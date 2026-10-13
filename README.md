@@ -33,6 +33,21 @@ try region.resetToZero()
 try region.release()
 ```
 
+For payload code that throws, use `withReadAccess` or `withWriteAccess`:
+
+```swift
+let value = try region.withReadAccess { bytes in
+  try decodePayload(bytes)
+}
+```
+
+The original callback methods retain typed `PageMemoryError` failures and now
+also return independent noncopyable values. The throwing methods propagate
+original payload errors; writes made before a payload failure remain present.
+Nested payload code may itself throw `PageMemoryError`, so that type alone does
+not identify which region failed. These are source APIs: rebuild consumers when
+upgrading rather than mixing precompiled v0.1 binaries with newer modules.
+
 Callbacks are synchronous and nonescaping. Their result is an ordinary escapable
 value; safe spans cannot outlive the callback. Return `Result` to represent a
 callback failure. The owner is noncopyable and deliberately not `Sendable`.
@@ -53,12 +68,31 @@ allocator heaps, executable pages, files or other processes are reclaimed.
   decommits active contents and recommits zero-on-demand pages; if recommit fails,
   contents remain retired and reset/release can be retried. Release uses
   `VirtualFree(MEM_RELEASE)` with size zero. No `MEM_RESET` zero guarantee is assumed.
+- Darwin opt-in: `discardContents(using: .reusable)` uses `MADV_FREE_REUSABLE`,
+  then reset balances it with `MADV_FREE_REUSE` before zeroing. The report keeps
+  `.lazyFree` semantics and separately reports `usesReusableAccounting`. This can
+  lower the footprint ledger while pages remain resident. Advice failure keeps
+  access retired, and reset refusal remains retryable.
 - Advice failures conservatively retire contents. Access remains denied until a
   successful reset; advice and explicit release can be retried.
 - Advice reports bytes submitted, not a fictional physical-memory delta.
 - Residency is observed with bounded scratch memory; it is not RSS/PSS/physical footprint.
 - Explicit release reports errors and is idempotent; destruction attempts release
   but cannot report a failed syscall. Use explicit release where error handling matters.
+
+Use one bounded region for repeated work. Call `resetToZero()` between payloads
+when zero initialization is needed, and discard pages when the region becomes
+idle. Linux reset after a successful discard avoids repeating `MADV_DONTNEED`.
+Linux and Windows reusable strategies use their same discard/zero-on-demand behavior and do
+not report Darwin ledger accounting. A default discard on a region already
+retired as reusable is a no-op; reset completes the balancing step.
+
+`ProcessMemorySnapshot.capture()` observes the calling process using native
+Mach task counters, bounded Linux `statm` reads, or Windows working-set counters.
+RSS/working set and Darwin physical footprint remain separate; Linux and Windows
+footprint is unknown. `statm` RSS is the
+kernel's approximate counter. Snapshots are observations, not lifecycle or
+memory-budget authority.
 
 Mapped bytes may be reclaimed without reducing code/runtime RSS. This component
 does not replace the Swift runtime, provide a global malloc implementation,
@@ -69,19 +103,22 @@ guarantee recovery from OOM killing or implement VM ballooning.
 ```text
 swift test -c release
 swift run -c release page-memory-probe soak 300
+swift run -c release page-memory-probe footprint reusable
+swift run -c release page-memory-probe cycle reuse 1000 65536
 swift Tools/CheckCompileFailures.swift /path/to/swiftc /path/to/built/modules Tests/CompileFail /path/to/scratch
 ```
 
 Unit tests cover bounds/rounding, independent owners, borrowed access,
 discard/reset, residency and release. `Tests/CompileFail` contains negative
-consumers for double consumption, escaping/nested/mutable borrows, task capture, non-Sendable ownership
+consumers for double consumption, escaping/nested/mutable/throwing borrows, task capture,
+non-Sendable ownership
 and release during a borrow, plus a positive control.
 Those cases are expected to be rejected by the compiler, not built as package tests.
 On macOS, set `SDKROOT` to the installed macOS SDK for the compiler helper.
 On Windows with Swift 6.4.1, use `swift test -c release -Xswiftc -disable-cmo`:
 cross-module optimization otherwise removes SwiftBuild's empty DLL test anchor
 and discovers zero cases. This keeps release optimization, exclusivity and memory
-safety checks enabled. CI also checks that all six Windows cases are discovered.
+safety checks enabled. CI also checks that all ten Windows cases are discovered.
 Compile `Tools/CheckCompileFailures.swift` with `swiftc -swift-version 6 -o checker.exe`
 and invoke that executable with the four shown arguments on Windows; its interpreter
 cannot load the helper's Foundation symbols in this toolchain.
@@ -94,9 +131,13 @@ the residency query inspects this owner's pages with at most 1024 native entries
 between cycles for an isolated diagnostic run. Measurements are diagnostic,
 not a language-performance ranking.
 
+[NIOResourceLab](Examples/NIOResourceLab) is an optional, separately built example
+for repeated loopback connections, timeout cleanup and descriptor accounting.
+It pins its own NIO dependencies and does not add them to PageMemory.
+
 ## Scope
 
-Version 0.1 is an initial standalone primitive. Production adoption requires the
+This is an evolving standalone primitive. Production adoption requires the
 consumer's lifecycle, capacity and recovery acceptance. Future pool, event-loop,
 allocator/PAL and VM-balloon integrations should be justified by measured needs.
 

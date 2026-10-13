@@ -19,9 +19,13 @@ public enum ReclamationSemantics: String, Sendable {
   case discardAndZeroOnDemand
   case lazyFree
 }
+/// Selects native reclamation accounting without promising immediate physical release.
+public enum ReclamationStrategy: Sendable { case platformDefault, reusable }
 public struct Reclamation: Equatable, Sendable {
   public let advisedBytes: Int
   public let semantics: ReclamationSemantics
+  /// Darwin reusable-ledger accounting was applied; not a physical-release claim.
+  public let usesReusableAccounting: Bool
   /// Advice success does not measure physical/resident bytes actually released.
   public let physicalReleasedBytes: Int? = nil
 }
@@ -34,6 +38,9 @@ public struct Reclamation: Equatable, Sendable {
   public let pageSize: Int
   private enum Contents { case active, retired, discarded }
   private var contents: Contents
+  #if canImport(Darwin)
+    private var reusableAdviceMayApply = false
+  #endif
   public var isReleased: Bool { unsafe pointer == nil }
 
   private init(pointer: UnsafeMutablePointer<UInt8>, byteCount: Int, mapped: Int, pageSize: Int) {
@@ -97,7 +104,7 @@ public struct Reclamation: Equatable, Sendable {
   }
 
   /// Result is Escapable: a safe Span cannot be returned or retained outside the callback.
-  public borrowing func withBytes<Result>(_ body: (Span<UInt8>) -> Result)
+  public borrowing func withBytes<Result: ~Copyable>(_ body: (Span<UInt8>) -> Result)
     throws(PageMemoryError) -> Result
   {
     guard let pointer = unsafe pointer else { throw .unavailable }
@@ -106,7 +113,9 @@ public struct Reclamation: Equatable, Sendable {
     let view = unsafe _overrideLifetime(rawView, borrowing: self)
     return body(view)
   }
-  public mutating func withMutableBytes<Result>(_ body: (inout MutableSpan<UInt8>) -> Result)
+  public mutating func withMutableBytes<Result: ~Copyable>(
+    _ body: (inout MutableSpan<UInt8>) -> Result
+  )
     throws(PageMemoryError) -> Result
   {
     guard let pointer = unsafe pointer else { throw .unavailable }
@@ -116,11 +125,38 @@ public struct Reclamation: Equatable, Sendable {
     return body(&view)
   }
 
+  /// Lends bytes to a throwing callback and propagates its original error.
+  public borrowing func withReadAccess<Result: ~Copyable, Failure: Error>(
+    _ body: (Span<UInt8>) throws(Failure) -> Result
+  ) throws -> Result {
+    let outcome: Swift.Result<Result, Failure> = try withBytes { bytes in
+      Swift.Result(catching: { () throws(Failure) -> Result in try body(bytes) })
+    }
+    return try outcome.get()
+  }
+
+  /// Mutably lends bytes to a throwing callback; mutations made before a throw are retained.
+  public mutating func withWriteAccess<Result: ~Copyable, Failure: Error>(
+    _ body: (inout MutableSpan<UInt8>) throws(Failure) -> Result
+  ) throws -> Result {
+    let outcome: Swift.Result<Result, Failure> = try withMutableBytes { bytes in
+      Swift.Result(catching: { () throws(Failure) -> Result in try body(&bytes) })
+    }
+    return try outcome.get()
+  }
+
   /// Retires all contents, including on advisory failure. Reset is required before access.
   public mutating func discardContents() throws(PageMemoryError) -> Reclamation {
+    try discardContents(using: .platformDefault)
+  }
+
+  /// Retires contents using the chosen native strategy; failure also retires access.
+  public mutating func discardContents(using strategy: ReclamationStrategy)
+    throws(PageMemoryError) -> Reclamation
+  {
     guard let pointer = unsafe pointer else { throw .unavailable }
     #if canImport(Darwin)
-      let advice = MADV_FREE
+      let advice = strategy == .reusable ? MADV_FREE_REUSABLE : MADV_FREE
       let semantics: ReclamationSemantics = .lazyFree
     #elseif os(Linux)
       let advice = MADV_DONTNEED
@@ -128,9 +164,27 @@ public struct Reclamation: Equatable, Sendable {
     #else
       let semantics: ReclamationSemantics = .discardAndZeroOnDemand
     #endif
-    if contents == .discarded { return Reclamation(advisedBytes: 0, semantics: semantics) }
+    #if canImport(Darwin)
+      if contents == .discarded && (strategy != .reusable || reusableAdviceMayApply) {
+        return Reclamation(
+          advisedBytes: 0, semantics: .lazyFree, usesReusableAccounting: reusableAdviceMayApply)
+      }
+    #else
+      if contents == .discarded {
+        return Reclamation(advisedBytes: 0, semantics: semantics, usesReusableAccounting: false)
+      }
+    #endif
     // Advice can fail after partial effects. Retire contents before the syscall.
     contents = .retired
+    #if canImport(Darwin)
+      if strategy == .platformDefault && reusableAdviceMayApply {
+        guard unsafe madvise(pointer, mappedByteCount, MADV_FREE_REUSE) == 0 else {
+          throw .systemCall(operation: .advise, code: errno)
+        }
+        reusableAdviceMayApply = false
+      }
+      if strategy == .reusable { reusableAdviceMayApply = true }
+    #endif
     #if os(Windows)
       // MEM_RESET does not guarantee zeros. Decommit keeps our reservation for reset/release.
       guard unsafe VirtualFree(pointer, SIZE_T(mappedByteCount), DWORD(MEM_DECOMMIT)) else {
@@ -142,15 +196,34 @@ public struct Reclamation: Equatable, Sendable {
       }
     #endif
     contents = .discarded
-    return Reclamation(advisedBytes: mappedByteCount, semantics: semantics)
+    #if canImport(Darwin)
+      let reusable = reusableAdviceMayApply
+    #else
+      let reusable = false
+    #endif
+    return Reclamation(
+      advisedBytes: mappedByteCount, semantics: semantics, usesReusableAccounting: reusable)
   }
 
   /// Initializes logical bytes. Darwin touches pages; Linux and Windows use zero-on-demand.
   /// If Linux advice is refused, explicit zeroing restores this exclusively owned live mapping.
   public mutating func resetToZero() throws(PageMemoryError) {
     guard let pointer = unsafe pointer else { throw .unavailable }
+    #if os(Linux)
+      // Successful DONTNEED already guarantees zero-on-demand without a second syscall.
+      if contents == .discarded {
+        contents = .active
+        return
+      }
+    #endif
     contents = .retired
     #if canImport(Darwin)
+      if reusableAdviceMayApply {
+        guard unsafe madvise(pointer, mappedByteCount, MADV_FREE_REUSE) == 0 else {
+          throw .systemCall(operation: .advise, code: errno)
+        }
+        reusableAdviceMayApply = false
+      }
       _ = unsafe memset(pointer, 0, byteCount)
     #elseif os(Windows)
       // Also decommit active or partially retired contents before recommitting zeroed pages.

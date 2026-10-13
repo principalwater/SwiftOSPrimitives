@@ -86,6 +86,7 @@ func runChecks() throws {
     ),
     ("TaskCapture", ["4:26: error: lifetime-dependent variable 'bytes' escapes its scope"]),
     ("SendOwner", ["6:3: error: type 'PageRegion' does not conform to the 'Sendable' protocol"]),
+    ("ThrowingBorrow", ["6:32: error: lifetime-dependent variable 'bytes' escapes its scope"]),
   ]
   for (name, expected) in cases {
     let log = scratch.appendingPathComponent(name + ".log")
