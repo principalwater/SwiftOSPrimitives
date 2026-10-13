@@ -4,9 +4,11 @@
   import Glibc
 #elseif os(Linux) && canImport(Musl)
   import Musl
+#elseif os(Windows)
+  import WinSDK
 #endif
 
-/// A failed self-memory observation; Mach and POSIX codes retain their native operation.
+/// A failed self-memory observation; error codes retain their native operation.
 public enum MemoryObservationError: Error, Equatable, Sendable {
   case systemCall(operation: Operation, code: Int32)
   case malformedCounters
@@ -15,8 +17,9 @@ public enum MemoryObservationError: Error, Equatable, Sendable {
 
 /// Native counters for the calling process, separate from owned mappings and allocator advice.
 public struct ProcessMemorySnapshot: Equatable, Sendable {
+  /// Resident bytes, including shared pages; Windows observes the process working set.
   public let residentBytes: UInt64
-  /// Darwin's accounting ledger; unknown on Linux. This is not a physical-release delta.
+  /// Darwin's accounting ledger; unknown on Linux and Windows. Not a physical-release delta.
   public let physicalFootprintBytes: UInt64?
 
   /// Reads self counters with bounded scratch storage and no background sampling task.
@@ -42,6 +45,18 @@ public struct ProcessMemorySnapshot: Equatable, Sendable {
       return ProcessMemorySnapshot(
         residentBytes: info.resident_size,
         physicalFootprintBytes: returnedBytes >= footprintEnd ? info.phys_footprint : nil)
+    #elseif os(Windows)
+      var counters = PROCESS_MEMORY_COUNTERS()
+      let size = DWORD(MemoryLayout<PROCESS_MEMORY_COUNTERS>.size)
+      counters.cb = size
+      guard unsafe K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, size) else {
+        throw .systemCall(operation: .selfMemory, code: Int32(bitPattern: GetLastError()))
+      }
+      guard counters.cb == size, counters.WorkingSetSize <= counters.PeakWorkingSetSize else {
+        throw .malformedCounters
+      }
+      return ProcessMemorySnapshot(
+        residentBytes: UInt64(counters.WorkingSetSize), physicalFootprintBytes: nil)
     #else
       let fd = unsafe open("/proc/self/statm", O_RDONLY | O_CLOEXEC)
       guard fd >= 0 else { throw .systemCall(operation: .selfMemory, code: errno) }

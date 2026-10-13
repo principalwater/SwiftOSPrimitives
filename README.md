@@ -13,6 +13,7 @@ Swift 6.4 or later; development and validation use Swift 6.4.1.
 macOS 27 release tests pass; the static Linux build and runtime probe pass.
 Native Linux package tests are a separate CI gate. The declared iOS 18 target compiles with the iOS 27
 SDK using back-deployable Span APIs; device behavior is not claimed.
+Windows 10 x64 uses native WinSDK APIs; its CI gate uses exactly Swift 6.4.1.
 
 ## Use
 
@@ -62,6 +63,11 @@ allocator heaps, executable pages, files or other processes are reclaimed.
   initialization can use the kernel's zero-on-demand behavior.
 - Darwin: `MADV_FREE` is lazy advice. Reset explicitly zeros logical bytes because
   old contents may still exist; reset touches pages and can make them resident again.
+- Windows: `VirtualAlloc` reserves and commits private read/write pages. Discard
+  uses `VirtualFree(MEM_DECOMMIT)`, retaining the address reservation. Reset
+  decommits active contents and recommits zero-on-demand pages; if recommit fails,
+  contents remain retired and reset/release can be retried. Release uses
+  `VirtualFree(MEM_RELEASE)` with size zero. No `MEM_RESET` zero guarantee is assumed.
 - Darwin opt-in: `discardContents(using: .reusable)` uses `MADV_FREE_REUSABLE`,
   then reset balances it with `MADV_FREE_REUSE` before zeroing. The report keeps
   `.lazyFree` semantics and separately reports `usesReusableAccounting`. This can
@@ -77,13 +83,14 @@ allocator heaps, executable pages, files or other processes are reclaimed.
 Use one bounded region for repeated work. Call `resetToZero()` between payloads
 when zero initialization is needed, and discard pages when the region becomes
 idle. Linux reset after a successful discard avoids repeating `MADV_DONTNEED`.
-Linux's reusable strategy uses the same discard/zero-on-demand behavior and does
+Linux and Windows reusable strategies use their same discard/zero-on-demand behavior and do
 not report Darwin ledger accounting. A default discard on a region already
 retired as reusable is a no-op; reset completes the balancing step.
 
 `ProcessMemorySnapshot.capture()` observes the calling process using native
-Mach task counters or bounded Linux `statm` reads. RSS and Darwin physical
-footprint remain separate; Linux footprint is unknown. `statm` RSS is the
+Mach task counters, bounded Linux `statm` reads, or Windows working-set counters.
+RSS/working set and Darwin physical footprint remain separate; Linux and Windows
+footprint is unknown. `statm` RSS is the
 kernel's approximate counter. Snapshots are observations, not lifecycle or
 memory-budget authority.
 
@@ -103,12 +110,22 @@ swift Tools/CheckCompileFailures.swift /path/to/swiftc /path/to/built/modules Te
 
 Unit tests cover bounds/rounding, independent owners, borrowed access,
 discard/reset, residency and release. `Tests/CompileFail` contains negative
-consumers for double consumption, escaping/nested/mutable borrows, task capture
+consumers for double consumption, escaping/nested/mutable/throwing borrows, task capture,
+non-Sendable ownership
 and release during a borrow, plus a positive control.
 Those cases are expected to be rejected by the compiler, not built as package tests.
 On macOS, set `SDKROOT` to the installed macOS SDK for the compiler helper.
+On Windows with Swift 6.4.1, use `swift test -c release -Xswiftc -disable-cmo`:
+cross-module optimization otherwise removes SwiftBuild's empty DLL test anchor
+and discovers zero cases. This keeps release optimization, exclusivity and memory
+safety checks enabled. CI also checks that all ten Windows cases are discovered.
+Compile `Tools/CheckCompileFailures.swift` with `swiftc -swift-version 6 -o checker.exe`
+and invoke that executable with the four shown arguments on Windows; its interpreter
+cannot load the helper's Foundation symbols in this toolchain.
 
 The probe only uses its own mappings and bounded reads of Linux self-status/self-smaps.
+On Windows, its counters use the calling process's working set and CPU time;
+the residency query inspects this owner's pages with at most 1024 native entries.
 `baseline` emits process-image counters; `smaps` emits mapping details;
 `soak N` exercises at most one 1 MiB mapping at a time. `paced-soak N` adds 20 ms
 between cycles for an isolated diagnostic run. Measurements are diagnostic,
