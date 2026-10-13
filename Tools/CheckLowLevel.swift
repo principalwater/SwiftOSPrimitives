@@ -36,6 +36,13 @@ func checkLowLevel() throws {
     child.standardOutput = output
     child.standardError = output
     child.standardInput = FileHandle.nullDevice
+    try JSONSerialization.data(
+      withJSONObject: [
+        "executable": executable.path, "arguments": arguments,
+        "SDKROOT": environment["SDKROOT"] ?? "",
+      ], options: [.prettyPrinted, .sortedKeys]
+    ).write(
+      to: scratch.appendingPathComponent(name + "-invocation.json"))
     try child.run()
     let end = ContinuousClock.now.advanced(by: .seconds(60))
     while child.isRunning && ContinuousClock.now < end { Thread.sleep(forTimeInterval: 0.02) }
@@ -61,6 +68,7 @@ func checkLowLevel() throws {
     "-swift-version", "6", "-O", "-wmo", "-parse-as-library", "-strict-memory-safety",
     "-warnings-as-errors", "-module-cache-path", scratch.appendingPathComponent("modules").path,
   ]
+  try run("CompilerVersion", executable: compiler, arguments: ["--version"])
   var host = common
   if let sdk = ProcessInfo.processInfo.environment["SDKROOT"] { host += ["-sdk", sdk] }
   let embedded = ["-enable-experimental-feature", "Embedded"]
@@ -83,7 +91,7 @@ func checkLowLevel() throws {
       throw CheckFailure.refused("Native Glibc declaration map unavailable: " + moduleMap.path)
     }
     // Import existing libc declarations without the non-Embedded Swift overlay.
-    embeddedHost += ["-Xcc", "-fmodule-map-file=" + moduleMap.path]
+    embeddedHost += ["-I", platform.path, "-Xcc", "-fmodule-map-file=" + moduleMap.path]
   #endif
   let pages = try files.contentsOfDirectory(
     atPath: root.appendingPathComponent("Sources/PageMemory").path

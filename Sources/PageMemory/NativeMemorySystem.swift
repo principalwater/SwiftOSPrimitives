@@ -1,4 +1,6 @@
-#if canImport(Darwin)
+#if os(Linux) && hasFeature(Embedded)
+  import SwiftGlibc
+#elseif canImport(Darwin)
   import Darwin
 #elseif os(Linux) && canImport(Glibc)
   import Glibc
@@ -15,7 +17,7 @@ enum NativeMemorySystem {
   static var errorCode: Int32 {
     #if canImport(Darwin)
       return unsafe __error().pointee
-    #elseif os(Linux) && (canImport(Glibc) || canImport(Musl) || canImport(SwiftGlibc) || canImport(SwiftMusl))
+    #elseif os(Linux)
       return unsafe __errno_location().pointee
     #else
       #error("NativeMemorySystem requires Darwin, Glibc, or Musl.")

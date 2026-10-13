@@ -1,4 +1,6 @@
-#if canImport(Darwin)
+#if os(Linux) && hasFeature(Embedded)
+  import SwiftGlibc
+#elseif canImport(Darwin)
   import Darwin
 #elseif canImport(Glibc)
   import Glibc
