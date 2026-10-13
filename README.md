@@ -118,6 +118,17 @@ not a language-performance ranking.
 for repeated loopback connections, timeout cleanup and descriptor accounting.
 It pins its own NIO dependencies and does not add them to PageMemory.
 
+## Embedded and low-level experiments
+
+[EmbeddedPageProbe](Examples/EmbeddedPageProbe) validates the same PageMemory sources
+in explicitly selected Embedded mode. [RegisterTrace](Examples/RegisterTrace) uses
+Swift 6.4.1 compiler-native volatile operations and checks their optimized code
+for ARM64 and x86-64 without touching hardware. These remain optional; the main
+package does not force Embedded mode or import `_Volatile`.
+
+[Kernel Rust and Swift](Documentation/KernelRustAndSwift.md) explains the kernel
+contracts, current Swift capabilities and remaining compiler/subsystem work.
+
 ## Scope
 
 This is an evolving standalone primitive. Production adoption requires the

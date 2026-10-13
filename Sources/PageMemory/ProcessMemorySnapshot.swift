@@ -25,26 +25,35 @@ public struct ProcessMemorySnapshot: Equatable, Sendable {
       var info = task_vm_info_data_t()
       let capacity = MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
       var count = mach_msg_type_number_t(capacity)
+      var residentEnd = 0
+      var footprintEnd = 0
       let result = withUnsafeMutablePointer(to: &info) { pointer in
-        unsafe pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) { words in
+        // Actual imported field addresses avoid key-path runtime support in Embedded mode.
+        residentEnd = unsafe withUnsafePointer(to: &pointer.pointee.resident_size) { field in
+          unsafe UnsafeRawPointer(pointer).distance(to: UnsafeRawPointer(field))
+            + MemoryLayout<mach_vm_size_t>.size
+        }
+        footprintEnd = unsafe withUnsafePointer(to: &pointer.pointee.phys_footprint) { field in
+          unsafe UnsafeRawPointer(pointer).distance(to: UnsafeRawPointer(field))
+            + MemoryLayout<mach_vm_size_t>.size
+        }
+        return unsafe pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) { words in
           unsafe task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), words, &count)
         }
       }
       guard result == KERN_SUCCESS else { throw .systemCall(operation: .taskInfo, code: result) }
-      guard let residentOffset = MemoryLayout<task_vm_info_data_t>.offset(of: \.resident_size),
-        let footprintOffset = MemoryLayout<task_vm_info_data_t>.offset(of: \.phys_footprint)
-      else { throw .malformedCounters }
       let returnedBytes = Int(count) * MemoryLayout<integer_t>.size
-      guard returnedBytes >= residentOffset + MemoryLayout<mach_vm_size_t>.size else {
+      guard count <= capacity, returnedBytes >= residentEnd else {
         throw .malformedCounters
       }
-      let footprintEnd = footprintOffset + MemoryLayout<mach_vm_size_t>.size
       return ProcessMemorySnapshot(
         residentBytes: info.resident_size,
         physicalFootprintBytes: returnedBytes >= footprintEnd ? info.phys_footprint : nil)
     #else
       let fd = unsafe open("/proc/self/statm", O_RDONLY | O_CLOEXEC)
-      guard fd >= 0 else { throw .systemCall(operation: .selfMemory, code: errno) }
+      guard fd >= 0 else {
+        throw .systemCall(operation: .selfMemory, code: NativeMemorySystem.errorCode)
+      }
       defer { _ = close(fd) }
       var buffer = InlineArray<256, UInt8>(repeating: 0)
       var used = 0
@@ -57,11 +66,11 @@ public struct ProcessMemorySnapshot: Equatable, Sendable {
         }
         if amount == 0 { break }
         if amount < 0 {
-          if errno == EINTR && interruptions < 8 {
+          if NativeMemorySystem.errorCode == EINTR && interruptions < 8 {
             interruptions += 1
             continue
           }
-          throw .systemCall(operation: .selfMemory, code: errno)
+          throw .systemCall(operation: .selfMemory, code: NativeMemorySystem.errorCode)
         }
         used += amount
       }
@@ -84,7 +93,9 @@ public struct ProcessMemorySnapshot: Equatable, Sendable {
       }
       guard number() != nil, let pages = number() else { throw .malformedCounters }
       let pageSize = sysconf(Int32(_SC_PAGESIZE))
-      guard pageSize > 0 else { throw .systemCall(operation: .pageSize, code: errno) }
+      guard pageSize > 0 else {
+        throw .systemCall(operation: .pageSize, code: NativeMemorySystem.errorCode)
+      }
       guard pages <= UInt64.max / UInt64(pageSize) else { throw .malformedCounters }
       return ProcessMemorySnapshot(
         residentBytes: pages * UInt64(pageSize), physicalFootprintBytes: nil)

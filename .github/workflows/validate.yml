@@ -44,6 +44,7 @@ jobs:
           swift run -c release --skip-build page-memory-probe cycle reuse 1000 65536
           swift run -c release --skip-build page-memory-probe footprint reusable
           swift run --package-path Examples/NIOResourceLab -c release --jobs 2
+          swift Tools/CheckLowLevel.swift "$(command -v swiftc)" . "$RUNNER_TEMP/low-level"
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             swiftc -swift-version 6 -strict-memory-safety -warnings-as-errors \
               -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \

@@ -55,17 +55,21 @@ public struct Reclamation: Equatable, Sendable {
   {
     guard byteCount > 0, maximumMappedBytes > 0 else { throw .invalidSize }
     let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
-    guard pageSize > 0 else { throw .systemCall(operation: .pageSize, code: errno) }
+    guard pageSize > 0 else {
+      throw .systemCall(operation: .pageSize, code: NativeMemorySystem.errorCode)
+    }
     let (sum, overflow) = byteCount.addingReportingOverflow(pageSize - 1)
     guard !overflow else { throw .invalidSize }
     let mapped = sum / pageSize * pageSize
     guard mapped <= maximumMappedBytes else { throw .limitExceeded }
     let raw = unsafe mmap(nil, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
-    guard unsafe raw != MAP_FAILED else { throw .systemCall(operation: .map, code: errno) }
+    guard unsafe !NativeMemorySystem.mappingFailed(raw) else {
+      throw .systemCall(operation: .map, code: NativeMemorySystem.errorCode)
+    }
     // Swift cannot represent a nonoptional pointer to address zero. Reject and release it.
     guard let raw = unsafe raw else {
       guard munmap(nil, mapped) == 0 else {
-        throw .systemCall(operation: .unmap, code: errno)
+        throw .systemCall(operation: .unmap, code: NativeMemorySystem.errorCode)
       }
       throw .systemCall(operation: .map, code: EFAULT)
     }
@@ -153,14 +157,14 @@ public struct Reclamation: Equatable, Sendable {
     #if canImport(Darwin)
       if strategy == .platformDefault && reusableAdviceMayApply {
         guard unsafe madvise(pointer, mappedByteCount, MADV_FREE_REUSE) == 0 else {
-          throw .systemCall(operation: .advise, code: errno)
+          throw .systemCall(operation: .advise, code: NativeMemorySystem.errorCode)
         }
         reusableAdviceMayApply = false
       }
       if strategy == .reusable { reusableAdviceMayApply = true }
     #endif
     guard unsafe madvise(pointer, mappedByteCount, advice) == 0 else {
-      throw .systemCall(operation: .advise, code: errno)
+      throw .systemCall(operation: .advise, code: NativeMemorySystem.errorCode)
     }
     contents = .discarded
     #if canImport(Darwin)
@@ -187,7 +191,7 @@ public struct Reclamation: Equatable, Sendable {
     #if canImport(Darwin)
       if reusableAdviceMayApply {
         guard unsafe madvise(pointer, mappedByteCount, MADV_FREE_REUSE) == 0 else {
-          throw .systemCall(operation: .advise, code: errno)
+          throw .systemCall(operation: .advise, code: NativeMemorySystem.errorCode)
         }
         reusableAdviceMayApply = false
       }
@@ -203,27 +207,33 @@ public struct Reclamation: Equatable, Sendable {
   public borrowing func residentPageCount() throws(PageMemoryError) -> Int {
     guard let pointer = unsafe pointer else { throw .unavailable }
     #if canImport(Darwin)
-      var vector = [Int8](repeating: 0, count: min(1024, mappedByteCount / pageSize))
+      typealias ResidencyByte = Int8
     #else
-      var vector = [UInt8](repeating: 0, count: min(1024, mappedByteCount / pageSize))
+      typealias ResidencyByte = UInt8
     #endif
-    var offset = 0
-    var resident = 0
-    while offset < mappedByteCount {
-      let length = min(mappedByteCount - offset, vector.count * pageSize)
-      guard unsafe mincore(pointer.advanced(by: offset), length, &vector) == 0 else {
-        throw .systemCall(operation: .residency, code: errno)
+    // Bounded temporary storage avoids an Array owner and supports the iOS 18 target.
+    return try withUnsafeTemporaryAllocation(of: ResidencyByte.self, capacity: 1024) {
+      storage throws(PageMemoryError) -> Int in
+      guard let vector = storage.baseAddress else { throw .unavailable }
+      var offset = 0
+      var resident = 0
+      while offset < mappedByteCount {
+        let length = min(mappedByteCount - offset, 1024 * pageSize)
+        guard unsafe mincore(pointer.advanced(by: offset), length, vector) == 0 else {
+          throw .systemCall(operation: .residency, code: NativeMemorySystem.errorCode)
+        }
+        // mincore initialized exactly the entries for this page-rounded extent.
+        for index in 0..<(length / pageSize) { resident += Int(unsafe vector[index]) & 1 }
+        offset += length
       }
-      for index in 0..<(length / pageSize) { resident += Int(vector[index]) & 1 }
-      offset += length
+      return resident
     }
-    return resident
   }
   /// On failure ownership remains retryable; success is idempotent.
   public mutating func release() throws(PageMemoryError) {
     guard let pointer = unsafe pointer else { return }
     guard unsafe munmap(pointer, mappedByteCount) == 0 else {
-      throw .systemCall(operation: .unmap, code: errno)
+      throw .systemCall(operation: .unmap, code: NativeMemorySystem.errorCode)
     }
     unsafe self.pointer = nil
   }
