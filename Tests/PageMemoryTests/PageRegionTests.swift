@@ -153,14 +153,16 @@ import Testing
     }
   #endif
   #if os(Linux)
-    @Test func lockedPagesRecoverAfterAdviceFailure() throws {
+    @Test(arguments: [false, true])
+    func lockedPagesRecoverAfterAdviceFailure(partiallyLocked: Bool) throws {
       let sizing = try PageRegion.allocate(byteCount: 1)
-      var region = try PageRegion.allocate(byteCount: sizing.pageSize)
+      let step = sizing.pageSize
+      var region = try PageRegion.allocate(byteCount: step * (partiallyLocked ? 2 : 1))
       let locked = try region.withMutableBytes { bytes in
         bytes[0] = 73
         bytes[bytes.count - 1] = 91
         return bytes.withUnsafeMutableBufferPointer { buffer in
-          unsafe mlock(buffer.baseAddress, buffer.count)
+          unsafe mlock(buffer.baseAddress!.advanced(by: partiallyLocked ? step : 0), step)
         }
       }
       try #require(locked == 0, "mlock failed with errno \(errno)")
