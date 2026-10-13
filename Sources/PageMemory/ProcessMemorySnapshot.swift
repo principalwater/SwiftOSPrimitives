@@ -1,15 +1,12 @@
 #if os(Linux) && hasFeature(Embedded)
-  import SwiftGlibc
+  import NativePOSIX
 #elseif canImport(Darwin)
   import Darwin
 #elseif os(Linux) && canImport(Glibc)
   import Glibc
 #elseif os(Linux) && canImport(Musl)
   import Musl
-#elseif os(Linux) && canImport(SwiftGlibc)
-  import SwiftGlibc
-#elseif os(Linux) && canImport(SwiftMusl)
-  import SwiftMusl
+
 #endif
 
 /// A failed self-memory observation; Mach and POSIX codes retain their native operation.

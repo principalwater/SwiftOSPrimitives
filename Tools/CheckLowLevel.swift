@@ -78,42 +78,24 @@ func checkLowLevel() throws {
     let targetInfo =
       try JSONSerialization.jsonObject(
         with: Data(contentsOf: scratch.appendingPathComponent("TargetInfo.log"))) as? [String: Any]
-    guard let paths = targetInfo?["paths"] as? [String: Any],
-      let resourcePath = paths["runtimeResourcePath"] as? String,
-      let target = targetInfo?["target"] as? [String: Any],
+    guard let target = targetInfo?["target"] as? [String: Any],
       let triple = target["triple"] as? String,
       let architecture = triple.split(separator: "-").first
-    else { throw CheckFailure.refused("Missing compiler resource path") }
-    let platform = URL(fileURLWithPath: resourcePath).appendingPathComponent("linux")
-      .appendingPathComponent(String(architecture))
-    let moduleMap = platform.appendingPathComponent("glibc.modulemap")
-    guard files.fileExists(atPath: moduleMap.path) else {
-      throw CheckFailure.refused("Native Glibc declaration map unavailable: " + moduleMap.path)
-    }
+    else { throw CheckFailure.refused("Missing compiler target") }
     let systemHeaders = "/usr/include"
     let architectureHeaders = systemHeaders + "/" + String(architecture) + "-linux-gnu"
-    guard files.fileExists(atPath: systemHeaders + "/assert.h"),
-      files.fileExists(atPath: architectureHeaders + "/bits/wordsize.h")
-    else { throw CheckFailure.refused("Native glibc development headers unavailable") }
-    // Module-map headers resolve relative to the map, independently of include search paths.
-    var map = try String(contentsOf: moduleMap, encoding: .utf8)
-    guard map.contains("module SwiftGlibc [system] {"),
-      let unrelatedModule = map.range(of: "\nmodule CUUID")
-    else { throw CheckFailure.refused("Unexpected compiler Glibc module-map shape") }
-    // The fixture imports libc only; optional UUID headers are not a dependency.
-    map = String(map[..<unrelatedModule.lowerBound])
-    let pattern = try NSRegularExpression(pattern: #"\bheader "([^"]+)""#)
-    let matches = pattern.matches(in: map, range: NSRange(map.startIndex..., in: map))
-    for match in matches.reversed() {
-      guard let range = Range(match.range(at: 1), in: map) else { throw CheckFailure.arguments }
-      let name = String(map[range])
-      let candidates = [platform.path, systemHeaders, architectureHeaders].map { $0 + "/" + name }
+    let names = ["unistd.h", "sys/mman.h", "errno.h", "stdio.h", "stdlib.h", "string.h", "fcntl.h"]
+    var map = "module NativePOSIX [system] {\n"
+    for name in names {
+      let candidates = [systemHeaders, architectureHeaders].map { $0 + "/" + name }
       guard let path = candidates.first(where: { files.fileExists(atPath: $0) }) else {
-        throw CheckFailure.refused("Missing module-map header: " + name)
+        throw CheckFailure.refused("Missing native POSIX header: " + name)
       }
-      map.replaceSubrange(range, with: path)
+      map += "  header \"" + path + "\"\n"
     }
-    let boundMap = scratch.appendingPathComponent("glibc.modulemap")
+    map += "  export *\n}\n"
+    // Import OS declarations only; the general SwiftGlibc umbrella also imports unsupported tgmath.
+    let boundMap = scratch.appendingPathComponent("NativePOSIX.modulemap")
     try map.write(to: boundMap, atomically: true, encoding: .utf8)
     embeddedHost += ["-Xcc", "-fmodule-map-file=" + boundMap.path]
     // Embedded deliberately omits system include paths; this is a native user-space fixture.

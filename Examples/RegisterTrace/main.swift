@@ -1,15 +1,12 @@
 #if os(Linux) && hasFeature(Embedded)
-  import SwiftGlibc
+  import NativePOSIX
 #elseif canImport(Darwin)
   import Darwin
 #elseif canImport(Glibc)
   import Glibc
 #elseif canImport(Musl)
   import Musl
-#elseif canImport(SwiftGlibc)
-  import SwiftGlibc
-#elseif canImport(SwiftMusl)
-  import SwiftMusl
+
 #else
   #error("A native libc declaration module is required.")
 #endif
