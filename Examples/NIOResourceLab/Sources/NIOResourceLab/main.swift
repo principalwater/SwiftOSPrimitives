@@ -175,7 +175,7 @@ func descriptorCount() throws -> Int {
 do {
   // Warm native runtime/stdio once before comparing resource counts.
   try perform()
-  // NIO's graceful callback can precede thread-local descriptor retirement.
+  // Observe stable counters around joined shutdown and asynchronous runtime cleanup.
   let settleEnd = ContinuousClock.now.advanced(by: .seconds(1))
   var before = try descriptorCount()
   var stable = 0
