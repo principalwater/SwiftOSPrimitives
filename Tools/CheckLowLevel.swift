@@ -97,6 +97,11 @@ func checkLowLevel() throws {
     else { throw CheckFailure.refused("Native glibc development headers unavailable") }
     // Module-map headers resolve relative to the map, independently of include search paths.
     var map = try String(contentsOf: moduleMap, encoding: .utf8)
+    guard map.contains("module SwiftGlibc [system] {"),
+      let unrelatedModule = map.range(of: "\nmodule CUUID")
+    else { throw CheckFailure.refused("Unexpected compiler Glibc module-map shape") }
+    // The fixture imports libc only; optional UUID headers are not a dependency.
+    map = String(map[..<unrelatedModule.lowerBound])
     let pattern = try NSRegularExpression(pattern: #"\bheader "([^"]+)""#)
     let matches = pattern.matches(in: map, range: NSRange(map.startIndex..., in: map))
     for match in matches.reversed() {
