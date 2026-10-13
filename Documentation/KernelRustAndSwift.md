@@ -62,6 +62,12 @@ on older Embedded limitations are incomplete. The
 [6.4 Embedded announcement](https://www.swift.org/blog/embedded-swift-improvements-coming-in-swift-6.4/)
 also describes its platform abstraction layer. The supported package mode remains
 separate from the explicitly experimental Embedded consumers in this repository.
+The [6.4.1 PAL header](https://github.com/swiftlang/swift/blob/swift-6.4.1-RELEASE/stdlib/public/EmbeddedPlatform/swift/EmbeddedPlatform.h)
+already specifies aligned allocation/free, random generation, output and
+exclusivity TLS hooks. A future kernel port should implement that existing
+contract in Swift before introducing a competing runtime. Returning an allocation
+error from a PAL hook does not make all implicit standard-library allocation
+fallible; those callers' failure behavior must also be audited.
 
 The actual official 6.4.1 distribution includes `_Volatile`, whose
 [source](https://github.com/swiftlang/swift/blob/swift-6.4.1-RELEASE/stdlib/public/Volatile/Volatile.swift)

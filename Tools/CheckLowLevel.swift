@@ -92,6 +92,16 @@ func checkLowLevel() throws {
     }
     // Import existing libc declarations without the non-Embedded Swift overlay.
     embeddedHost += ["-I", platform.path, "-Xcc", "-fmodule-map-file=" + moduleMap.path]
+    let systemHeaders = "/usr/include"
+    let architectureHeaders = systemHeaders + "/" + String(architecture) + "-linux-gnu"
+    guard files.fileExists(atPath: systemHeaders + "/assert.h"),
+      files.fileExists(atPath: architectureHeaders + "/bits/wordsize.h")
+    else { throw CheckFailure.refused("Native glibc development headers unavailable") }
+    // Embedded deliberately omits system include paths; this is a native user-space fixture.
+    embeddedHost += [
+      "-Xcc", "-isystem", "-Xcc", systemHeaders,
+      "-Xcc", "-isystem", "-Xcc", architectureHeaders,
+    ]
   #endif
   let pages = try files.contentsOfDirectory(
     atPath: root.appendingPathComponent("Sources/PageMemory").path
