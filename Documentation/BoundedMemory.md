@@ -96,6 +96,93 @@ stub traps; autolink metadata can remain. Existing input/Span checks are preserv
 Kernel integration still needs a pinned kernel configuration, Kbuild/Kconfig,
 module/versioned-symbol ABI, final link/section/TLS/relocation/stack analysis,
 objtool/ORC and applicable CFI/retpoline/IBT protections, a panic contract and
-actual disposable-guest init/exit execution. GFP-backed fallible typed placement,
-partial-init cleanup and stronger pinning are separate work. Physical page
+actual disposable-guest init/exit execution. GFP-backed fallible placement and stronger pinning remain separate work; scoped
+partial-init cleanup is now provided by the typed API below. Physical page
 accounting and host/guest balloon protocols remain separate from process reclaim.
+
+
+## Typed reservations
+
+`withTypedAllocation(of:capacity:_:)` reserves `capacity * MemoryLayout<Element>.stride`
+bytes with actual-address alignment. The count must be positive; multiplication
+must fit `Int`. Invalid count/extent returns `.invalidSize`; an aligned extent
+that does not fit returns `.capacityExceeded`. Refusal skips the callback and
+leaves bytes unchanged. `Element` and the result can be noncopyable, but must be
+escapable. A borrowed Span/Ref is not an independently owned result.
+
+The callback receives a standard-library `OutputSpan<Element>` initially containing
+zero elements and a disjoint byte remainder. `append` consumes an element;
+`removeLast` transfers an independent element out. Overfilling or removing from
+an empty output span is a programmer error checked by the standard library,
+not an allocation refusal. Its safe API tracks the initialized prefix, including
+partial initialization before a thrown error.
+
+```swift
+switch arena.withTypedAllocation(of: UInt64.self, capacity: 4, { output, remainder in
+  output.append(17)
+  output.append(29)
+  return output.span[0] + output.span[1]
+}) {
+case .allocated(let sum): print(sum)
+case .refused(let reason): print(reason)
+}
+```
+
+The library deinitializes the borrowed UInt8 extent, temporarily rebinds memory,
+then destroys the output span **before** restoring byte binding. Its standard
+`OutputSpan` destructor destroys every remaining live element. An outer `defer`
+reinitializes the entire reserved extent as zero UInt8 values, even when the
+callback throws or replaces the output span with an empty one. Alignment padding
+and unreserved bytes are untouched. Byte-only `withAllocation` keeps its original
+preserve-content behavior; the typed API deliberately has a different contract.
+
+The library owns no backing allocation or heap object-tracking table. Ordinary Swift
+generic metadata/runtime initialization is not excluded for arbitrary element/result
+types; only the pinned Embedded fixtures have a compiler-checked no-allocation
+contract. This does not remove normal Swift runtime RSS.
+
+Cleanup is O(live elements + reserved bytes). This is not secure erasure, a promise
+of immediate physical-page release or fallible construction of arbitrary Swift
+classes/collections. Constructors/destructors can allocate, block or invoke syscalls.
+A trap/process termination does not run normal cleanup. Unsafe output-span
+`finalize`/pointer APIs can violate initialization tracking; callers must respect
+their unsafe contracts. Do not suspend, retain raw pointers or return loans from
+this synchronous callback. Remaining elements are destroyed before PageRegion can
+retire/reclaim/release its pages; actual page release belongs to the owner.
+
+These are movable Swift values appended to their final scratch storage, **not**
+self-referential in-place initialization, a Rust-style Pin, physical pin or
+registration-safe address stability. Kernel GFP contexts, IRQ/DMA ownership and
+OOM policy still need separate reviewed adapters.
+
+### Typed validation and kernel dependencies
+
+Native release and AddressSanitizer tests exercise partial construction lengths
+0...4, exact destruction identities, success/error reuse, replacement, independent
+noncopyable transfer and ARC-owned page-backed resources before reclaim. An
+independent actual-address grid verifies typed alignment, zero restoration and
+untouched bytes. Three new emit-SIL consumers reject initialized-span return,
+outer-lifetime storage and parent reentry; the positive consumer exercises scalar
+return. iOS18 module compatibility and Linux CI remain gates.
+
+`EmbeddedTypedProbe` combines the sources into one Embedded module and runs 1,000
+cycles (5 partial-error requests plus success/nesting per cycle), with a checked
+37,000 destructor checksum and zero restoration. It compiles with `-no-allocations`,
+strict memory safety and warnings as errors. The fixture uses a stack-owned
+counter pointer with a bounded native loan; it adds no general raw-pointer API.
+
+The optional LLVM experiment now audits separate `typed_arena_trace` objects for
+ARM64/x86-64. Unlike the earlier byte trace, dynamic typed zero restoration and
+stack-counter lifetime may require `memset`, `__stack_chk_guard` and
+`__stack_chk_fail`. **Stack protection is retained.** The gate enumerates actual
+imports and refuses every dependency outside that explicitly declared set; it
+still verifies whole-object no-FP/SIMD operands and retains the unrelated-symbol
+negative control. An import-free byte trace does not establish an import-free
+whole library. A kernel adapter must provide correct architecture-specific guard,
+failure and zeroing contracts and validate final relocation/stack/hardening paths;
+these objects have not been linked into Kbuild or booted in a guest.
+
+Upstream semantics were checked against the pinned
+[Swift6.4.1 OutputSpan source](https://github.com/swiftlang/swift/blob/swift-6.4.1-RELEASE/stdlib/public/core/Span/OutputSpan.swift)
+and installed interfaces, then exercised natively. No custom object runtime,
+allocator interposer or borrowed upstream allocator implementation was added.

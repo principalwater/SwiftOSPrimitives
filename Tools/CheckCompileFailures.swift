@@ -29,6 +29,19 @@ func runChecks() throws {
   let cases: [(String, [String])] = [
     ("CompilerVersion", []),
     ("ArenaPositive", []),
+    (
+      "TypedEscape",
+      [
+        "4:13: error: instance method 'withTypedAllocation(of:capacity:_:)' requires that 'Span<UInt64>' conform to 'Escapable'"
+      ]
+    ),
+    ("TypedOuter", ["4:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
+    (
+      "TypedReenter",
+      [
+        "4:7: error: overlapping accesses to 'arena', but modification requires exclusive access [#ExclusivityViolation]"
+      ]
+    ),
     ("ArenaOuter", ["4:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
     (
       "ArenaSwap",

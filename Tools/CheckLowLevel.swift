@@ -229,6 +229,18 @@ func checkLowLevel() throws {
       + arenaSources + ["-o", arenaImage.path])
   try run("ArenaExecution", executable: arenaImage, arguments: [])
 
+  let typedImage = scratch.appendingPathComponent("EmbeddedTypedProbe")
+  try run(
+    "EmbeddedTyped", executable: compiler,
+    arguments: host + embedded + lifetimes + ["-no-allocations", "-D", "BOUNDEDMEMORY_STANDALONE"]
+      + [
+        arenaSources[0],
+        root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
+        root.appendingPathComponent("Examples/EmbeddedTypedProbe/main.swift").path,
+        "-o", typedImage.path,
+      ])
+  try run("TypedExecution", executable: typedImage, arguments: [])
+
   try run(
     "AllocatingControl", executable: compiler,
     arguments: common + embedded + [
@@ -261,116 +273,141 @@ func checkLowLevel() throws {
       }
       try run("Version-" + name, executable: tool, arguments: ["--version"])
     }
-    for target in ["aarch64-none-none-elf", "x86_64-unknown-none-elf"] {
-      let prefix = "Arena-" + target
-      let original = scratch.appendingPathComponent(prefix + ".ll")
-      try run(
-        prefix, executable: compiler,
-        arguments: common + embedded + lifetimes + [
-          "-no-allocations", "-target", target, "-emit-ir", arenaSources[0],
+    let traces = [
+      (
+        "Arena", "arena_trace",
+        [
+          arenaSources[0],
           root.appendingPathComponent("Examples/ArenaTrace/ArenaTrace.swift").path,
-          "-o", original.path,
-        ])
-      let reachable = scratch.appendingPathComponent(prefix + "-reachable.ll")
-      try run(
-        prefix + "-Reachable", executable: llvm.appendingPathComponent("opt"),
-        arguments: [
-          "-verify-each", "-passes=internalize<preserve-gv=arena_trace>,globaldce", "-S",
-          original.path, "-o", reachable.path,
-        ])
-      // LLVM function attributes override llc -mattr. Apply the explicit experiment profile here.
-      let features =
-        target.hasPrefix("x86")
-        ? "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-avx512f,-x87,+soft-float"
-        : "-fp-armv8,-neon,-sve,-sve2,-sme,-sme2"
-      let featurePattern = try NSRegularExpression(pattern: #""target-features"="[^"]*""#)
-      let text = try String(contentsOf: reachable, encoding: .utf8)
-      let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-      var changed = 0
-      let profiled = lines.map { line -> String in
-        guard line.hasPrefix("attributes #") else { return line }
-        guard line.contains(#""target-features"="#) else { return line }
-        changed += 1
-        let adjusted = featurePattern.stringByReplacingMatches(
-          in: line,
-          range: NSRange(line.startIndex..., in: line),
-          withTemplate: #""target-features"="$FEATURES""#.replacingOccurrences(
-            of: "$FEATURES", with: features))
-        return adjusted.replacingOccurrences(of: " = {", with: " = { noredzone")
-      }.joined(separator: "\n")
-      guard changed > 0 else { throw CheckFailure.refused("No target profile attributes") }
-      let kernelIR = scratch.appendingPathComponent(prefix + "-profile.ll")
-      try profiled.write(to: kernelIR, atomically: true, encoding: .utf8)
-      let object = scratch.appendingPathComponent(prefix + ".o")
-      let model = target.hasPrefix("x86") ? "kernel" : "small"
-      try run(
-        prefix + "-Object", executable: llvm.appendingPathComponent("llc"),
-        arguments: [
-          "-filetype=obj", "-code-model=" + model, kernelIR.path, "-o", object.path,
-        ])
-      try run(
-        prefix + "-Imports", executable: llvm.appendingPathComponent("llvm-nm"),
-        arguments: [
-          "--undefined-only", object.path,
-        ])
-      let imports = try String(
-        contentsOf: scratch.appendingPathComponent(prefix + "-Imports.log"),
-        encoding: .utf8
-      ).trimmingCharacters(in: .whitespacesAndNewlines)
-      guard imports.isEmpty else { throw CheckFailure.refused("Object imports: " + imports) }
-      try run(
-        prefix + "-Assembly", executable: llvm.appendingPathComponent("llvm-objdump"),
-        arguments: ["-d", "--no-show-raw-insn", object.path])
-      let assembly = try String(
-        contentsOf: scratch.appendingPathComponent(prefix + "-Assembly.log"),
-        encoding: .utf8)
-      let forbidden =
-        target.hasPrefix("x86")
-        ? #"%(?:xmm|ymm|zmm|mm)[0-9]+|%st(?:\(|\b)"#
-        : #"\b(?:v[0-9]+\.[0-9]+[bhsd]|[bhsdqzp][0-9]+)\b"#
-      // Match operands only: a hex instruction address such as `d0:` is not an FP register.
-      let operands = assembly.split(separator: "\n").compactMap { line -> String? in
-        guard line.range(of: #"^\s*[0-9a-f]+:\s"#, options: .regularExpression) != nil,
-          let colon = line.firstIndex(of: ":")
-        else { return nil }
-        let instruction = line[line.index(after: colon)...]
-        return String(instruction.split(separator: "<", maxSplits: 1)[0])
-      }.joined(separator: "\n")
-      guard operands.range(of: forbidden, options: .regularExpression) == nil else {
-        throw CheckFailure.refused("Floating-point/vector register in " + target)
-      }
-      print("PASS \(prefix): whole object has no undefined symbols or FP/vector registers")
+        ]
+      ),
+      (
+        "TypedArena", "typed_arena_trace",
+        [
+          arenaSources[0],
+          root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
+          root.appendingPathComponent("Examples/TypedTrace/TypedTrace.swift").path,
+        ]
+      ),
+    ]
+    for (kind, entry, sources) in traces {
+      for target in ["aarch64-none-none-elf", "x86_64-unknown-none-elf"] {
+        let prefix = kind + "-" + target
+        let original = scratch.appendingPathComponent(prefix + ".ll")
+        try run(
+          prefix, executable: compiler,
+          arguments: common + embedded + lifetimes + [
+            "-no-allocations", "-target", target, "-emit-ir",
+          ] + sources + ["-o", original.path])
+        let reachable = scratch.appendingPathComponent(prefix + "-reachable.ll")
+        try run(
+          prefix + "-Reachable", executable: llvm.appendingPathComponent("opt"),
+          arguments: [
+            "-verify-each", "-passes=internalize<preserve-gv=" + entry + ">,globaldce", "-S",
+            original.path, "-o", reachable.path,
+          ])
+        // LLVM function attributes override llc -mattr. Apply the explicit experiment profile here.
+        let features =
+          target.hasPrefix("x86")
+          ? "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-avx512f,-x87,+soft-float"
+          : "-fp-armv8,-neon,-sve,-sve2,-sme,-sme2"
+        let featurePattern = try NSRegularExpression(pattern: #""target-features"="[^"]*""#)
+        let text = try String(contentsOf: reachable, encoding: .utf8)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var changed = 0
+        let profiled = lines.map { line -> String in
+          guard line.hasPrefix("attributes #") else { return line }
+          guard line.contains(#""target-features"="#) else { return line }
+          changed += 1
+          let adjusted = featurePattern.stringByReplacingMatches(
+            in: line,
+            range: NSRange(line.startIndex..., in: line),
+            withTemplate: #""target-features"="$FEATURES""#.replacingOccurrences(
+              of: "$FEATURES", with: features))
+          return adjusted.replacingOccurrences(of: " = {", with: " = { noredzone")
+        }.joined(separator: "\n")
+        guard changed > 0 else { throw CheckFailure.refused("No target profile attributes") }
+        let kernelIR = scratch.appendingPathComponent(prefix + "-profile.ll")
+        try profiled.write(to: kernelIR, atomically: true, encoding: .utf8)
+        let object = scratch.appendingPathComponent(prefix + ".o")
+        let model = target.hasPrefix("x86") ? "kernel" : "small"
+        try run(
+          prefix + "-Object", executable: llvm.appendingPathComponent("llc"),
+          arguments: [
+            "-filetype=obj", "-code-model=" + model, kernelIR.path, "-o", object.path,
+          ])
+        try run(
+          prefix + "-Imports", executable: llvm.appendingPathComponent("llvm-nm"),
+          arguments: [
+            "--undefined-only", object.path,
+          ])
+        let imports = try String(
+          contentsOf: scratch.appendingPathComponent(prefix + "-Imports.log"),
+          encoding: .utf8
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Retain compiler stack protection and zero restoration; audit this exact PAL boundary.
+        let allowedImports: Set<String> =
+          kind == "TypedArena" ? ["memset", "__stack_chk_fail", "__stack_chk_guard"] : []
+        let importedSymbols = imports.split(separator: "\n").compactMap {
+          $0.split(separator: " ").last.map(String.init)
+        }
+        guard Set(importedSymbols).isSubset(of: allowedImports) else {
+          throw CheckFailure.refused("Object imports: " + imports)
+        }
+        try run(
+          prefix + "-Assembly", executable: llvm.appendingPathComponent("llvm-objdump"),
+          arguments: ["-d", "--no-show-raw-insn", object.path])
+        let assembly = try String(
+          contentsOf: scratch.appendingPathComponent(prefix + "-Assembly.log"),
+          encoding: .utf8)
+        let forbidden =
+          target.hasPrefix("x86")
+          ? #"%(?:xmm|ymm|zmm|mm)[0-9]+|%st(?:\(|\b)"#
+          : #"\b(?:v[0-9]+\.[0-9]+[bhsd]|[bhsdqzp][0-9]+)\b"#
+        // Match operands only: a hex instruction address such as `d0:` is not an FP register.
+        let operands = assembly.split(separator: "\n").compactMap { line -> String? in
+          guard line.range(of: #"^\s*[0-9a-f]+:\s"#, options: .regularExpression) != nil,
+            let colon = line.firstIndex(of: ":")
+          else { return nil }
+          let instruction = line[line.index(after: colon)...]
+          return String(instruction.split(separator: "<", maxSplits: 1)[0])
+        }.joined(separator: "\n")
+        guard operands.range(of: forbidden, options: .regularExpression) == nil else {
+          throw CheckFailure.refused("Floating-point/vector register in " + target)
+        }
+        print("PASS \(prefix): whole object imports \(importedSymbols); no FP/vector registers")
 
-      let controlIR = scratch.appendingPathComponent(prefix + "-dependency.ll")
-      try run(
-        prefix + "-Dependency", executable: compiler,
-        arguments: common + embedded + [
-          "-no-allocations", "-target", target, "-emit-ir",
-          root.appendingPathComponent("Examples/ArenaTrace/DependencyControl.swift").path,
-          "-o", controlIR.path,
-        ])
-      let controlLive = scratch.appendingPathComponent(prefix + "-dependency-live.ll")
-      try run(
-        prefix + "-DependencyReachable", executable: llvm.appendingPathComponent("opt"),
-        arguments: [
-          "-verify-each", "-passes=internalize<preserve-gv=arena_trace>,globaldce", "-S",
-          controlIR.path, "-o", controlLive.path,
-        ])
-      let controlObject = scratch.appendingPathComponent(prefix + "-dependency.o")
-      try run(
-        prefix + "-DependencyObject", executable: llvm.appendingPathComponent("llc"),
-        arguments: ["-filetype=obj", controlLive.path, "-o", controlObject.path])
-      try run(
-        prefix + "-DependencyImports", executable: llvm.appendingPathComponent("llvm-nm"),
-        arguments: ["--undefined-only", controlObject.path])
-      let controlImports = try String(
-        contentsOf: scratch.appendingPathComponent(prefix + "-DependencyImports.log"),
-        encoding: .utf8)
-      guard controlImports.contains(" U forbidden_dependency") else {
-        throw CheckFailure.refused("Undefined dependency control was not retained")
-      }
-      print("PASS \(prefix): no-allocations alone allows the forbidden dependency control")
+        let controlIR = scratch.appendingPathComponent(prefix + "-dependency.ll")
+        try run(
+          prefix + "-Dependency", executable: compiler,
+          arguments: common + embedded + [
+            "-no-allocations", "-target", target, "-emit-ir",
+            root.appendingPathComponent("Examples/ArenaTrace/DependencyControl.swift").path,
+            "-o", controlIR.path,
+          ])
+        let controlLive = scratch.appendingPathComponent(prefix + "-dependency-live.ll")
+        try run(
+          prefix + "-DependencyReachable", executable: llvm.appendingPathComponent("opt"),
+          arguments: [
+            "-verify-each", "-passes=internalize<preserve-gv=arena_trace>,globaldce", "-S",
+            controlIR.path, "-o", controlLive.path,
+          ])
+        let controlObject = scratch.appendingPathComponent(prefix + "-dependency.o")
+        try run(
+          prefix + "-DependencyObject", executable: llvm.appendingPathComponent("llc"),
+          arguments: ["-filetype=obj", controlLive.path, "-o", controlObject.path])
+        try run(
+          prefix + "-DependencyImports", executable: llvm.appendingPathComponent("llvm-nm"),
+          arguments: ["--undefined-only", controlObject.path])
+        let controlImports = try String(
+          contentsOf: scratch.appendingPathComponent(prefix + "-DependencyImports.log"),
+          encoding: .utf8)
+        guard controlImports.contains(" U forbidden_dependency") else {
+          throw CheckFailure.refused("Undefined dependency control was not retained")
+        }
+        print("PASS \(prefix): no-allocations alone allows the forbidden dependency control")
 
+      }
     }
   }
 
