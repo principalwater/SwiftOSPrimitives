@@ -16,14 +16,14 @@ Foundation clone is not required to solve Macray's resource lifecycle problems.
 | [swift-linux](https://github.com/swift-compositions/swift-linux/tree/edefc85621119b6be468630665b4dd3120a1c95f) | Subsystem products/reexports, real io_uring support probe, lifetime-borrowed descriptor targets | Small imports; typed failure and descriptor lifetime conventions | User-space syscalls; multiple unpinned main dependencies; README and manifest differ |
 | [swift-linux-standard](https://github.com/swift-linux-foundation/swift-linux-standard/tree/3a04e4791ba4663e512fdc4fd3867a9eda3fba37) | Typed syscall families, reexports and allocation statistics shim | Review individual Linux binding products before duplicating them | Community project, not Apple Foundation; declarations/system ABI are distinct from owned C implementation |
 | [swift-os](https://github.com/asaptf/swift-os/tree/bdb9debadc94599999744b7c8cd0aa74beb5c20e) | ARM64 custom OS, PMM bitmap/refcount core, MMIO/heap/context interfaces | Disposable guest/PAL fixture ideas; caller-provided allocator tables and lifecycle tests | Own ABI; C and assembly bridges remain; not a Linux/macOS module |
-| [Carette's kernel experiment](https://carette.xyz/posts/minimal_swift_kernel_on_qemu/) | Partial primary article and complete repository README retrieved | Explicit toolset, linker script, noalloc and orphan-section gates; stable C export direction | Recreational kernel; snapshot recommendation is not necessary for our tested release toolchain; full source/boot unverified |
+| [Carette's kernel experiment](https://carette.xyz/posts/minimal_swift_kernel_on_qemu/) | Primary article prefix and pinned kernel/boot/toolset/linker sources inspected | Explicit toolset, linker script, noalloc and orphan-section gates; stable C export direction | Recreational kernel; snapshot recommendation is not necessary for our tested release toolchain; boot execution unverified |
 
 Foundation's contemporary implementation split matters: corelibs supplies compatibility
 APIs and reexports FoundationEssentials/Internationalization from
 [swift-foundation](https://github.com/swiftlang/swift-foundation). Learn the module
 boundaries rather than importing the full framework into the nonallocating core.
 The existing PageMemory native platform boundary and the independent BoundedMemory
-product already follow this separation. No upstream implementation was copied.
+product already follow this separation. No upstream allocator implementation was copied.
 
 The Linux allocation-statistics shim replaces malloc/free using dlsym/pthread_once
 and per-thread counters. Its `bytesAllocated` is cumulative allocation, not current
@@ -37,6 +37,17 @@ cannot claim physical page ownership by copying the code. Its older `io.h` comme
 about no Swift volatile support also needs context: our 6.4.1 `_Volatile` experiment
 works. Volatile still does not implement cache maintenance, TLB operations, DMA
 ownership or architecture/device barriers.
+
+The small Carette kernel source was subsequently retrieved at
+[`83c8caf3`](https://git.carette.xyz/k0pernicus/swift-kernel/src/commit/83c8caf3e06fe6ba5fcb33593cda936c27df7e8e).
+Its UART polling reads ordinary pointer memory. Our equivalent compile-only
+experiment loses the plain polling loop entirely under Swift6.4.1 optimization;
+`VolatileMappedRegister<UInt8>` retains a volatile load and loop. Merely enabling
+the Volatile feature does not make ordinary pointers volatile. This is a concrete
+reason to reuse build ideas while auditing MMIO semantics. No device or guest
+kernel was accessed, and we did not build/boot that upstream project. We also
+adopted its stable `@c` export direction in the new compiler fixtures, verified
+against [SE-0495](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0495-cdecl.md).
 
 The [Gentoo page](https://wiki.gentoo.org/wiki/User:SwifT/Complete_Handbook/Building_the_Linux_kernel)
 is an ordinary Linux kernel build handbook; `SwifT` is its author's username.

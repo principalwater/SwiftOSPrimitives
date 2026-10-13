@@ -1,6 +1,8 @@
 # SwiftOSPrimitives
 
-Native Swift operating-system primitives, starting with **PageMemory**.
+Ownership and bounded-memory primitives for Swift systems software, with optional
+freestanding validation. Complements typed OS bindings; this is not an OS, kernel
+allocator, runtime or Foundation replacement.
 
 PageMemory owns anonymous private mappings without a class, ARC ownership or COW
 storage. It lends synchronous `Span`/`MutableSpan` views, retires contents before

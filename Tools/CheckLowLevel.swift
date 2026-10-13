@@ -165,6 +165,50 @@ func checkLowLevel() throws {
       !instructions.contains(where: { $0.contains("call ") || $0.contains("invoke ") })
     else { throw CheckFailure.refused("Volatile count or call-free contract: " + target) }
     print("PASS \(target): two volatile loads, two volatile stores, no calls")
+    let pollingIR = scratch.appendingPathComponent(target + "-polling.ll")
+    try run(
+      target + "-polling", executable: compiler,
+      arguments: common + embedded + [
+        "-no-allocations", "-target", target, "-emit-ir",
+        root.appendingPathComponent("Examples/RegisterTrace/PollingTrace.swift").path,
+        "-o", pollingIR.path,
+      ])
+    let polling = try String(contentsOf: pollingIR, encoding: .utf8)
+    let pollingLines = polling.split(separator: "\n", omittingEmptySubsequences: false)
+    guard
+      let pollingStart = pollingLines.firstIndex(where: {
+        $0.hasPrefix("define ") && $0.contains(" @uart_poll_volatile(") && $0.hasSuffix("{")
+      }), let pollingEnd = pollingLines[(pollingStart + 1)...].firstIndex(of: "}")
+    else {
+      throw CheckFailure.refused("Missing volatile polling entry")
+    }
+    let pollingBody = pollingLines[(pollingStart + 1)..<pollingEnd]
+    var block = ""
+    var loadBlocks = Set<String>()
+    var selfBranches = Set<String>()
+    let targets = try NSRegularExpression(pattern: #"label %([-A-Za-z$._0-9]+)"#)
+    for instruction in pollingBody {
+      if instruction.range(of: #"^[-A-Za-z$._0-9]+:"#, options: .regularExpression) != nil {
+        block = String(instruction.prefix(while: { $0 != ":" }))
+      }
+      if instruction.contains("load atomic volatile i8") { loadBlocks.insert(block) }
+      if instruction.contains("br i1") {
+        let line = String(instruction)
+        for match in targets.matches(in: line, range: NSRange(line.startIndex..., in: line)) {
+          if let range = Range(match.range(at: 1), in: line), String(line[range]) == block {
+            selfBranches.insert(block)
+          }
+        }
+      }
+    }
+    guard pollingBody.filter({ $0.contains("load atomic volatile i8") }).count == 1,
+      !loadBlocks.intersection(selfBranches).isEmpty,
+      !pollingBody.contains(where: { $0.contains("call ") || $0.contains("invoke ") })
+    else {
+      throw CheckFailure.refused("Volatile polling load/loop contract")
+    }
+    print("PASS \(target): volatile polling retains a load and conditional backedge")
+
     try run(
       target + "-assembly", executable: compiler,
       arguments: common + embedded + [

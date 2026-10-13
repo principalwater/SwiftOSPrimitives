@@ -23,3 +23,8 @@ In particular, a CPU atomic fence is not automatically a device/DMA barrier.
 
 Run the combined validation with the compiler helper described in
 [EmbeddedPageProbe](../EmbeddedPageProbe/README.md).
+
+`PollingTrace.swift` adds a compile-only MMIO polling comparison. Ordinary
+pointer loads are not volatile; the pinned compiler can delete the plain loop.
+The volatile loop must retain its load and conditional branch. There is no
+concurrent-RAM or real-device execution in this fixture.
