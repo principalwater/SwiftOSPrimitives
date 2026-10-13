@@ -1,0 +1,39 @@
+name: Validate
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, xcode-27]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: swift-actions/setup-swift@7591e4f04c00624cb043783da51a7fd6ee0a6bf6 # v2
+        with:
+          swift-version: "6.4.1"
+      - name: Toolchain
+        run: swift --version
+      - name: Validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          fi
+          swift test -c release --jobs 2 -Xswiftc -warnings-as-errors
+          modules="$(swift build -c release --show-bin-path)"
+          swift Tools/CheckCompileFailures.swift "$(command -v swiftc)" "$modules" Tests/CompileFail "$RUNNER_TEMP/ownership"
+          swift run -c release --skip-build page-memory-probe soak 300
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            swiftc -swift-version 6 -strict-memory-safety -warnings-as-errors \
+              -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+              -emit-module -module-name PageMemory Sources/PageMemory/PageRegion.swift \
+              -emit-module-path "$RUNNER_TEMP/PageMemory-ios18.swiftmodule"
+          fi
