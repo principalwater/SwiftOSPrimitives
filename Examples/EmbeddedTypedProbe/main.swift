@@ -16,7 +16,13 @@
     var storage: InlineArray<1024, UInt8> = .init(repeating: 71)
     var destroyed = 0
     withUnsafeMutablePointer(to: &destroyed) { counter in
-      var arena = ScratchArena(storage: storage.mutableSpan)
+      let loan = storage.mutableSpan
+      let base = loan.withUnsafeBufferPointer { UInt(bitPattern: $0.baseAddress) }
+      let alignment = MemoryLayout<Token>.alignment
+      var first = 0
+      while (base + UInt(first)) % UInt(alignment) != 0 { first += 1 }
+      let end = first + 4 * MemoryLayout<Token>.stride
+      var arena = ScratchArena(storage: consume loan)
       for iteration in 0..<1000 {
         for count in 0...4 {
           let before = unsafe counter.pointee
@@ -37,6 +43,17 @@
             }
           }
           precondition(unsafe counter.pointee == before + count * (count + 1) / 2)
+          switch arena.withAllocation(
+            byteCount: 1024,
+            { bytes, _ in
+              for index in first..<end { precondition(bytes[index] == 0) }
+              for index in 0..<first { precondition(bytes[index] == 71) }
+              precondition(bytes[1023] == 71)
+            })
+          {
+          case .allocated: break
+          case .refused: preconditionFailure("Failed typed request leaked its byte loan")
+          }
         }
         switch arena.withTypedAllocation(
           of: Token.self, capacity: 4,
@@ -63,10 +80,19 @@
       case .refused(.invalidSize): break
       default: preconditionFailure("Overflow admitted")
       }
+      switch arena.withAllocation(
+        byteCount: 1024,
+        { bytes, _ in
+          for index in first..<(end + 8) { precondition(bytes[index] == 0) }
+          for index in 0..<first { precondition(bytes[index] == 71) }
+          precondition(bytes[1023] == 71)
+        })
+      {
+      case .allocated: break
+      case .refused: preconditionFailure("Final byte loan refused")
+      }
+
     }
     precondition(destroyed == 37000)
-    // The first four Token slots and the following nested UInt64 have all been restored.
-    for index in 0..<(4 * MemoryLayout<Token>.stride + 8) { precondition(storage[index] == 0) }
-    precondition(storage[1023] == 71)
   }
 }

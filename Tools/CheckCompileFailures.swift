@@ -29,6 +29,9 @@ func runChecks() throws {
   let cases: [(String, [String])] = [
     ("CompilerVersion", []),
     ("ArenaPositive", []),
+    ("TypedOwnerOuter", ["4:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
+    ("TypedNestedOwner", ["4:65: error: lifetime-dependent variable 'outer' escapes its scope"]),
+    ("TypedRemainderAlias", ["4:72: error: lifetime-dependent variable 'rest' escapes its scope"]),
     (
       "TypedEscape",
       [

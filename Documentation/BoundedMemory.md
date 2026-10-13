@@ -128,8 +128,11 @@ case .refused(let reason): print(reason)
 }
 ```
 
-The library deinitializes the borrowed UInt8 extent, temporarily rebinds memory,
-then destroys the output span **before** restoring byte binding. Its standard
+The library deinitializes the borrowed UInt8 extent and explicitly binds the
+uninitialized memory to Element. A private function owns/destroys the output
+span **before** the caller explicitly binds and initializes UInt8 again.
+Temporary `withMemoryRebound` is intentionally not used across unrelated types: its
+layout-compatibility requirement still applies to previously bound storage. Its standard
 `OutputSpan` destructor destroys every remaining live element. An outer `defer`
 reinitializes the entire reserved extent as zero UInt8 values, even when the
 callback throws or replaces the output span with an empty one. Alignment padding
@@ -140,6 +143,13 @@ The library owns no backing allocation or heap object-tracking table. Ordinary S
 generic metadata/runtime initialization is not excluded for arbitrary element/result
 types; only the pinned Embedded fixtures have a compiler-checked no-allocation
 contract. This does not remove normal Swift runtime RSS.
+
+Empty element types use their standard stride (at least one byte); they still
+reserve bounded capacity. Destruction order within one prefix is unspecified.
+
+Use checked builds (`-Onone` or `-O`), as the gates do. `-Ounchecked` removes
+standard-library preconditions and is outside this safety contract, just as for
+Array and Span. This package does not weaken or disable exclusivity/safety checks.
 
 Cleanup is O(live elements + reserved bytes). This is not secure erasure, a promise
 of immediate physical-page release or fallible construction of arbitrary Swift
@@ -161,13 +171,16 @@ Native release and AddressSanitizer tests exercise partial construction lengths
 0...4, exact destruction identities, success/error reuse, replacement, independent
 noncopyable transfer and ARC-owned page-backed resources before reclaim. An
 independent actual-address grid verifies typed alignment, zero restoration and
-untouched bytes. Three new emit-SIL consumers reject initialized-span return,
-outer-lifetime storage and parent reentry; the positive consumer exercises scalar
+untouched bytes. Six new emit-SIL consumers reject initialized-span return,
+outer-lifetime storage, parent reentry, captured-owner moves, nested-owner moves and
+output/remainder aliasing; the positive consumer exercises scalar
 return. iOS18 module compatibility and Linux CI remain gates.
 
 `EmbeddedTypedProbe` combines the sources into one Embedded module and runs 1,000
 cycles (5 partial-error requests plus success/nesting per cycle), with a checked
-37,000 destructor checksum and zero restoration. It compiles with `-no-allocations`,
+37,000 destructor checksum, zero restoration after each throw, and actual-address
+alignment padding. Only the standalone combined-module Embedded mode is checked;
+normal package consumers exercise the imported-module API. It compiles with `-no-allocations`,
 strict memory safety and warnings as errors. The fixture uses a stack-owned
 counter pointer with a bounded native loan; it adds no general raw-pointer API.
 
@@ -184,5 +197,7 @@ these objects have not been linked into Kbuild or booted in a guest.
 
 Upstream semantics were checked against the pinned
 [Swift6.4.1 OutputSpan source](https://github.com/swiftlang/swift/blob/swift-6.4.1-RELEASE/stdlib/public/core/Span/OutputSpan.swift)
-and installed interfaces, then exercised natively. No custom object runtime,
+and installed interfaces, then exercised natively. Explicit binding follows the
+[raw-pointer memory-state contract](https://github.com/swiftlang/swift/blob/swift-6.4.1-RELEASE/stdlib/public/core/UnsafeRawPointer.swift);
+ASan alone cannot validate type-binding/TBAA rules. No custom object runtime,
 allocator interposer or borrowed upstream allocator implementation was added.

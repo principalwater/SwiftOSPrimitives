@@ -19,6 +19,111 @@ private final class OwnedResource {
 }
 
 struct TypedArenaTests {
+  @Test func nestedNontrivialFailuresDestroyBothPrefixesAndRetype() {
+    enum Payload: Error, Equatable { case inner, outer }
+    let ledger = DestructionLedger()
+    var backing = [UInt8](repeating: 71, count: 256)
+    var arena = ScratchArena(storage: backing.mutableSpan)
+    for innerThrows in [true, false] {
+      ledger.identifiers = []
+      do throws(Payload) {
+        let _: AllocationOutcome<Int> = try arena.withTypedAllocation(
+          of: TrackedElement.self, capacity: 2
+        ) { outer, rest throws(Payload) in
+          outer.append(TrackedElement(identifier: 1, ledger: ledger))
+          let nested = try rest.withTypedAllocation(of: TrackedElement.self, capacity: 2) {
+            inner, _ throws(Payload) in
+            inner.append(TrackedElement(identifier: 2, ledger: ledger))
+            if innerThrows { throw .inner }
+            return 29
+          }
+          switch nested {
+          case .allocated(let value): #expect(value == 29 && ledger.identifiers == [2])
+          case .refused: Issue.record("Nested typed request refused")
+          }
+          #expect(outer.span[0].identifier == 1)
+          throw .outer
+        }
+        Issue.record("Nested typed error swallowed")
+      } catch { #expect(error == (innerThrows ? .inner : .outer)) }
+      #expect(ledger.identifiers == [2, 1])
+      // A different trivial type may bind the same deinitialized extent after the failure.
+      switch arena.withTypedAllocation(
+        of: UInt64.self, capacity: 4,
+        { output, _ in
+          output.append(73)
+          return output.span[0]
+        })
+      {
+      case .allocated(let value): #expect(value == 73)
+      case .refused: Issue.record("Retyping after nested failure refused")
+      }
+    }
+  }
+
+  @Test func variedLayoutsEmptyStorageAndExactFit() {
+    struct Empty {}
+    struct Padded {
+      let first: UInt64
+      let last: UInt8
+    }
+    struct Triple {
+      let first: UInt64
+      let second: UInt64
+      let last: UInt8
+    }
+    @_alignment(16) struct Aligned { let value: UInt64 }
+    func exercise<Element>(_ value: Element) {
+      let stride = MemoryLayout<Element>.stride
+      let alignment = MemoryLayout<Element>.alignment
+      var backing = [UInt8](repeating: 71, count: 129)
+      var span = backing.mutableSpan
+      let base = span.withUnsafeBufferPointer { UInt(bitPattern: $0.baseAddress) }
+      let first = (1..<(1 + alignment)).first { (base + UInt($0)) % UInt(alignment) == 0 } ?? 1
+      let loan = span._mutatingExtracting(first..<(first + 3 * stride))
+      var arena = ScratchArena(storage: consume loan)
+      switch arena.withTypedAllocation(
+        of: Element.self, capacity: 3,
+        { output, rest in
+          #expect(rest.capacity == 0 && output.capacity == 3)
+          output.append(value)
+          output.append(value)
+          output.append(value)
+          #expect(output.count == 3)
+        })
+      {
+      case .allocated: break
+      case .refused: Issue.record("Exact-fit typed layout refused")
+      }
+      for count in [Int.max / stride + (stride == 1 ? 0 : 1), Int.max / stride] {
+        switch arena.withTypedAllocation(
+          of: Element.self, capacity: count,
+          { _, _ in
+            Issue.record("Huge typed layout admitted")
+          })
+        {
+        case .allocated: break
+        case .refused(let reason):
+          #expect(reason == (count > Int.max / stride ? .invalidSize : .capacityExceeded))
+        }
+      }
+    }
+    exercise(Empty())
+    exercise(Padded(first: 17, last: 29))
+    exercise(Triple(first: 17, second: 29, last: 41))
+    exercise(Aligned(value: 73))
+    var empty = ScratchArena(storage: MutableSpan<UInt8>())
+    switch empty.withTypedAllocation(
+      of: UInt64.self, capacity: 1,
+      { _, _ in
+        Issue.record("Empty storage admitted typed elements")
+      })
+    {
+    case .allocated: break
+    case .refused(let reason): #expect(reason == .capacityExceeded)
+    }
+  }
+
   @Test func pageOwnedReferencesEndBeforeReclamation() throws {
     let ledger = DestructionLedger()
     weak var observed: OwnedResource?

@@ -1,6 +1,7 @@
 extension ScratchArena {
   /// Lends storage for at most `capacity` elements, initially with no live elements.
-  /// The standard-library output span destroys its remaining elements on return or throw.
+  /// The output span destroys its remaining elements on replacement, return or throw.
+  /// Unsafe output operations must not leave live elements outside its tracked count.
   /// Reserved bytes are then restored as initialized zero bytes, including unused slots.
   /// Refusal leaves bytes untouched; this library owns no backing allocation or tracking heap.
   /// Constructors, destructors and ordinary Swift runtime work may allocate or block.
@@ -18,14 +19,24 @@ extension ScratchArena {
         // A positive admitted extent has a base; UInt8 has no destructor or invalid bit pattern.
         let base = unsafe buffer.baseAddress.unsafelyUnwrapped
         let raw = unsafe base.deinitialize(count: buffer.count)
-        defer { unsafe base.initialize(repeating: 0, count: buffer.count) }
-        return try unsafe raw.withMemoryRebound(to: type, capacity: capacity) {
-          pointer throws(Failure) in
-          let typed = unsafe UnsafeMutableBufferPointer(start: pointer, count: capacity)
-          var output = unsafe OutputSpan(buffer: typed, initializedCount: 0)
-          return try body(&output, &remainder)
+        defer {
+          // No Element remains live: rebind the uninitialized extent and restore byte ownership.
+          _ = unsafe raw.initializeMemory(as: UInt8.self, repeating: 0, count: buffer.count)
         }
+        // Deinitialized UInt8 remains bound; arbitrary Element is not layout-compatible with it.
+        let pointer = unsafe raw.bindMemory(to: type, capacity: capacity)
+        let typed = unsafe UnsafeMutableBufferPointer(start: pointer, count: capacity)
+        return try unsafe withTypedStorage(typed, remainder: &remainder, body)
       }
     }
   }
+}
+
+// The function boundary ends OutputSpan ownership before the caller can rebind/zero its extent.
+@unsafe private func withTypedStorage<Element: ~Copyable, Value: ~Copyable, Failure: Error>(
+  _ buffer: UnsafeMutableBufferPointer<Element>, remainder: inout ScratchArena,
+  _ body: (inout OutputSpan<Element>, inout ScratchArena) throws(Failure) -> Value
+) throws(Failure) -> Value {
+  var output = unsafe OutputSpan(buffer: buffer, initializedCount: 0)
+  return try body(&output, &remainder)
 }

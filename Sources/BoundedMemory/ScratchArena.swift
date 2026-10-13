@@ -11,7 +11,7 @@ extension AllocationOutcome: Copyable where Value: Copyable {}
 
 /// Synchronous scratch reservations in exclusively borrowed, initialized byte storage.
 /// No heap allocation, syscall, synchronization or address relocation is performed.
-/// Bytes retain their previous contents; this is not a typed-object allocator or physical pin.
+/// Byte reservations retain contents; typed reservations end zero-filled. Neither is a physical pin.
 /// `Lifetimes` is experimental: build and verify with the pinned Swift 6.4.1 toolchain.
 @safe public struct ScratchArena: ~Copyable, ~Escapable {
   private var storage: MutableSpan<UInt8>
