@@ -21,7 +21,10 @@ final class Echo: ChannelInboundHandler {
   func errorCaught(context: ChannelHandlerContext, error: any Error) { context.close(promise: nil) }
 }
 
-enum LabError: Error { case timeout, invalidReply }
+enum LabError: Error {
+  case timeout, invalidReply
+  case descriptorMismatch(before: Int, after: Int)
+}
 struct Reply: Sendable {
   let cycles: Int
   let digest: UInt64
@@ -172,7 +175,16 @@ func descriptorCount() throws -> Int {
 do {
   // Warm native runtime/stdio once before comparing resource counts.
   try perform()
-  let before = try descriptorCount()
+  // NIO's graceful callback can precede thread-local descriptor retirement.
+  let settleEnd = ContinuousClock.now.advanced(by: .seconds(1))
+  var before = try descriptorCount()
+  var stable = 0
+  while stable < 10 && ContinuousClock.now < settleEnd {
+    _ = usleep(1000)
+    let current = try descriptorCount()
+    stable = current == before ? stable + 1 : 0
+    before = current
+  }
   for _ in 0..<20 { try perform() }
   for _ in 0..<10 {
     do {
@@ -180,8 +192,13 @@ do {
       throw LabError.invalidReply
     } catch LabError.timeout {}
   }
-  let after = try descriptorCount()
-  guard after == before else { throw LabError.invalidReply }
+  let retirementEnd = ContinuousClock.now.advanced(by: .seconds(1))
+  var after = try descriptorCount()
+  while after != before && ContinuousClock.now < retirementEnd {
+    _ = usleep(1000)
+    after = try descriptorCount()
+  }
+  guard after == before else { throw LabError.descriptorMismatch(before: before, after: after) }
   print(
     "{\"resource_check\":\"passed\",\"fd_before\":\(before),\"fd_after\":\(after),\"timeouts\":10,\"successful_connections\":21}"
   )
