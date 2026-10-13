@@ -10,7 +10,8 @@ dependencies and contains no C, Rust, shell or Python implementations.
 ## Requirements
 
 Swift 6.4 or later; development and validation use Swift 6.4.1.
-macOS 27 and Linux are tested. The declared iOS 18 target compiles with the iOS 27
+macOS 27 release tests pass; the static Linux build and runtime probe pass.
+Native Linux package tests are a separate CI gate. The declared iOS 18 target compiles with the iOS 27
 SDK using back-deployable Span APIs; device behavior is not claimed.
 
 ## Use
@@ -86,8 +87,9 @@ allocator/PAL and VM-balloon integrations should be justified by measured needs.
 
 The target enables strict memory-safety diagnostics. Its small unsafe boundary
 binds Span lifetimes explicitly to the owner using the toolchain's underscored
-`_overrideLifetime` helper. Compiler upgrade checks must validate this dependency.
-Safe use requires Swift's exclusivity checks; do not disable them. Nonlocal
+`_overrideLifetime` helper and `_unsafeStart` initializers. Compiler upgrade checks
+must validate these dependencies. Safe use requires Swift's exclusivity and
+bounds checks; do not disable them or use `-Ounchecked`. Nonlocal
 aliasing may be checked dynamically rather than diagnosed at compile time.
 Syscall failure injection and destructive VMA-hole tests are not included.
 

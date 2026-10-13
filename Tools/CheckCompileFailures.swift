@@ -25,16 +25,28 @@ func runChecks() throws {
   guard files.isExecutableFile(atPath: compiler.path) else { throw CheckError.arguments }
   try files.createDirectory(at: scratch, withIntermediateDirectories: true)
 
-  let cases: [(String, String?)] = [
-    ("PositiveControl", nil),
-    ("CopyOwner", "consumed more than once"),
-    ("EscapingBorrow", "escapes"),
-    ("ReleaseDuringBorrow", "overlapping accesses"),
-    ("OuterBorrow", "lifetime"),
-    ("MutableBorrow", "lifetime"),
-    ("TaskCapture", "capture"),
+  let cases: [(String, [String])] = [
+    ("CompilerVersion", []),
+    ("PositiveControl", []),
+    ("CopyOwner", ["4:7: error: 'region' consumed more than once"]),
+    ("EscapingBorrow", ["4:26: error: lifetime-dependent variable 'bytes' escapes its scope"]),
+    (
+      "ReleaseDuringBorrow",
+      [
+        "6:10: error: overlapping accesses to 'region', but modification requires exclusive access [#ExclusivityViolation]"
+      ]
+    ),
+    ("OuterBorrow", ["6:9: error: lifetime-dependent variable 'saved' escapes its scope"]),
+    (
+      "MutableBorrow",
+      [
+        "8:38: error: missing reinitialization of inout parameter 'inner' after consume",
+        "5:32: error: lifetime-dependent variable 'outer' escapes its scope",
+      ]
+    ),
+    ("TaskCapture", ["4:26: error: lifetime-dependent variable 'bytes' escapes its scope"]),
   ]
-  for (name, diagnostic) in cases {
+  for (name, expected) in cases {
     let log = scratch.appendingPathComponent(name + ".log")
     guard files.createFile(atPath: log.path, contents: nil) else {
       throw CheckError.compilation(name)
@@ -43,6 +55,10 @@ func runChecks() throws {
     defer { try? output.close() }
     let process = Process()
     process.executableURL = compiler
+    var environment = ProcessInfo.processInfo.environment
+    // A new compiler invocation must not inherit the parent's Swiftly proxy sentinel.
+    environment.removeValue(forKey: "SWIFTLY_PROXY_IN_PROGRESS")
+    process.environment = environment
     process.arguments = [
       "-swift-version", "6", "-emit-sil", "-I", modules,
       "-module-cache-path", scratch.appendingPathComponent("module-cache").path,
@@ -52,6 +68,7 @@ func runChecks() throws {
     if let sdk = ProcessInfo.processInfo.environment["SDKROOT"] {
       process.arguments?.append(contentsOf: ["-sdk", sdk])
     }
+    if name == "CompilerVersion" { process.arguments = ["-version"] }
     process.standardOutput = output
     process.standardError = output
     try process.run()
@@ -73,15 +90,18 @@ func runChecks() throws {
     let size = try files.attributesOfItem(atPath: log.path)[.size] as? NSNumber
     guard let size, size.intValue <= 65_536 else { throw CheckError.outputTooLarge }
     let text = String(decoding: try Data(contentsOf: log), as: UTF8.self)
-    if let diagnostic {
+    if !expected.isEmpty {
+      let actual = text.split(separator: "\n").filter { $0.contains(": error:") }.map(String.init)
+      let prefix = sources.appendingPathComponent(name + ".swift").path + ":"
       guard process.terminationReason == .exit, process.terminationStatus != 0,
-        text.contains("error:"), text.localizedCaseInsensitiveContains(diagnostic)
+        actual.sorted() == expected.map({ prefix + $0 }).sorted()
       else { throw CheckError.compilation(name + ": " + text) }
     } else {
       guard process.terminationReason == .exit, process.terminationStatus == 0 else {
         throw CheckError.compilation(name + ": " + text)
       }
     }
+    if name == "CompilerVersion" { print(text.trimmingCharacters(in: .whitespacesAndNewlines)) }
     print("PASS \(name)")
   }
   print("Compiler evidence: \(scratch.path)")

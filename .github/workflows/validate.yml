@@ -15,6 +15,16 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
+      - name: Import official Swift signing keys
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --compressed --location --proto '=https' \
+            https://www.swift.org/keys/all-keys.asc --output "$RUNNER_TEMP/swift-keys.asc"
+          gpg --show-keys --with-colons "$RUNNER_TEMP/swift-keys.asc" > "$RUNNER_TEMP/swift-key-fingerprints.txt"
+          grep -q 'fpr:::::::::E813C892820A6FA13755B268F167DF1ACF9CE069:' "$RUNNER_TEMP/swift-key-fingerprints.txt"
+          gpg --batch --import "$RUNNER_TEMP/swift-keys.asc"
       - uses: swift-actions/setup-swift@364295d9c23900ce04d4e5cc708387921b4e50f9 # v3.0.0-beta.1
         with:
           swift-version: "6.4.1"
