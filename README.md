@@ -13,6 +13,7 @@ Swift 6.4 or later; development and validation use Swift 6.4.1.
 macOS 27 release tests pass; the static Linux build and runtime probe pass.
 Native Linux package tests are a separate CI gate. The declared iOS 18 target compiles with the iOS 27
 SDK using back-deployable Span APIs; device behavior is not claimed.
+Windows 10 x64 uses native WinSDK APIs; its CI gate uses exactly Swift 6.4.1.
 
 ## Use
 
@@ -47,6 +48,11 @@ allocator heaps, executable pages, files or other processes are reclaimed.
   initialization can use the kernel's zero-on-demand behavior.
 - Darwin: `MADV_FREE` is lazy advice. Reset explicitly zeros logical bytes because
   old contents may still exist; reset touches pages and can make them resident again.
+- Windows: `VirtualAlloc` reserves and commits private read/write pages. Discard
+  uses `VirtualFree(MEM_DECOMMIT)`, retaining the address reservation. Reset
+  decommits active contents and recommits zero-on-demand pages; if recommit fails,
+  contents remain retired and reset/release can be retried. Release uses
+  `VirtualFree(MEM_RELEASE)` with size zero. No `MEM_RESET` zero guarantee is assumed.
 - Advice failures conservatively retire contents. Access remains denied until a
   successful reset; advice and explicit release can be retried.
 - Advice reports bytes submitted, not a fictional physical-memory delta.
@@ -68,12 +74,21 @@ swift Tools/CheckCompileFailures.swift /path/to/swiftc /path/to/built/modules Te
 
 Unit tests cover bounds/rounding, independent owners, borrowed access,
 discard/reset, residency and release. `Tests/CompileFail` contains negative
-consumers for double consumption, escaping/nested/mutable borrows, task capture
+consumers for double consumption, escaping/nested/mutable borrows, task capture, non-Sendable ownership
 and release during a borrow, plus a positive control.
 Those cases are expected to be rejected by the compiler, not built as package tests.
 On macOS, set `SDKROOT` to the installed macOS SDK for the compiler helper.
+On Windows with Swift 6.4.1, use `swift test -c release -Xswiftc -disable-cmo`:
+cross-module optimization otherwise removes SwiftBuild's empty DLL test anchor
+and discovers zero cases. This keeps release optimization, exclusivity and memory
+safety checks enabled. CI also checks that all six Windows cases are discovered.
+Compile `Tools/CheckCompileFailures.swift` with `swiftc -swift-version 6 -o checker.exe`
+and invoke that executable with the four shown arguments on Windows; its interpreter
+cannot load the helper's Foundation symbols in this toolchain.
 
 The probe only uses its own mappings and bounded reads of Linux self-status/self-smaps.
+On Windows, its counters use the calling process's working set and CPU time;
+the residency query inspects this owner's pages with at most 1024 native entries.
 `baseline` emits process-image counters; `smaps` emits mapping details;
 `soak N` exercises at most one 1 MiB mapping at a time. `paced-soak N` adds 20 ms
 between cycles for an isolated diagnostic run. Measurements are diagnostic,

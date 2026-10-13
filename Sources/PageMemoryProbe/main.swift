@@ -4,31 +4,46 @@ import PageMemory
   import Darwin
 #elseif canImport(Glibc)
   import Glibc
+#elseif os(Windows)
+  import WinSDK
+  import ucrt
 #else
   import Musl
 #endif
 
-func readKernel(_ path: String, limit: Int = 1_048_576) -> String? {
-  let fd = open(path, O_RDONLY | O_CLOEXEC)
-  guard fd >= 0 else { return nil }
-  defer { _ = close(fd) }
-  var bytes = [UInt8](repeating: 0, count: limit)
-  var used = 0
-  while used < limit {
-    let count = bytes.withUnsafeMutableBytes { raw in
-      read(fd, raw.baseAddress!.advanced(by: used), limit - used)
+#if os(Linux)
+  func readKernel(_ path: String, limit: Int = 1_048_576) -> String? {
+    let fd = open(path, O_RDONLY | O_CLOEXEC)
+    guard fd >= 0 else { return nil }
+    defer { _ = close(fd) }
+    var bytes = [UInt8](repeating: 0, count: limit)
+    var used = 0
+    while used < limit {
+      let count = bytes.withUnsafeMutableBytes { raw in
+        read(fd, raw.baseAddress!.advanced(by: used), limit - used)
+      }
+      if count == 0 { return String(decoding: bytes[..<used], as: UTF8.self) }
+      if count < 0 {
+        if errno == EINTR { continue }
+        return nil
+      }
+      used += count
     }
-    if count == 0 { return String(decoding: bytes[..<used], as: UTF8.self) }
-    if count < 0 {
-      if errno == EINTR { continue }
-      return nil
-    }
-    used += count
+    return nil
   }
-  return nil
-}
+#endif
+
 func memoryField(_ name: String) -> String {
   #if canImport(Darwin)
+    return "null"
+  #elseif os(Windows)
+    var counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = DWORD(MemoryLayout<PROCESS_MEMORY_COUNTERS>.size)
+    guard K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, counters.cb) else {
+      return "null"
+    }
+    if name == "VmRSS" { return String(counters.WorkingSetSize) }
+    if name == "VmHWM" { return String(counters.PeakWorkingSetSize) }
     return "null"
   #else
     guard let text = readKernel("/proc/self/status", limit: 16384),
@@ -42,12 +57,27 @@ func memoryField(_ name: String) -> String {
   #endif
 }
 func processCpuNanoseconds() -> Int64? {
-  var value = timespec()
-  guard clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0,
-    value.tv_sec >= 0, value.tv_sec <= (Int64.max - 999_999_999) / 1_000_000_000,
-    (0..<1_000_000_000).contains(value.tv_nsec)
-  else { return nil }
-  return Int64(value.tv_sec) * 1_000_000_000 + Int64(value.tv_nsec)
+  #if os(Windows)
+    var created = FILETIME()
+    var exited = FILETIME()
+    var kernel = FILETIME()
+    var user = FILETIME()
+    guard GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) else {
+      return nil
+    }
+    let kernelTicks = UInt64(kernel.dwHighDateTime) << 32 | UInt64(kernel.dwLowDateTime)
+    let userTicks = UInt64(user.dwHighDateTime) << 32 | UInt64(user.dwLowDateTime)
+    let (ticks, overflow) = kernelTicks.addingReportingOverflow(userTicks)
+    guard !overflow, ticks <= UInt64(Int64.max / 100) else { return nil }
+    return Int64(ticks) * 100
+  #else
+    var value = timespec()
+    guard clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &value) == 0,
+      value.tv_sec >= 0, value.tv_sec <= (Int64.max - 999_999_999) / 1_000_000_000,
+      (0..<1_000_000_000).contains(value.tv_nsec)
+    else { return nil }
+    return Int64(value.tv_sec) * 1_000_000_000 + Int64(value.tv_nsec)
+  #endif
 }
 func run() throws {
   let args = CommandLine.arguments
@@ -88,14 +118,20 @@ func run() throws {
     let resident = try region.residentPageCount()
     guard resident > 0 else { throw PageMemoryError.unavailable }
     _ = try region.discardContents()
-    #if os(Linux)
+    #if os(Linux) || os(Windows)
       guard try region.residentPageCount() == 0 else { throw PageMemoryError.unavailable }
     #endif
     try region.resetToZero()
     guard try region.withBytes({ $0[0] }) == 0 else { throw PageMemoryError.unavailable }
     try region.release()
     guard region.isReleased else { throw PageMemoryError.unavailable }
-    if args[1] == "paced-soak" { _ = usleep(20_000) }
+    if args[1] == "paced-soak" {
+      #if os(Windows)
+        Sleep(20)
+      #else
+        _ = usleep(20_000)
+      #endif
+    }
   }
   let duration = started.duration(to: .now).components
   let cpuAfter = processCpuNanoseconds()
