@@ -2,8 +2,14 @@
   import Darwin
 #elseif canImport(Glibc)
   import Glibc
-#else
+#elseif canImport(Musl)
   import Musl
+#elseif canImport(SwiftGlibc)
+  import SwiftGlibc
+#elseif canImport(SwiftMusl)
+  import SwiftMusl
+#else
+  #error("A native libc declaration module is required.")
 #endif
 #if !PAGEMEMORY_STANDALONE
   import PageMemory

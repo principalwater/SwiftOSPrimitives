@@ -4,6 +4,10 @@
   import Glibc
 #elseif os(Linux) && canImport(Musl)
   import Musl
+#elseif os(Linux) && canImport(SwiftGlibc)
+  import SwiftGlibc
+#elseif os(Linux) && canImport(SwiftMusl)
+  import SwiftMusl
 #endif
 
 /// A failed self-memory observation; Mach and POSIX codes retain their native operation.
@@ -50,11 +54,23 @@ public struct ProcessMemorySnapshot: Equatable, Sendable {
         residentBytes: info.resident_size,
         physicalFootprintBytes: returnedBytes >= footprintEnd ? info.phys_footprint : nil)
     #else
-      let fd = unsafe open("/proc/self/statm", O_RDONLY | O_CLOEXEC)
-      guard fd >= 0 else {
-        throw .systemCall(operation: .selfMemory, code: NativeMemorySystem.errorCode)
-      }
-      defer { _ = close(fd) }
+      #if hasFeature(Embedded)
+        // The normal Swift libc overlay is unavailable; these libc APIs have fixed signatures.
+        guard let file = unsafe fopen("/proc/self/statm", "re") else {
+          throw .systemCall(operation: .selfMemory, code: NativeMemorySystem.errorCode)
+        }
+        defer { _ = unsafe fclose(file) }
+        let fd = unsafe fileno(file)
+        guard fd >= 0 else {
+          throw .systemCall(operation: .selfMemory, code: NativeMemorySystem.errorCode)
+        }
+      #else
+        let fd = unsafe open("/proc/self/statm", O_RDONLY | O_CLOEXEC)
+        guard fd >= 0 else {
+          throw .systemCall(operation: .selfMemory, code: NativeMemorySystem.errorCode)
+        }
+        defer { _ = close(fd) }
+      #endif
       var buffer = InlineArray<256, UInt8>(repeating: 0)
       var used = 0
       var interruptions = 0

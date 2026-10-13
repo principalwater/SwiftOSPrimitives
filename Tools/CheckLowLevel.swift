@@ -35,6 +35,7 @@ func checkLowLevel() throws {
     child.environment = environment
     child.standardOutput = output
     child.standardError = output
+    child.standardInput = FileHandle.nullDevice
     try child.run()
     let end = ContinuousClock.now.advanced(by: .seconds(60))
     while child.isRunning && ContinuousClock.now < end { Thread.sleep(forTimeInterval: 0.02) }
@@ -63,6 +64,27 @@ func checkLowLevel() throws {
   var host = common
   if let sdk = ProcessInfo.processInfo.environment["SDKROOT"] { host += ["-sdk", sdk] }
   let embedded = ["-enable-experimental-feature", "Embedded"]
+  var embeddedHost = host + embedded
+  #if os(Linux)
+    try run("TargetInfo", executable: compiler, arguments: ["-print-target-info"])
+    let targetInfo =
+      try JSONSerialization.jsonObject(
+        with: Data(contentsOf: scratch.appendingPathComponent("TargetInfo.log"))) as? [String: Any]
+    guard let paths = targetInfo?["paths"] as? [String: Any],
+      let resourcePath = paths["runtimeResourcePath"] as? String,
+      let target = targetInfo?["target"] as? [String: Any],
+      let triple = target["triple"] as? String,
+      let architecture = triple.split(separator: "-").first
+    else { throw CheckFailure.refused("Missing compiler resource path") }
+    let platform = URL(fileURLWithPath: resourcePath).appendingPathComponent("linux")
+      .appendingPathComponent(String(architecture))
+    let moduleMap = platform.appendingPathComponent("glibc.modulemap")
+    guard files.fileExists(atPath: moduleMap.path) else {
+      throw CheckFailure.refused("Native Glibc declaration map unavailable: " + moduleMap.path)
+    }
+    // Import existing libc declarations without the non-Embedded Swift overlay.
+    embeddedHost += ["-Xcc", "-fmodule-map-file=" + moduleMap.path]
+  #endif
   let pages = try files.contentsOfDirectory(
     atPath: root.appendingPathComponent("Sources/PageMemory").path
   )
@@ -72,7 +94,7 @@ func checkLowLevel() throws {
   let pageImage = scratch.appendingPathComponent("EmbeddedPageProbe")
   try run(
     "EmbeddedPages", executable: compiler,
-    arguments: host + embedded + ["-D", "PAGEMEMORY_STANDALONE"] + pages + [
+    arguments: embeddedHost + ["-D", "PAGEMEMORY_STANDALONE"] + pages + [
       root.appendingPathComponent("Examples/EmbeddedPageProbe/main.swift").path, "-o",
       pageImage.path,
     ])
@@ -82,7 +104,7 @@ func checkLowLevel() throws {
   let traceImage = scratch.appendingPathComponent("RegisterTrace")
   try run(
     "EmbeddedRegisters", executable: compiler,
-    arguments: host + embedded + [
+    arguments: embeddedHost + [
       trace, root.appendingPathComponent("Examples/RegisterTrace/main.swift").path,
       "-o", traceImage.path,
     ])
@@ -96,15 +118,20 @@ func checkLowLevel() throws {
         "-no-allocations", "-target", target, "-emit-ir", trace, "-o", ir.path,
       ])
     let contents = try String(contentsOf: ir, encoding: .utf8)
-    guard let start = contents.range(of: "@register_trace32("),
-      let bodyStart = contents[start.upperBound...].range(of: "{\n"),
-      let bodyEnd = contents[bodyStart.upperBound...].range(of: "\n}")
+    let lines = contents.split(separator: "\n", omittingEmptySubsequences: false)
+    guard
+      let start = lines.firstIndex(where: {
+        $0.hasPrefix("define ") && $0.contains(" @register_trace32(") && $0.hasSuffix("{")
+      }), let end = lines[(start + 1)...].firstIndex(of: "}")
     else { throw CheckFailure.refused("Missing exported trace body") }
-    let body = contents[bodyStart.upperBound..<bodyEnd.lowerBound]
-    let instructions = body.split(separator: "\n")
+    let instructions = lines[(start + 1)..<end]
     let loads = instructions.filter { $0.contains("load atomic volatile i32") }
     let stores = instructions.filter { $0.contains("store atomic volatile i32") }
+    let accesses = instructions.filter { $0.contains("atomic volatile") }
     guard loads.count == 2, stores.count == 2,
+      accesses.count == 4,
+      accesses.map({ $0.contains("store atomic volatile i32") }) == [true, false, true, false],
+      accesses.allSatisfy({ $0.contains("monotonic, align 4") }),
       !instructions.contains(where: { $0.contains("call ") || $0.contains("invoke ") })
     else { throw CheckFailure.refused("Volatile count or call-free contract: " + target) }
     print("PASS \(target): two volatile loads, two volatile stores, no calls")

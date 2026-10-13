@@ -29,3 +29,10 @@ and some standard-library paths still require allocation support. The register
 leaf passes that mode separately. No infallible allocation or validation is
 removed to make the full library pass. Reclamation is process-local; this is
 not guest VM ballooning or a replacement for a kernel allocator.
+
+For native Linux/glibc, the helper locates the compiler-provided SwiftGlibc
+declaration map. The optional self-observer uses fopen/fileno/fclose in Embedded
+mode because the overlay supplies the normal variadic open wrapper. The FILE
+object may allocate in libc and is closed before capture returns. The normal
+library retains open/O_CLOEXEC. No custom C implementation or ABI redeclaration
+is introduced.
