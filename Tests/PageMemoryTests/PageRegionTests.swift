@@ -91,8 +91,8 @@ import Testing
       let locked = try region.withMutableBytes { bytes in
         bytes[0] = 73
         bytes[bytes.count - 1] = 91
-        return unsafe bytes.withUnsafeMutableBufferPointer { buffer in
-          mlock(buffer.baseAddress, buffer.count)
+        return bytes.withUnsafeMutableBufferPointer { buffer in
+          unsafe mlock(buffer.baseAddress, buffer.count)
         }
       }
       try #require(locked == 0, "mlock failed with errno \(errno)")

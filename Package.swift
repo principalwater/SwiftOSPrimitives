@@ -11,6 +11,8 @@ let package = Package(
   targets: [
     .target(name: "PageMemory", swiftSettings: [.strictMemorySafety()]),
     .executableTarget(name: "PageMemoryProbe", dependencies: ["PageMemory"]),
-    .testTarget(name: "PageMemoryTests", dependencies: ["PageMemory"]),
+    .testTarget(
+      name: "PageMemoryTests", dependencies: ["PageMemory"],
+      swiftSettings: [.strictMemorySafety()]),
   ],
   swiftLanguageModes: [.v6])
