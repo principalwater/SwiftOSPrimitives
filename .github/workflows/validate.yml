@@ -50,4 +50,9 @@ jobs:
               -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
               -emit-module -module-name PageMemory Sources/PageMemory/*.swift \
               -emit-module-path "$RUNNER_TEMP/PageMemory-ios18.swiftmodule"
+            swiftc -swift-version 6 -enable-experimental-feature Lifetimes \
+              -strict-memory-safety -warnings-as-errors \
+              -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
+              -emit-module -module-name BoundedMemory Sources/BoundedMemory/*.swift \
+              -emit-module-path "$RUNNER_TEMP/BoundedMemory-ios18.swiftmodule"
           fi

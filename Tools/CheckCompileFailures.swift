@@ -17,16 +17,39 @@ enum CheckError: Error {
 func runChecks() throws {
   let arguments = CommandLine.arguments
   guard arguments.count == 5 else { throw CheckError.arguments }
-  let compiler = URL(fileURLWithPath: arguments[1])
+  let compiler = URL(fileURLWithPath: arguments[1]).standardizedFileURL
   let modules = arguments[2]
-  let sources = URL(fileURLWithPath: arguments[3])
-  let scratch = URL(fileURLWithPath: arguments[4]).appendingPathComponent(UUID().uuidString)
+  let sources = URL(fileURLWithPath: arguments[3]).standardizedFileURL
+  let scratch = URL(fileURLWithPath: arguments[4]).standardizedFileURL.appendingPathComponent(
+    UUID().uuidString)
   let files = FileManager.default
   guard files.isExecutableFile(atPath: compiler.path) else { throw CheckError.arguments }
   try files.createDirectory(at: scratch, withIntermediateDirectories: true)
 
   let cases: [(String, [String])] = [
     ("CompilerVersion", []),
+    ("ArenaPositive", []),
+    ("ArenaOuter", ["4:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
+    (
+      "ArenaSwap",
+      [
+        "8:5: error: global function 'swap' requires that 'MutableSpan<UInt8>' conform to 'Escapable'"
+      ]
+    ),
+    ("ArenaCopy", ["6:7: error: 'arena' consumed more than once"]),
+    ("ArenaEscape", ["4:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
+    (
+      "ArenaReenter",
+      [
+        "6:7: error: overlapping accesses to 'arena', but modification requires exclusive access [#ExclusivityViolation]"
+      ]
+    ),
+    (
+      "ArenaRemainder",
+      [
+        "6:13: error: instance method 'withAllocation(byteCount:alignment:_:)' requires that 'ScratchArena' conform to 'Escapable'"
+      ]
+    ),
     ("PositiveControl", []),
     ("CopyOwner", ["4:7: error: 'region' consumed more than once"]),
     ("EscapingBorrow", ["4:26: error: lifetime-dependent variable 'bytes' escapes its scope"]),
@@ -61,7 +84,8 @@ func runChecks() throws {
     environment.removeValue(forKey: "SWIFTLY_PROXY_IN_PROGRESS")
     process.environment = environment
     process.arguments = [
-      "-swift-version", "6", "-emit-sil", "-I", modules,
+      "-swift-version", "6", "-enable-experimental-feature", "Lifetimes", "-emit-sil", "-I",
+      modules,
       "-module-cache-path", scratch.appendingPathComponent("module-cache").path,
       sources.appendingPathComponent(name + ".swift").path,
       "-o", scratch.appendingPathComponent(name + ".sil").path,

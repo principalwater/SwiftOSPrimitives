@@ -150,3 +150,10 @@ Formatting follows a 100-column, two-space Swift profile informed by
 ## License
 
 MIT. Operating-system APIs and the Swift toolchain retain their own licenses.
+
+## BoundedMemory research product
+
+Experimental `BoundedMemory` adds nonallocating borrowed scratch reservations and
+whole-object Embedded compiler checks. It is separate from PageMemory and requires
+pinned Swift6.4.1 lifetime features. See [the contract](Documentation/BoundedMemory.md).
+This research branch does not yet combine the independently developed Windows main.
