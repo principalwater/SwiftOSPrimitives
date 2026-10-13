@@ -84,6 +84,74 @@ import Testing
     #expect(try region.withBytes { $0[0] } == 73)
     try region.release()
   }
+  @Test func throwingCallbacksPreserveErrorAndOwnership() throws {
+    enum Rejected: Error, Equatable { case payload }
+    var region = try PageRegion.allocate(byteCount: 1)
+    #expect(throws: Rejected.payload) {
+      try region.withWriteAccess { (bytes: inout MutableSpan<UInt8>) throws(Rejected) -> Void in
+        bytes[0] = 73
+        throw .payload
+      }
+    }
+    #expect(try region.withBytes { $0[0] } == 73)
+    #expect(throws: Rejected.payload) {
+      try region.withReadAccess { (_: Span<UInt8>) throws(Rejected) -> Void in throw .payload }
+    }
+    try region.release()
+  }
+  @Test func callbackReturnsIndependentNoncopyableOwner() throws {
+    struct Token: ~Copyable { let value: Int }
+    var region = try PageRegion.allocate(byteCount: 1)
+    let first = try region.withBytes { _ in Token(value: 73) }
+    let second = try region.withMutableBytes { _ in Token(value: 91) }
+    let values = (first.value, second.value)
+    #expect(values.0 == 73 && values.1 == 91)
+  }
+  @Test func reusableAdviceCanCycleAndChangeStrategy() throws {
+    let sizing = try PageRegion.allocate(byteCount: 1)
+    var region = try PageRegion.allocate(byteCount: sizing.pageSize + 1)
+    for strategy: ReclamationStrategy in [.reusable, .platformDefault, .reusable] {
+      try region.withMutableBytes { bytes in
+        bytes[0] = 73
+        bytes[bytes.count - 1] = 91
+      }
+      let report = try region.discardContents(using: strategy)
+      #expect(report.advisedBytes == region.mappedByteCount)
+      #if canImport(Darwin)
+        #expect(report.semantics == .lazyFree)
+        #expect(report.usesReusableAccounting == (strategy == .reusable))
+      #else
+        #expect(report.semantics == .discardAndZeroOnDemand)
+        #expect(!report.usesReusableAccounting)
+      #endif
+      #expect(throws: PageMemoryError.contentsDiscarded) { _ = try region.withBytes { $0[0] } }
+      try region.resetToZero()
+      #expect(try region.withBytes { $0[0] } == 0)
+      #expect(try region.withBytes { $0[$0.count - 1] } == 0)
+    }
+    try region.release()
+  }
+  @Test func nativeSelfMemoryCountersAreAvailable() throws {
+    let snapshot = try ProcessMemorySnapshot.capture()
+    #expect(snapshot.residentBytes > 0)
+    #if canImport(Darwin)
+      #expect(snapshot.physicalFootprintBytes != nil)
+    #else
+      #expect(snapshot.physicalFootprintBytes == nil)
+    #endif
+  }
+  #if canImport(Darwin)
+    @Test func discardedRegionCanUpgradeReusableAccounting() throws {
+      var region = try PageRegion.allocate(byteCount: 1)
+      _ = try region.discardContents()
+      let upgrade = try region.discardContents(using: .reusable)
+      #expect(upgrade.advisedBytes == region.mappedByteCount && upgrade.usesReusableAccounting)
+      let noop = try region.discardContents(using: .platformDefault)
+      #expect(noop.advisedBytes == 0 && noop.usesReusableAccounting)
+      try region.resetToZero()
+      #expect(try region.withBytes { $0[0] } == 0)
+    }
+  #endif
   #if os(Linux)
     @Test func lockedPagesRecoverAfterAdviceFailure() throws {
       let sizing = try PageRegion.allocate(byteCount: 1)

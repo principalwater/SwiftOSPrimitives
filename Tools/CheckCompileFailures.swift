@@ -45,6 +45,7 @@ func runChecks() throws {
       ]
     ),
     ("TaskCapture", ["4:26: error: lifetime-dependent variable 'bytes' escapes its scope"]),
+    ("ThrowingBorrow", ["6:32: error: lifetime-dependent variable 'bytes' escapes its scope"]),
   ]
   for (name, expected) in cases {
     let log = scratch.appendingPathComponent(name + ".log")

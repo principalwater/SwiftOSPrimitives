@@ -41,9 +41,12 @@ jobs:
           modules="$(swift build -c release --show-bin-path)"
           swift Tools/CheckCompileFailures.swift "$(command -v swiftc)" "$modules" Tests/CompileFail "$RUNNER_TEMP/ownership"
           swift run -c release --skip-build page-memory-probe soak 300
+          swift run -c release --skip-build page-memory-probe cycle reuse 1000 65536
+          swift run -c release --skip-build page-memory-probe footprint reusable
+          swift run --package-path Examples/NIOResourceLab -c release --jobs 2
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             swiftc -swift-version 6 -strict-memory-safety -warnings-as-errors \
               -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
-              -emit-module -module-name PageMemory Sources/PageMemory/PageRegion.swift \
+              -emit-module -module-name PageMemory Sources/PageMemory/*.swift \
               -emit-module-path "$RUNNER_TEMP/PageMemory-ios18.swiftmodule"
           fi
