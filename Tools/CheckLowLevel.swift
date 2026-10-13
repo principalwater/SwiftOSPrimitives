@@ -90,13 +90,27 @@ func checkLowLevel() throws {
     guard files.fileExists(atPath: moduleMap.path) else {
       throw CheckFailure.refused("Native Glibc declaration map unavailable: " + moduleMap.path)
     }
-    // Import existing libc declarations without the non-Embedded Swift overlay.
-    embeddedHost += ["-I", platform.path, "-Xcc", "-fmodule-map-file=" + moduleMap.path]
     let systemHeaders = "/usr/include"
     let architectureHeaders = systemHeaders + "/" + String(architecture) + "-linux-gnu"
     guard files.fileExists(atPath: systemHeaders + "/assert.h"),
       files.fileExists(atPath: architectureHeaders + "/bits/wordsize.h")
     else { throw CheckFailure.refused("Native glibc development headers unavailable") }
+    // Module-map headers resolve relative to the map, independently of include search paths.
+    var map = try String(contentsOf: moduleMap, encoding: .utf8)
+    let pattern = try NSRegularExpression(pattern: #"\bheader "([^"]+)""#)
+    let matches = pattern.matches(in: map, range: NSRange(map.startIndex..., in: map))
+    for match in matches.reversed() {
+      guard let range = Range(match.range(at: 1), in: map) else { throw CheckFailure.arguments }
+      let name = String(map[range])
+      let candidates = [platform.path, systemHeaders, architectureHeaders].map { $0 + "/" + name }
+      guard let path = candidates.first(where: { files.fileExists(atPath: $0) }) else {
+        throw CheckFailure.refused("Missing module-map header: " + name)
+      }
+      map.replaceSubrange(range, with: path)
+    }
+    let boundMap = scratch.appendingPathComponent("glibc.modulemap")
+    try map.write(to: boundMap, atomically: true, encoding: .utf8)
+    embeddedHost += ["-Xcc", "-fmodule-map-file=" + boundMap.path]
     // Embedded deliberately omits system include paths; this is a native user-space fixture.
     embeddedHost += [
       "-Xcc", "-isystem", "-Xcc", systemHeaders,
