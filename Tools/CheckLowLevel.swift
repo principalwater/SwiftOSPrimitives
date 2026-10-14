@@ -12,6 +12,185 @@ enum CheckFailure: Error {
   case deadline, oversizedEvidence
 }
 
+// ELF flags are audited declarations; this single-CPU guest has no MMU-enforced W^X policy.
+func auditGuestELF(_ path: URL) throws {
+  let attributes = try FileManager.default.attributesOfItem(atPath: path.path)
+  guard let size = attributes[.size] as? NSNumber, size.intValue <= 16 * 1024 * 1024 else {
+    throw CheckFailure.refused("ELF size")
+  }
+  let data = try Data(contentsOf: path)
+  func read(_ offset: Int, _ width: Int) throws -> UInt64 {
+    guard offset >= 0, width > 0, width <= 8, offset <= data.count - width else {
+      throw CheckFailure.refused("ELF extent")
+    }
+    var value: UInt64 = 0
+    for index in 0..<width { value |= UInt64(data[offset + index]) << (index * 8) }
+    return value
+  }
+  guard data.count >= 64, try read(0, 4) == 0x464c_457f,
+    data[4] == 2, data[5] == 1, data[6] == 1,
+    try read(16, 2) == 2, try read(18, 2) == 183, try read(20, 4) == 1,
+    try read(52, 2) == 64
+  else { throw CheckFailure.refused("ELF identity") }
+  let entry = try read(24, 8)
+  let programOffset = try read(32, 8)
+  let sectionOffset = try read(40, 8)
+  let programCount = try read(56, 2)
+  let sectionCount = try read(60, 2)
+  guard try read(54, 2) == 56, try read(58, 2) == 64,
+    programCount > 0, programCount <= 32, sectionCount > 0, sectionCount <= 128,
+    programOffset >= 64, sectionOffset >= 64,
+    programOffset <= UInt64(data.count), sectionOffset <= UInt64(data.count),
+    programCount * 56 <= UInt64(data.count) - programOffset,
+    sectionCount * 64 <= UInt64(data.count) - sectionOffset
+  else { throw CheckFailure.refused("ELF tables") }
+  var executableEntry = false
+  var stack = false
+  var loads: [Range<UInt64>] = []
+  for index in 0..<Int(programCount) {
+    let offset = Int(programOffset) + index * 56
+    let type = try read(offset, 4)
+    let flags = try read(offset + 4, 4)
+    guard type != 2, type != 3, type != 7 else { throw CheckFailure.refused("ELF dynamic/TLS") }
+    guard type == 1 || type == 0x6474_e551 else {
+      throw CheckFailure.refused("ELF segment type")
+    }
+    guard flags & 3 != 3 else { throw CheckFailure.refused("ELF writable executable segment") }
+    if type == 0x6474_e551 {
+      guard flags == 6, !stack else { throw CheckFailure.refused("ELF entry/stack") }
+      stack = true
+    }
+    if type == 1 {
+      let fileOffset = try read(offset + 8, 8)
+      let address = try read(offset + 16, 8)
+      let physicalAddress = try read(offset + 24, 8)
+      let fileBytes = try read(offset + 32, 8)
+      let memoryBytes = try read(offset + 40, 8)
+      guard fileOffset <= UInt64(data.count), fileBytes <= UInt64(data.count) - fileOffset,
+        physicalAddress == address, memoryBytes >= fileBytes,
+        address >= 0x4008_0000, address < 0x4400_0000,
+        memoryBytes <= 0x4400_0000 - address
+      else { throw CheckFailure.refused("ELF load extent") }
+      let extent = address..<(address + memoryBytes)
+      guard !loads.contains(where: { $0.overlaps(extent) }) else {
+        throw CheckFailure.refused("ELF overlapping loads")
+      }
+      loads.append(extent)
+      if flags & 1 != 0 && entry % 4 == 0 && entry >= address && entry - address < fileBytes {
+        executableEntry = true
+      }
+    }
+  }
+  guard stack, executableEntry else { throw CheckFailure.refused("ELF entry/stack") }
+  for index in 0..<Int(sectionCount) {
+    let offset = Int(sectionOffset) + index * 64
+    let type = try read(offset + 4, 4)
+    let bytes = try read(offset + 32, 8)
+    guard bytes == 0 || ![4, 9, 6, 11, 19, 0x4000_0014].contains(type) else {
+      throw CheckFailure.refused("ELF relocation/dynamic section")
+    }
+    if type != 8 {
+      let fileOffset = try read(offset + 24, 8)
+      guard fileOffset <= UInt64(data.count), bytes <= UInt64(data.count) - fileOffset else {
+        throw CheckFailure.refused("ELF section extent")
+      }
+    }
+  }
+}
+
+func checkELFRefusals(_ image: URL, scratch: URL) throws {
+  let original = try Data(contentsOf: image)
+  func word(_ offset: Int) -> Int {
+    (0..<8).reduce(0) { $0 | (Int(original[offset + $1]) << ($1 * 8)) }
+  }
+  func field(_ value: UInt64, width: Int = 8) -> Data {
+    Data((0..<width).map { UInt8(truncatingIfNeeded: value >> ($0 * 8)) })
+  }
+  let program = word(32)
+  let section = word(40) + 64
+  let address = UInt64(word(program + 16))
+  let fileBytes = UInt64(word(program + 32))
+  for (name, changes, expected) in [
+    ("Entry", [(24, field(0))], "ELF entry/stack"),
+    ("UnalignedEntry", [(24, field(address + 1))], "ELF entry/stack"),
+    (
+      "BSSentry",
+      [
+        (24, field(address + fileBytes + 4 - fileBytes % 4)),
+        (program + 40, field(fileBytes + 16)),
+      ], "ELF entry/stack"
+    ),
+    ("WX", [(program + 4, field(7, width: 4))], "ELF writable executable segment"),
+    ("Dynamic", [(program, field(2, width: 4))], "ELF dynamic/TLS"),
+    ("UnknownSegment", [(program, field(6, width: 4))], "ELF segment type"),
+    ("Relocation", [(section + 4, field(4, width: 4))], "ELF relocation/dynamic section"),
+    (
+      "PackedRelocation", [(section + 4, field(19, width: 4))],
+      "ELF relocation/dynamic section"
+    ),
+    ("Count", [(56, field(65535, width: 2))], "ELF tables"),
+    ("TableExtent", [(32, field(UInt64(original.count - 1)))], "ELF tables"),
+    ("Machine", [(18, field(62, width: 2))], "ELF identity"),
+    ("SharedImage", [(16, field(3, width: 2))], "ELF identity"),
+    ("Physical", [(program + 24, field(0x0900_0000))], "ELF load extent"),
+    (
+      "BelowRAM",
+      [
+        (program + 16, field(0x4000_0000)),
+        (program + 24, field(0x4000_0000)),
+      ], "ELF load extent"
+    ),
+    ("RAMextent", [(program + 40, field(0x4400_0000))], "ELF load extent"),
+    ("FileExtent", [(program + 32, field(UInt64(original.count + 1)))], "ELF load extent"),
+    ("FileOffset", [(program + 8, field(UInt64(original.count + 1)))], "ELF load extent"),
+    (
+      "SectionOffset", [(section + 24, field(UInt64(original.count + 1)))],
+      "ELF section extent"
+    ),
+    ("MissingStack", [(56, field(3, width: 2))], "ELF entry/stack"),
+    (
+      "DuplicateStack",
+      [
+        (program + 56, field(0x6474_e551, width: 4)),
+        (program + 60, field(6, width: 4)),
+      ], "ELF entry/stack"
+    ),
+    (
+      "Overlap", [(program + 72, field(address)), (program + 80, field(address))],
+      "ELF overlapping loads"
+    ),
+  ] {
+    var mutated = original
+    for (offset, replacement) in changes {
+      mutated.replaceSubrange(offset..<(offset + replacement.count), with: replacement)
+    }
+    let path = scratch.appendingPathComponent("InvalidELF-" + name + ".bin")
+    try mutated.write(to: path)
+    do {
+      try auditGuestELF(path)
+    } catch CheckFailure.refused(let reason) {
+      guard reason == expected else { throw CheckFailure.refused(name + ": " + reason) }
+      print("PASS ELF refusal: " + name)
+      continue
+    }
+    throw CheckFailure.refused("Invalid ELF admitted: " + name)
+  }
+}
+
+func hasFloatingPointOperands(_ assembly: String, target: String) -> Bool {
+  // Match operands only: a hex instruction address such as `d0:` is not an FP register.
+  let operands = assembly.split(separator: "\n").compactMap { line -> String? in
+    guard line.range(of: #"^\s*[0-9a-f]+:\s"#, options: .regularExpression) != nil,
+      let colon = line.firstIndex(of: ":")
+    else { return nil }
+    return String(line[line.index(after: colon)...].split(separator: "<", maxSplits: 1)[0])
+  }.joined(separator: "\n")
+  let forbidden =
+    target.hasPrefix("x86")
+    ? #"%(?:xmm|ymm|zmm|mm)[0-9]+|%st(?:\(|\b)"# : #"\b(?:v[0-9]+|[bhsdqzp][0-9]+)\b"#
+  return operands.range(of: forbidden, options: .regularExpression) != nil
+}
+
 func checkLowLevel() throws {
   let args = CommandLine.arguments
   guard args.count == 4 else { throw CheckFailure.arguments }
@@ -21,9 +200,16 @@ func checkLowLevel() throws {
     UUID().uuidString)
   let files = FileManager.default
   guard files.isExecutableFile(atPath: compiler.path) else { throw CheckFailure.arguments }
+  guard
+    ProcessInfo.processInfo.environment["GUEST_QEMU_BIN"] == nil
+      || ProcessInfo.processInfo.environment["KERNEL_LLVM_BIN"] != nil
+  else { throw CheckFailure.refused("GUEST_QEMU_BIN requires KERNEL_LLVM_BIN") }
   try files.createDirectory(at: scratch, withIntermediateDirectories: true)
 
-  func run(_ name: String, executable: URL, arguments: [String], expectedError: String? = nil)
+  func run(
+    _ name: String, executable: URL, arguments: [String], expectedError: String? = nil,
+    expectedOutput: String? = nil, timeoutSeconds: Int = 60
+  )
     throws
   {
     let log = scratch.appendingPathComponent(name + ".log")
@@ -47,14 +233,23 @@ func checkLowLevel() throws {
     ).write(
       to: scratch.appendingPathComponent(name + "-invocation.json"))
     try child.run()
-    let end = ContinuousClock.now.advanced(by: .seconds(60))
-    while child.isRunning && ContinuousClock.now < end { Thread.sleep(forTimeInterval: 0.02) }
+    let end = ContinuousClock.now.advanced(by: .seconds(timeoutSeconds))
+    var oversized = false
+    while child.isRunning && ContinuousClock.now < end {
+      let size = try files.attributesOfItem(atPath: log.path)[.size] as? NSNumber
+      if let size, size.intValue > 262_144 {
+        oversized = true
+        break
+      }
+      Thread.sleep(forTimeInterval: 0.02)
+    }
     if child.isRunning {
       child.terminate()
       let cleanup = ContinuousClock.now.advanced(by: .seconds(2))
       while child.isRunning && ContinuousClock.now < cleanup { Thread.sleep(forTimeInterval: 0.02) }
       if child.isRunning { _ = kill(child.processIdentifier, SIGKILL) }
       child.waitUntilExit()
+      if oversized { throw CheckFailure.oversizedEvidence }
       throw CheckFailure.deadline
     }
     child.waitUntilExit()
@@ -72,6 +267,10 @@ func checkLowLevel() throws {
       throw CheckFailure.refused(
         name + ": " + String(decoding: try Data(contentsOf: log), as: UTF8.self))
     }
+    if let expectedOutput {
+      let text = String(decoding: try Data(contentsOf: log), as: UTF8.self)
+      guard text == expectedOutput else { throw CheckFailure.refused(name + ": " + text) }
+    }
     print("PASS \(name)")
   }
 
@@ -80,6 +279,20 @@ func checkLowLevel() throws {
     "-warnings-as-errors", "-module-cache-path", scratch.appendingPathComponent("modules").path,
   ]
   try run("CompilerVersion", executable: compiler, arguments: ["--version"])
+  for (instruction, target, expected) in [
+    ("d0: ldr x0, [x1]", "aarch64", false),
+    ("10: ld1 {v0.s}[1], [x0]", "aarch64", true),
+    ("10: fmov x0, v0.d[1]", "aarch64", true),
+    ("10: mov v0, v1", "aarch64", true),
+    ("10: fmov d0, x0", "aarch64", true),
+    ("10: movq %rax, %rbx", "x86", false),
+    ("10: movq %rax, %xmm0", "x86", true),
+  ] {
+    guard hasFloatingPointOperands(instruction, target: target) == expected else {
+      throw CheckFailure.refused("Operand scanner control: " + instruction)
+    }
+  }
+  print("PASS OperandScannerControls")
   var host = common
   if let sdk = ProcessInfo.processInfo.environment["SDKROOT"] { host += ["-sdk", sdk] }
   let embedded = ["-enable-experimental-feature", "Embedded"]
@@ -241,6 +454,17 @@ func checkLowLevel() throws {
       ])
   try run("TypedExecution", executable: typedImage, arguments: [])
 
+  let fillImage = scratch.appendingPathComponent("FillProbe")
+  try run(
+    "EmbeddedFill", executable: compiler,
+    arguments: host + embedded + [
+      "-no-allocations",
+      root.appendingPathComponent("Examples/FreestandingGuest/MemoryFill.swift").path,
+      root.appendingPathComponent("Examples/FillProbe/main.swift").path,
+      "-o", fillImage.path,
+    ])
+  try run("FillExecution", executable: fillImage, arguments: [])
+
   try run(
     "AllocatingControl", executable: compiler,
     arguments: common + embedded + [
@@ -266,13 +490,38 @@ func checkLowLevel() throws {
   // This optional compiler experiment is a whole-object audit, not a kernel/module loader.
   if let llvmPath = ProcessInfo.processInfo.environment["KERNEL_LLVM_BIN"] {
     let llvm = URL(fileURLWithPath: llvmPath)
-    for name in ["opt", "llc", "llvm-nm", "llvm-objdump"] {
+    for name in ["opt", "llc", "llvm-nm", "llvm-objdump", "llvm-readelf"] {
       let tool = llvm.appendingPathComponent(name)
       guard files.isExecutableFile(atPath: tool.path) else {
         throw CheckFailure.refused("Missing requested LLVM tool: " + name)
       }
       try run("Version-" + name, executable: tool, arguments: ["--version"])
     }
+    func writeProfile(_ input: URL, output: URL, target: String) throws {
+      // Per-function attributes override llc defaults; preserve all stack protection attributes.
+      let features =
+        target.hasPrefix("x86")
+        ? "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-avx512f,-x87,+soft-float"
+        : "+strict-align,-fp-armv8,-neon,-sve,-sve2,-sme,-sme2"
+      let featurePattern = try NSRegularExpression(pattern: #""target-features"="[^"]*""#)
+      let text = try String(contentsOf: input, encoding: .utf8)
+      let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+      var changed = 0
+      let profiled = lines.map { line -> String in
+        guard line.hasPrefix("attributes #") else { return line }
+        guard line.contains(#""target-features"="#) else { return line }
+        changed += 1
+        let adjusted = featurePattern.stringByReplacingMatches(
+          in: line,
+          range: NSRange(line.startIndex..., in: line),
+          withTemplate: #""target-features"="$FEATURES""#.replacingOccurrences(
+            of: "$FEATURES", with: features))
+        return adjusted.replacingOccurrences(of: " = {", with: " = { noredzone")
+      }.joined(separator: "\n")
+      guard changed > 0 else { throw CheckFailure.refused("No target profile attributes") }
+      try profiled.write(to: output, atomically: true, encoding: .utf8)
+    }
+
     let traces = [
       (
         "Arena", "arena_trace",
@@ -306,29 +555,8 @@ func checkLowLevel() throws {
             "-verify-each", "-passes=internalize<preserve-gv=" + entry + ">,globaldce", "-S",
             original.path, "-o", reachable.path,
           ])
-        // LLVM function attributes override llc -mattr. Apply the explicit experiment profile here.
-        let features =
-          target.hasPrefix("x86")
-          ? "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,-avx512f,-x87,+soft-float"
-          : "-fp-armv8,-neon,-sve,-sve2,-sme,-sme2"
-        let featurePattern = try NSRegularExpression(pattern: #""target-features"="[^"]*""#)
-        let text = try String(contentsOf: reachable, encoding: .utf8)
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        var changed = 0
-        let profiled = lines.map { line -> String in
-          guard line.hasPrefix("attributes #") else { return line }
-          guard line.contains(#""target-features"="#) else { return line }
-          changed += 1
-          let adjusted = featurePattern.stringByReplacingMatches(
-            in: line,
-            range: NSRange(line.startIndex..., in: line),
-            withTemplate: #""target-features"="$FEATURES""#.replacingOccurrences(
-              of: "$FEATURES", with: features))
-          return adjusted.replacingOccurrences(of: " = {", with: " = { noredzone")
-        }.joined(separator: "\n")
-        guard changed > 0 else { throw CheckFailure.refused("No target profile attributes") }
         let kernelIR = scratch.appendingPathComponent(prefix + "-profile.ll")
-        try profiled.write(to: kernelIR, atomically: true, encoding: .utf8)
+        try writeProfile(reachable, output: kernelIR, target: target)
         let object = scratch.appendingPathComponent(prefix + ".o")
         let model = target.hasPrefix("x86") ? "kernel" : "small"
         try run(
@@ -360,19 +588,7 @@ func checkLowLevel() throws {
         let assembly = try String(
           contentsOf: scratch.appendingPathComponent(prefix + "-Assembly.log"),
           encoding: .utf8)
-        let forbidden =
-          target.hasPrefix("x86")
-          ? #"%(?:xmm|ymm|zmm|mm)[0-9]+|%st(?:\(|\b)"#
-          : #"\b(?:v[0-9]+\.[0-9]+[bhsd]|[bhsdqzp][0-9]+)\b"#
-        // Match operands only: a hex instruction address such as `d0:` is not an FP register.
-        let operands = assembly.split(separator: "\n").compactMap { line -> String? in
-          guard line.range(of: #"^\s*[0-9a-f]+:\s"#, options: .regularExpression) != nil,
-            let colon = line.firstIndex(of: ":")
-          else { return nil }
-          let instruction = line[line.index(after: colon)...]
-          return String(instruction.split(separator: "<", maxSplits: 1)[0])
-        }.joined(separator: "\n")
-        guard operands.range(of: forbidden, options: .regularExpression) == nil else {
+        guard !hasFloatingPointOperands(assembly, target: target) else {
           throw CheckFailure.refused("Floating-point/vector register in " + target)
         }
         print("PASS \(prefix): whole object imports \(importedSymbols); no FP/vector registers")
@@ -407,6 +623,110 @@ func checkLowLevel() throws {
         }
         print("PASS \(prefix): no-allocations alone allows the forbidden dependency control")
 
+      }
+    }
+    if let qemuPath = ProcessInfo.processInfo.environment["GUEST_QEMU_BIN"] {
+      let qemu = URL(fileURLWithPath: qemuPath).standardizedFileURL
+      let linker = compiler.deletingLastPathComponent().appendingPathComponent("ld.lld")
+      let clang = compiler.deletingLastPathComponent().appendingPathComponent("clang")
+      for tool in [qemu, linker, clang] {
+        guard files.isExecutableFile(atPath: tool.path) else {
+          throw CheckFailure.refused("Missing requested guest tool: " + tool.path)
+        }
+      }
+      try run("QEMUVersion", executable: qemu, arguments: ["--version"])
+      try run("LinkerVersion", executable: linker, arguments: ["--version"])
+      try run("ClangVersion", executable: clang, arguments: ["--version"])
+      let guest = root.appendingPathComponent("Examples/FreestandingGuest")
+      let boot = scratch.appendingPathComponent("GuestBoot.o")
+      try run(
+        "GuestBoot", executable: clang,
+        arguments: [
+          "--target=aarch64-none-elf", "-c",
+          guest.appendingPathComponent("boot.S").path, "-o", boot.path,
+        ])
+      let sources =
+        [
+          arenaSources[0],
+          root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
+        ]
+        + ["Guest.swift", "MemoryFill.swift", "Platform.swift"].map {
+          guest.appendingPathComponent($0).path
+        }
+      for (mode, definition, marker) in [
+        ("Success", "GUEST_BUILD", "GUEST_PASS\n"),
+        ("Guard", "GUEST_GUARD_FAILURE", "STACK_FAIL\n"),
+        ("Memory", "GUEST_MEMORY_FAILURE", "MEMORY_FAIL\n"),
+      ] {
+        let name = "Guest" + mode
+        let original = scratch.appendingPathComponent(name + ".ll")
+        try run(
+          name + "IR", executable: compiler,
+          arguments: common + embedded + lifetimes + [
+            "-no-allocations",
+            "-target", "aarch64-none-none-elf", "-I", guest.path,
+            "-D", "GUEST_BUILD", "-D", definition, "-emit-ir",
+          ]
+            + sources + ["-o", original.path])
+        let reachable = scratch.appendingPathComponent(name + "-live.ll")
+        let entries = [
+          "guest_main", "memset", "__stack_chk_guard", "__stack_chk_fail", "guard_probe",
+        ]
+        let preserved = entries.map { "preserve-gv=" + $0 }.joined(separator: ";")
+        try run(
+          name + "Reachable", executable: llvm.appendingPathComponent("opt"),
+          arguments: [
+            "-verify-each", "-passes=internalize<" + preserved + ">,globaldce",
+            "-S", original.path, "-o", reachable.path,
+          ])
+        let profile = scratch.appendingPathComponent(name + "-profile.ll")
+        try writeProfile(reachable, output: profile, target: "aarch64-none-none-elf")
+        let object = scratch.appendingPathComponent(name + ".o")
+        try run(
+          name + "Object", executable: llvm.appendingPathComponent("llc"),
+          arguments: ["-filetype=obj", "-code-model=small", profile.path, "-o", object.path])
+        let image = scratch.appendingPathComponent(name + ".elf")
+        try run(
+          name + "Link", executable: linker,
+          arguments: [
+            "--gc-sections", "--orphan-handling=error", "-z", "noexecstack",
+            "-z", "max-page-size=4096", "-T", guest.appendingPathComponent("link.ld").path,
+            boot.path, object.path, "-o", image.path,
+          ])
+        try run(
+          name + "Imports", executable: llvm.appendingPathComponent("llvm-nm"),
+          arguments: ["--undefined-only", image.path])
+        guard
+          try String(
+            contentsOf: scratch.appendingPathComponent(name + "Imports.log"),
+            encoding: .utf8
+          ).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { throw CheckFailure.refused("Final guest has undefined symbols") }
+        try run(
+          name + "Headers", executable: llvm.appendingPathComponent("llvm-readelf"),
+          arguments: [
+            "--file-header", "--program-headers", "--section-headers", "--relocations",
+            "--dynamic", image.path,
+          ])
+        try auditGuestELF(image)
+        if mode == "Success" { try checkELFRefusals(image, scratch: scratch) }
+        try run(
+          name + "Assembly", executable: llvm.appendingPathComponent("llvm-objdump"),
+          arguments: ["-d", "--no-show-raw-insn", image.path])
+        let assembly = try String(
+          contentsOf: scratch.appendingPathComponent(name + "Assembly.log"),
+          encoding: .utf8)
+        guard !hasFloatingPointOperands(assembly, target: "aarch64")
+        else { throw CheckFailure.refused("Guest FP/SIMD") }
+        try run(
+          name + "Execution", executable: qemu,
+          arguments: [
+            "-machine", "virt-10.2,secure=off,virtualization=off", "-accel",
+            "tcg,thread=single", "-cpu", "cortex-a72", "-m", "64M", "-smp", "1",
+            "-nic", "none", "-display", "none", "-nodefaults", "-monitor", "none",
+            "-serial", "stdio", "-no-reboot", "-kernel", image.path,
+          ],
+          expectedOutput: marker, timeoutSeconds: 10)
       }
     }
   }

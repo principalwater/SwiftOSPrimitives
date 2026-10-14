@@ -128,6 +128,13 @@ Swift 6.4.1 compiler-native volatile operations and checks their optimized code
 for ARM64 and x86-64 without touching hardware. These remain optional; the main
 package does not force Embedded mode or import `_Volatile`.
 
+[FreestandingGuest](Documentation/FreestandingGuest.md) adds a Swift-native RAM
+fill PAL and a complete ARM64 ELF/QEMU execution gate, including actual compiler
+stack-guard failure and memory-boundary negative controls. A small assembly boot
+boundary remains necessary; this experiment adds no package runtime dependency.
+[FillBenchmark](Examples/FillBenchmark) compares two standalone Swift volatile
+fill variants on macOS and makes no language-performance ranking.
+
 [Kernel Rust and Swift](Documentation/KernelRustAndSwift.md) explains the kernel
 contracts, current Swift capabilities and remaining compiler/subsystem work.
 
