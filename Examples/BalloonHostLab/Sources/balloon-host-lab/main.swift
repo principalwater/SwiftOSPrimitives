@@ -13,12 +13,13 @@ import HostLab
 private enum Failure: Error { case arguments, mismatch, cleanup }
 
 // The lab owns exactly this child; QEMU is configured without disks, NICs or subprocess backends.
-private func stop(_ process: Process) throws {
+private func stop(_ process: Process, escalated: inout Bool) throws {
   if process.isRunning {
     process.terminate()
     let end = ContinuousClock.now.advanced(by: .seconds(2))
     while process.isRunning && ContinuousClock.now < end { Thread.sleep(forTimeInterval: 0.01) }
     if process.isRunning {
+      escalated = true
       guard kill(process.processIdentifier, SIGKILL) == 0 else { throw Failure.cleanup }
       let end = ContinuousClock.now.advanced(by: .seconds(2))
       while process.isRunning && ContinuousClock.now < end { Thread.sleep(forTimeInterval: 0.01) }
@@ -72,7 +73,8 @@ private func run() throws {
   _ = signal(SIGPIPE, SIG_IGN)
   try process.run()
   defer {
-    if process.isRunning { try? stop(process) }
+    var escalated = false
+    if process.isRunning { try? stop(process, escalated: &escalated) }
     try? input.fileHandleForReading.close()
     try? input.fileHandleForWriting.close()
     try? output.fileHandleForReading.close()
@@ -84,6 +86,7 @@ private func run() throws {
   try output.fileHandleForWriting.close()
   var primary: (any Error)?
   var observations: [UInt64] = []
+  var completedCycles = 0
   let deadline = ContinuousClock.now.advanced(by: .seconds(80))
   var serialExpected = "IRQ_PASS\nDMA_PASS\n"
   func serialText() throws -> String {
@@ -100,7 +103,10 @@ private func run() throws {
         throw Failure.mismatch
       }
       if text.hasPrefix(serialExpected) { return }
-      guard process.isRunning else { throw LabError.disconnected }
+      guard process.isRunning else {
+        if try serialText().hasPrefix(serialExpected) { return }
+        throw LabError.disconnected
+      }
       Thread.sleep(forTimeInterval: 0.002)
     }
     throw LabError.deadline
@@ -160,6 +166,7 @@ private func run() throws {
           throw Failure.mismatch
         }
         observations.append(actual)
+        completedCycles += 1
       }
       if mode == "cycles" || mode == "wrong-target" {
         if mode == "cycles" {
@@ -177,42 +184,46 @@ private func run() throws {
     }
   } catch { primary = error }
   var cleanupError: (any Error)?
-  do { try stop(process) } catch { cleanupError = error }
+  var escalated = false
+  do { try stop(process, escalated: &escalated) } catch { cleanupError = error }
   try? input.fileHandleForWriting.close()
   try? output.fileHandleForReading.close()
   try? stderr.close()
-  let diagnostic = try String(contentsOf: errors, encoding: .utf8)
-  let warning =
-    "qemu-system-aarch64: warning: Balloon used with backing page size > 4kiB, this may not be reliable\n"
-  var qualified = diagnostic
   let expectWarning =
     ["cycles", "cancel-inflated"].contains(mode) && sysconf(Int32(_SC_PAGESIZE)) > 4096
+  var validationError: (any Error)?
+  var warningCount: Int?
+  do {
+    let size = try FileManager.default.attributesOfItem(atPath: errors.path)[.size] as? NSNumber
+    guard let size, size.intValue <= 262144 else { throw LabError.framing }
+    let diagnostic = try String(contentsOf: errors, encoding: .utf8)
+    warningCount = diagnostic.components(separatedBy: QEMUDiagnostic.backingPageWarning).count - 1
+    guard !process.isRunning, !escalated, process.terminationReason == .exit,
+      process.terminationStatus == 0
+    else { throw Failure.cleanup }
+    try QEMUDiagnostic.validate(
+      diagnostic, expectedWarningCount: expectWarning ? 1 : 0,
+      senderPID: mode == "absent" || mode == "cancel-inflated" ? getpid() : nil)
+  } catch { validationError = error }
+  let passed = primary == nil && cleanupError == nil && validationError == nil
   let receipt: [String: Any] = [
+    "pass": passed,
     "mode": mode, "observedLogicalBytes": observations,
-    "completedCycles": mode == "cycles" && primary == nil ? 10 : 0,
-    "physicalReleasedBytes": NSNull(), "backingPageWarning": expectWarning,
+    "completedCycles": completedCycles,
+    "physicalReleasedBytes": NSNull(), "expectedBackingWarning": expectWarning,
+    "observedWarningCount": warningCount.map { $0 as Any } ?? NSNull(),
+    "escalated": escalated,
+    "terminationReason": process.isRunning
+      ? "running" : process.terminationReason == .exit ? "exit" : "uncaughtSignal",
+    "terminationStatus": process.isRunning ? NSNull() : process.terminationStatus as Any,
     "ownedChildJoined": !process.isRunning,
     "primaryError": primary.map(String.init(describing:)) ?? "",
     "cleanupError": cleanupError.map(String.init(describing:)) ?? "",
+    "validationError": validationError.map(String.init(describing:)) ?? "",
   ]
   try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys])
     .write(to: root.appendingPathComponent("result.json"))
-  // Preserve execution/cleanup failures before applying stricter expected-output validation.
-  guard primary == nil, cleanupError == nil else { throw primary ?? cleanupError! }
-  if expectWarning {
-    guard qualified.components(separatedBy: warning).count == 2 else { throw Failure.mismatch }
-    qualified = qualified.replacingOccurrences(of: warning, with: "")
-  }
-  if mode == "absent" || mode == "cancel-inflated" {
-    // This is an owned-child intentional termination, not guest memory reuse/recovery success.
-    let termination = "qemu-system-aarch64: terminating on signal 15 from pid "
-    guard let range = qualified.range(of: termination),
-      qualified[..<range.lowerBound].isEmpty,
-      qualified[range.upperBound...].hasPrefix(String(getpid()) + " ")
-    else { throw Failure.mismatch }
-  } else if !qualified.isEmpty {
-    throw Failure.mismatch
-  }
+  guard passed else { throw primary ?? cleanupError ?? validationError! }
   print("PASS host balloon " + mode + "; physical reclaim unverified")
 }
 

@@ -41,6 +41,8 @@ deflate success, page reuse or recovery of a live production VM. Raw primary/cle
 and guest/QEMU diagnostics remain experiment evidence. Terminal device failures keep every
 ticket reserved until this entire disposable VM exits; they do not prove live-driver
 quiescence or reset recovery. Reset success waits for status0 with a bounded deadline.
+Host success requires QEMU exit0, no SIGKILL escalation and the complete expected stderr;
+the final receipt records observed warnings, native termination and any validation error.
 
 QEMU's [pinned balloon implementation](https://github.com/qemu/qemu/blob/v10.2.0/hw/virtio/virtio-balloon.c)
 warns on backing pages larger than4KiB and ignores nonfatal discard failures. On this
