@@ -1,7 +1,11 @@
 import _Volatile
 
-#if canImport(Darwin)
+#if os(Linux) && hasFeature(Embedded)
+  import FramePOSIX
+#elseif canImport(Darwin)
   import Darwin
+#elseif canImport(Musl)
+  import Musl
 #else
   import Glibc
 #endif

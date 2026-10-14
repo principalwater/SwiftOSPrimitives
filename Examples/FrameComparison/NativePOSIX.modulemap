@@ -1,0 +1,6 @@
+// Native Linux declarations only; the general Glibc umbrella is not Embedded-compatible.
+module FramePOSIX [system] {
+  header "/usr/include/time.h"
+  header "/usr/include/stdio.h"
+  export *
+}

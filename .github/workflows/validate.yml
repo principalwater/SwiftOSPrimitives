@@ -49,10 +49,15 @@ jobs:
             flags=()
             if [[ "$mode" == embedded ]]; then
               flags=(-enable-experimental-feature Embedded -no-allocations)
+              if [[ "$RUNNER_OS" == Linux ]]; then
+                flags+=(-Xcc "-fmodule-map-file=$GITHUB_WORKSPACE/Examples/FrameComparison/NativePOSIX.modulemap"
+                  -Xcc -isystem -Xcc /usr/include
+                  -Xcc -isystem -Xcc "/usr/include/$(uname -m)-linux-gnu")
+              fi
             fi
             swiftc -swift-version 6 -O -wmo -parse-as-library \
               -enable-experimental-feature Lifetimes -enable-experimental-feature Volatile \
-              -strict-memory-safety -warnings-as-errors "${flags[@]}" \
+              -strict-memory-safety -warnings-as-errors ${flags[@]+"${flags[@]}"} \
               Sources/BoundedMemory/FrameLedger.swift Examples/FrameComparison/main.swift \
               -o "$RUNNER_TEMP/frame-$mode"
             "$RUNNER_TEMP/frame-$mode" > "$RUNNER_TEMP/frame-$mode.txt"
@@ -80,7 +85,7 @@ jobs:
             if [[ "$mode" == cached ]]; then flags=(--cfg cached); fi
             RUSTC_BOOTSTRAP=1 rustup run 1.96.0 rustc --edition 2021 \
               -C opt-level=3 -C panic=abort -C overflow-checks=yes \
-              -Z stack-protector=strong -D warnings "${flags[@]}" \
+              -Z stack-protector=strong -D warnings ${flags[@]+"${flags[@]}"} \
               Examples/FrameComparison/reference.rs -o "$RUNNER_TEMP/frame-rust-$mode"
             nm --undefined-only "$RUNNER_TEMP/frame-rust-$mode" > "$RUNNER_TEMP/rust-imports-$mode.txt"
             grep -q '__stack_chk_fail' "$RUNNER_TEMP/rust-imports-$mode.txt"

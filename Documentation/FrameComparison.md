@@ -106,8 +106,9 @@ findings were reconciled; later portability/observation tooling received native
 validation, not a falsely claimed second model review.
 
 The fixture is prepared for 64-bit Linux, and Swift hosted/Embedded execution is
-part of CI. No weak live VPS was loaded. Rust Linux execution and weak-VPS
-measurements remain separate work. Physical allocator policies, typed Pin,
+part of CI. Rust Linux execution additionally checks actual stack-guard imports
+and both algorithm traces. No weak live VPS was loaded; weak-VPS measurements
+remain separate work. Physical allocator policies, typed Pin,
 interrupt/DMA contracts, Linux Kbuild integration and VM ballooning remain outside
 this release. Consumer production adoption requires its own acceptance.
 

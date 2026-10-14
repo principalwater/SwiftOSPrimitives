@@ -10,7 +10,8 @@ See [the report](../../Documentation/FrameComparison.md) for interpretation.
 Use pinned Swift 6.4.1 and a fresh scratch directory outside the checkout.
 On macOS set SDKROOT to the installed macOS SDK; Linux uses its native toolchain.
 The fixture requires macOS 27 or 64-bit Linux, not the package's iOS 18 floor.
-No allocations, overflow, bounds or exclusivity checks are disabled.
+Heap allocation is forbidden in Embedded mode; overflow, bounds and exclusivity
+checks remain enabled.
 
 ```text
 swiftc -swift-version 6 -O -wmo -parse-as-library -warnings-as-errors \
@@ -23,6 +24,10 @@ swift Tools/InspectFrameComparison.swift /path/to/scratch/frame-embedded.txt
 ```
 
 For hosted Swift, omit Embedded and no-allocations; retain every other safety flag.
+On native Linux Embedded, add -Xcc -fmodule-map-file=Examples/FrameComparison/NativePOSIX.modulemap
+and -Xcc -isystem -Xcc /usr/include, plus the native architecture include directory
+(for example /usr/include/x86_64-linux-gnu). This minimal module imports existing
+time/stdio declarations without the general Glibc umbrella; it implements no C code.
 For the scanning baseline, extract FrameLedger.swift from commit
 9cb8cf27e12096ac9d3548af02f3c0abcf774a87 and use that file with this same harness.
 Do not compare only the optimized Swift algorithm with scanning Rust.
@@ -45,7 +50,7 @@ On macOS pin MACOSX_DEPLOYMENT_TARGET=27.0. Local M2 measurements also pinned
 Swift -target-cpu apple-m2 and Rust -C target-cpu=apple-m2. Use an appropriate
 common CPU on other hosts; neither flag is a universal target.
 The prepared Rust Linux ABI assumes x86-64/AArch64 two-i64 timespec and libc.
-Its Linux execution is not yet a claimed acceptance gate.
+Both algorithms have a separate Linux CI execution gate with actual guard imports.
 
 ## Observation format (version 2)
 
