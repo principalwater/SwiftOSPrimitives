@@ -16,6 +16,9 @@ SECTIONS {
   .data : { *(.data .data.*) } :data
   .bss (NOLOAD) : {
     *(.bss .bss.*) *(COMMON)
+    . = ALIGN(8);
+    __irq_count = .;
+    . += 8;
     . = ALIGN(4096);
     __scratch_start = .;
     . += 4096;

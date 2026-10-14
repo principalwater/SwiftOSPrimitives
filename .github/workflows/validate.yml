@@ -43,6 +43,12 @@ jobs:
           swift run -c release --skip-build page-memory-probe soak 300
           swift run -c release --skip-build page-memory-probe cycle reuse 1000 65536
           swift run -c release --skip-build page-memory-probe footprint reusable
+          swift run --package-path Examples/MemoryContracts -c release --jobs 2 \
+            -Xswiftc -warnings-as-errors memory-contracts
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            swift run --package-path Examples/MemoryContracts -c release --jobs 2 \
+              -Xswiftc -warnings-as-errors memory-faults
+          fi
           swift run --package-path Examples/NIOResourceLab -c release --jobs 2
           swift Tools/CheckLowLevel.swift "$(command -v swiftc)" . "$RUNNER_TEMP/low-level"
           for mode in hosted embedded; do

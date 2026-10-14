@@ -209,7 +209,7 @@ func checkLowLevel() throws {
   func run(
     _ name: String, executable: URL, arguments: [String], expectedError: String? = nil,
     expectedTrap: String? = nil,
-    expectedOutput: String? = nil, timeoutSeconds: Int = 60
+    expectedOutput: String? = nil, expectedDiagnostic: String? = nil, timeoutSeconds: Int = 60
   )
     throws
   {
@@ -278,7 +278,14 @@ func checkLowLevel() throws {
         name + ": " + String(decoding: try Data(contentsOf: log), as: UTF8.self))
     }
     if let expectedOutput {
-      let text = String(decoding: try Data(contentsOf: log), as: UTF8.self)
+      var text = String(decoding: try Data(contentsOf: log), as: UTF8.self)
+      if let expectedDiagnostic {
+        guard text.components(separatedBy: expectedDiagnostic).count == 2 else {
+          throw CheckFailure.refused(name + ": expected platform diagnostic missing/duplicated")
+        }
+        text = text.replacingOccurrences(of: expectedDiagnostic, with: "")
+        print("QUALIFIED \(name): raw platform diagnostic retained; physical reclaim unverified")
+      }
       guard text == expectedOutput else { throw CheckFailure.refused(name + ": " + text) }
     }
     print("PASS \(name)")
@@ -723,17 +730,25 @@ func checkLowLevel() throws {
           root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
           root.appendingPathComponent("Sources/BoundedMemory/FrameLedger.swift").path,
         ]
-        + ["Guest.swift", "MemoryFill.swift", "MemoryCopy.swift", "Platform.swift", "Frames.swift"]
+        + [
+          "Guest.swift", "MemoryFill.swift", "MemoryCopy.swift", "Platform.swift", "Frames.swift",
+          "TimerIRQ.swift", "VirtioMMIO.swift", "VirtioDMA.swift", "Balloon.swift",
+        ]
         .map {
           guest.appendingPathComponent($0).path
         }
       for (mode, definition, marker) in [
-        ("Success", "GUEST_BUILD", "GUEST_PASS\n"),
+        ("Success", "GUEST_BUILD", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nGUEST_PASS\n"),
         ("Guard", "GUEST_GUARD_FAILURE", "STACK_FAIL\n"),
-        ("Memory", "GUEST_MEMORY_FAILURE", "MEMORY_FAIL\n"),
-        ("Frames", "GUEST_FRAME_FAILURE", "FRAME_FAIL\n"),
-        ("Trap", "GUEST_TRAP_FAILURE", "BRK_PASS\n"),
-        ("TrapOther", "GUEST_TRAP_OTHER", "TRAP\n"),
+        ("IRQTimeout", "GUEST_IRQ_MASK", "IRQ_TIMEOUT\n"),
+        ("DMAAbsent", "GUEST_DMA_ABSENT", "IRQ_PASS\nDMA_MISSING\n"),
+        ("DMAUnpublished", "GUEST_DMA_NO_PUBLISH", "IRQ_PASS\nDMA_TIMEOUT\n"),
+        ("BalloonAbsent", "GUEST_BALLOON_ABSENT", "IRQ_PASS\nDMA_PASS\nBALLOON_MISSING\n"),
+        ("BalloonNoDeflate", "GUEST_BALLOON_NO_DEFLATE", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_DEFLATE_TIMEOUT\n"),
+        ("Memory", "GUEST_MEMORY_FAILURE", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nMEMORY_FAIL\n"),
+        ("Frames", "GUEST_FRAME_FAILURE", "IRQ_PASS\nFRAME_FAIL\n"),
+        ("Trap", "GUEST_TRAP_FAILURE", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nBRK_PASS\n"),
+        ("TrapOther", "GUEST_TRAP_OTHER", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nTRAP\n"),
       ] {
         let name = "Guest" + mode
         let original = scratch.appendingPathComponent(name + ".ll")
@@ -748,7 +763,7 @@ func checkLowLevel() throws {
         let reachable = scratch.appendingPathComponent(name + "-live.ll")
         let entries = [
           "guest_main", "guest_trap", "memset", "memcpy", "__stack_chk_guard", "__stack_chk_fail",
-          "guard_probe",
+          "guard_probe", "guest_irq",
         ]
         let preserved = entries.map { "preserve-gv=" + $0 }.joined(separator: ";")
         try run(
@@ -799,12 +814,21 @@ func checkLowLevel() throws {
         try run(
           name + "Execution", executable: qemu,
           arguments: [
-            "-machine", "virt-10.2,secure=off,virtualization=off", "-accel",
+            "-machine", "virt-10.2,secure=off,virtualization=off,gic-version=2", "-accel",
             "tcg,thread=single", "-cpu", "cortex-a72", "-m", "64M", "-smp", "1",
             "-nic", "none", "-display", "none", "-nodefaults", "-monitor", "none",
             "-serial", "stdio", "-no-reboot", "-kernel", image.path,
-          ],
-          expectedOutput: marker, timeoutSeconds: 10)
+          ] + (mode == "DMAAbsent" ? [] : [
+            "-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device",
+          ]) + (mode == "BalloonAbsent" ? [] : [
+            "-device", "virtio-balloon-device",
+          ]),
+          expectedOutput: marker,
+          expectedDiagnostic: sysconf(Int32(_SC_PAGESIZE)) > 4096
+            && ["Success", "Memory", "Trap", "TrapOther", "BalloonNoDeflate"].contains(mode)
+            ? "qemu-system-aarch64: warning: Balloon used with backing page size > 4kiB, this may not be reliable\n"
+            : nil,
+          timeoutSeconds: 15)
       }
     }
   }

@@ -30,6 +30,30 @@ func runChecks() throws {
     ("CompilerVersion", []),
     ("ArenaPositive", []),
     ("FramePositive", []),
+    ("MappedPositive", []),
+    (
+      "MappedEscape",
+      [
+        "4:36: error: instance method 'withValue' requires that 'Span<Int>' conform to 'Escapable'"
+      ]
+    ),
+    (
+      "MappedRelease",
+      [
+        "5:10: error: overlapping accesses to 'value', but modification requires exclusive access [#ExclusivityViolation]"
+      ]
+    ),
+    ("MappedTake", ["5:37: error: 'consume' can only be used to partially consume storage"]),
+    ("MappedReplace", ["4:27: error: cannot assign through subscript: subscript is get-only"]),
+    ("MappedCopy", ["4:15: error: 'copy' cannot be applied to noncopyable types"]),
+    (
+      "MappedSendable",
+      ["5:3: error: type 'MappedValue<Int>' does not conform to the 'Sendable' protocol"]
+    ),
+    (
+      "MappedElementEscape",
+      ["3:14: error: type 'Span<UInt8>' does not conform to protocol 'Escapable'"]
+    ),
     ("FrameCopy", ["7:19: error: 'copy' cannot be applied to noncopyable types"]),
     ("FrameDoubleRelease", ["5:24: error: 'first' consumed more than once"]),
     ("FrameEscape", ["3:7: error: lifetime-dependent variable 'saved' escapes its scope"]),

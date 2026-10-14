@@ -1,0 +1,4 @@
+module MemoryFaultABI {
+  header "MemoryFaultABI.h"
+  export *
+}

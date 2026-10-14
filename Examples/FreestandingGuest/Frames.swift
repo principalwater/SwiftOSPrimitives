@@ -1,13 +1,21 @@
+import GuestABI
 import _Volatile
+
+// Only the boot ABI's linker-reserved extent is admitted, never image or stack addresses.
+@unsafe func validateFrameBacking(_ raw: UnsafeMutableRawPointer, count: Int) {
+  let address = UInt(bitPattern: raw)
+  guard count == 16, address % 4096 == 0,
+    address == UInt(guest_frames_start_address()),
+    address + UInt(count * 4096) == UInt(guest_frames_end_address()),
+    address >= 0x4008_0000 + 4096, address <= 0x4400_0000 - UInt((count + 1) * 4096)
+  else { finish("BAD_FRAME_EXTENT\n") }
+}
 
 // The linker owns sixteen aligned 4KiB frames plus canary padding, not MMU guard pages.
 @unsafe func checkFrames(_ raw: UnsafeMutableRawPointer, count: Int) {
   let pageSize = 4096
   let address = UInt(bitPattern: raw)
-  guard count == 16, address % UInt(pageSize) == 0,
-    address >= 0x4008_0000 + UInt(pageSize),
-    address <= 0x4400_0000 - UInt((count + 1) * pageSize)
-  else { finish("BAD_FRAME_EXTENT\n") }
+  unsafe validateFrameBacking(raw, count: count)
   let baseFrame = address / UInt(pageSize)
   _ = unsafe raw.advanced(by: -pageSize).initializeMemory(
     as: UInt8.self, repeating: 71, count: pageSize)

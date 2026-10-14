@@ -12,7 +12,7 @@
 #endif
 
 public enum PageMemoryError: Error, Equatable, Sendable {
-  case invalidSize, limitExceeded, unavailable, contentsDiscarded
+  case invalidSize, limitExceeded, unavailable, contentsDiscarded, operationMayBlock
   case systemCall(operation: Operation, code: Int32)
   public enum Operation: String, Sendable { case pageSize, map, advise, unmap, residency }
 }
@@ -22,6 +22,8 @@ public enum ReclamationSemantics: String, Sendable {
 }
 /// Selects native reclamation accounting without promising immediate physical release.
 public enum ReclamationStrategy: Sendable { case platformDefault, reusable }
+/// Caller-declared execution context; this does not inspect IRQ state or implement Linux GFP.
+public enum AllocationContext: Sendable { case mayBlock, nonblocking }
 public struct Reclamation: Equatable, Sendable {
   public let advisedBytes: Int
   public let semantics: ReclamationSemantics
@@ -34,6 +36,7 @@ public struct Reclamation: Equatable, Sendable {
 /// One owner of anonymous private pages, with synchronous lifetime-bounded access.
 /// The type exposes no raw pointer and is deliberately not Sendable.
 @safe public struct PageRegion: ~Copyable {
+  private var mapping: PageMapping
   private var pointer: UnsafeMutablePointer<UInt8>?
   public let byteCount: Int
   public let mappedByteCount: Int
@@ -45,45 +48,27 @@ public struct Reclamation: Equatable, Sendable {
   #endif
   public var isReleased: Bool { unsafe pointer == nil }
 
-  private init(pointer: UnsafeMutablePointer<UInt8>, byteCount: Int, mapped: Int, pageSize: Int) {
+  private init(mapping: consuming PageMapping, pointer: UnsafeMutablePointer<UInt8>, byteCount: Int) {
     unsafe self.pointer = unsafe pointer
     self.byteCount = byteCount
-    mappedByteCount = mapped
-    self.pageSize = pageSize
+    mappedByteCount = mapping.byteCount
+    pageSize = mapping.pageSize
+    self.mapping = mapping
     contents = .active
   }
   /// The limit includes page rounding and applies to this region, not the entire process.
-  public static func allocate(byteCount: Int, maximumMappedBytes: Int = 64 * 1024 * 1024)
+  public static func allocate(
+    byteCount: Int, maximumMappedBytes: Int = 64 * 1024 * 1024,
+    context: AllocationContext = .mayBlock
+  )
     throws(PageMemoryError) -> PageRegion
   {
-    guard byteCount > 0, maximumMappedBytes > 0 else { throw .invalidSize }
-    let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
-    guard pageSize > 0 else {
-      throw .systemCall(operation: .pageSize, code: NativeMemorySystem.errorCode)
-    }
-    let (sum, overflow) = byteCount.addingReportingOverflow(pageSize - 1)
-    guard !overflow else { throw .invalidSize }
-    let mapped = sum / pageSize * pageSize
-    guard mapped <= maximumMappedBytes else { throw .limitExceeded }
-    let raw = unsafe mmap(nil, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
-    guard unsafe !NativeMemorySystem.mappingFailed(raw) else {
-      throw .systemCall(operation: .map, code: NativeMemorySystem.errorCode)
-    }
-    // Swift cannot represent a nonoptional pointer to address zero. Reject and release it.
-    guard let raw = unsafe raw else {
-      guard munmap(nil, mapped) == 0 else {
-        throw .systemCall(operation: .unmap, code: NativeMemorySystem.errorCode)
-      }
-      throw .systemCall(operation: .map, code: EFAULT)
-    }
+    let mapping = try PageMapping.allocate(
+      byteCount: byteCount, maximumMappedBytes: maximumMappedBytes, context: context)
+    let raw = unsafe mapping.address.unsafelyUnwrapped
     // MAP_ANONYMOUS initializes bytes to zero; only this owner binds and unmaps them.
-    let pointer = unsafe raw.bindMemory(to: UInt8.self, capacity: mapped)
-    return unsafe PageRegion(
-      pointer: pointer, byteCount: byteCount, mapped: mapped, pageSize: pageSize)
-  }
-  deinit {
-    // Explicit release reports errors; destruction supplies a final fallback.
-    if let pointer = unsafe pointer { _ = unsafe munmap(pointer, mappedByteCount) }
+    let pointer = unsafe raw.bindMemory(to: UInt8.self, capacity: mapping.byteCount)
+    return unsafe PageRegion(mapping: mapping, pointer: pointer, byteCount: byteCount)
   }
 
   /// Result is Escapable: a safe Span cannot be returned or retained outside the callback.
@@ -232,12 +217,9 @@ public struct Reclamation: Equatable, Sendable {
       return resident
     }
   }
-  /// On failure ownership remains retryable; success is idempotent.
-  public mutating func release() throws(PageMemoryError) {
-    guard let pointer = unsafe pointer else { return }
-    guard unsafe munmap(pointer, mappedByteCount) == 0 else {
-      throw .systemCall(operation: .unmap, code: NativeMemorySystem.errorCode)
-    }
+  /// On failure ownership remains retryable; success is idempotent. Destruction may block.
+  public mutating func release(context: AllocationContext = .mayBlock) throws(PageMemoryError) {
+    try mapping.release(context: context)
     unsafe self.pointer = nil
   }
 }

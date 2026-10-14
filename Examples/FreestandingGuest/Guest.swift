@@ -22,8 +22,11 @@ import _Volatile
     _ = guardProbe()
     finish("GUARD_BYPASSED\n")
   #else
+    checkTimerIRQ()
     guard let frames = unsafe frames, frameCount == 16 else { finish("BAD_FRAME_EXTENT\n") }
     unsafe checkFrames(frames, count: frameCount)
+    unsafe checkDMA(frames, count: frameCount)
+    unsafe checkBalloon(frames, count: frameCount)
     let bytes = unsafe raw.initializeMemory(as: UInt8.self, repeating: 71, count: capacity)
     let lengths: InlineArray<7, Int> = [0, 1, 7, 8, 9, 31, 65]
     for offset in 0..<16 {
