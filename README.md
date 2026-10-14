@@ -188,3 +188,9 @@ This research branch does not yet combine the independently developed Windows ma
 Opt-in native [page reclamation and erasure](Documentation/MemorySecurityAndReclamation.md)
 adds Mach purgeable backing and measured physical-residency controls. This experimental
 building block is not a deployed VM balloon controller or a kernel/DMA allocator.
+
+The freestanding balloon donor path now erases its whole exclusively retained16KiB
+extent before every inflate publication, waits for real deflate completion and
+initializes the returned bytes before reading. Its isolated full-wrap gate exercises
+65540 completions on each queue. See [donor lifecycle](Documentation/BalloonDonorLifecycle.md)
+for faults, measurements and the remaining physical VM integration boundary.

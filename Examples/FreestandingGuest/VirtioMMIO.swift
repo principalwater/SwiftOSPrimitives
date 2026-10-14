@@ -135,6 +135,24 @@ import _Volatile
       unsafe mmioWord(ring + 168 + slot * 8).store(length + 1)
     }
   #endif
+  #if GUEST_BALLOON_WRAP_INFLATE_ID || GUEST_BALLOON_WRAP_DEFLATE_ID
+    if !deviceWrites && sequence.completedCount == 65536 {
+      #if GUEST_BALLOON_WRAP_INFLATE_ID
+        let selectedQueue: UInt32 = 0
+      #else
+        let selectedQueue: UInt32 = 1
+      #endif
+      if queue == selectedQueue {
+        emit("BALLOON_INJECT_ID_65536\n")
+        unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))
+      }
+    }
+  #elseif GUEST_BALLOON_WRAP_LENGTH
+    if !deviceWrites && queue == 1 && sequence.completedCount == 65536 {
+      emit("BALLOON_INJECT_LENGTH_65536\n")
+      unsafe mmioWord(ring + 168 + slot * 8).store(1)
+    }
+  #endif
   guard unsafe mmioWord(ring + 164 + slot * 8).load() == UInt32(head) else {
     finish("VIRTIO_IDENTITY_FAIL\n")
   }

@@ -772,6 +772,42 @@ func checkLowLevel() throws {
           "DMAUnpublishedIndex", "GUEST_DMA_UNPUBLISHED_INDEX",
           "IRQ_PASS\nDMA_UNPUBLISHED_INDEX_INJECT\nVIRTIO_USED_INDEX_FAIL\n"
         ),
+        (
+          "BalloonWrap", "GUEST_BALLOON_WRAP",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_WRAP_PASS 65540 65540\nBALLOON_PASS\nGUEST_PASS\n"
+        ),
+        (
+          "BalloonWrapInflateIdentity", "GUEST_BALLOON_WRAP_INFLATE_ID",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_INJECT_ID_65536\nVIRTIO_IDENTITY_FAIL\n"
+        ),
+        (
+          "BalloonWrapDeflateIdentity", "GUEST_BALLOON_WRAP_DEFLATE_ID",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_INJECT_ID_65536\nVIRTIO_IDENTITY_FAIL\n"
+        ),
+        (
+          "BalloonWrapLength", "GUEST_BALLOON_WRAP_LENGTH",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_INJECT_LENGTH_65536\nVIRTIO_LENGTH_FAIL\n"
+        ),
+        (
+          "BalloonWrapStale", "GUEST_BALLOON_WRAP_STALE",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_STALE_65536\nVIRTIO_STALE_COMPLETION\n"
+        ),
+        (
+          "BalloonWrapWithheld", "GUEST_BALLOON_WRAP_NO_DEFLATE",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_WITHHOLD_DEFLATE_65536\nBALLOON_DEFLATE_TIMEOUT\n"
+        ),
+        (
+          "BalloonWrapDirtyDonor", "GUEST_BALLOON_DIRTY_DONOR",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_DIRTY_DONOR_65536\nBALLOON_ERASE_FAIL\n"
+        ),
+        (
+          "BalloonPFNDeflate", "GUEST_BALLOON_BAD_PFN_DEFLATE",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PFN_BEFORE_DEFLATE_INJECT\nBALLOON_LIST_FAIL\n"
+        ),
+        (
+          "BalloonResetQueue", "GUEST_BALLOON_RESET_READY",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_RESET_QUEUE_INJECT\nBALLOON_RESET_QUEUE_FAIL\n"
+        ),
         ("Guard", "GUEST_GUARD_FAILURE", "STACK_FAIL\n"),
         ("IRQTimeout", "GUEST_IRQ_MASK", "IRQ_TIMEOUT\n"),
         ("DMAAbsent", "GUEST_DMA_ABSENT", "IRQ_PASS\nDMA_MISSING\n"),
@@ -887,12 +923,17 @@ func checkLowLevel() throws {
           expectedDiagnostic: sysconf(Int32(_SC_PAGESIZE)) > 4096
             && [
               "Success", "RingWrap", "Memory", "Trap", "TrapOther", "BalloonNoDeflate",
-              "WrongIdentity",
+              "WrongIdentity", "BalloonWrap", "BalloonWrapInflateIdentity",
+              "BalloonWrapDeflateIdentity", "BalloonWrapLength", "BalloonWrapStale",
+              "BalloonWrapWithheld", "BalloonWrapDirtyDonor", "BalloonPFNDeflate",
+              "BalloonResetQueue",
             ]
             .contains(mode)
             ? "qemu-system-aarch64: warning: Balloon used with backing page size > 4kiB, this may not be reliable\n"
             : nil,
-          timeoutSeconds: mode.hasPrefix("Wrap") || mode == "RingWrap" ? 75 : 15)
+          timeoutSeconds: mode.hasPrefix("BalloonWrap")
+            ? 135
+            : mode.hasPrefix("Wrap") || mode == "RingWrap" ? 75 : 15)
         if mode == "HostTimeout",
           let controller = ProcessInfo.processInfo.environment["GUEST_HOST_BIN"]
         {

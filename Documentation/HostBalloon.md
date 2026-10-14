@@ -26,9 +26,10 @@ ten real host-requested inflate/deflate cycles. A single descriptor is outstandi
 queue. Each post checks the preexisting producer/consumer indices, publishes the next
 available slot with a device barrier, then checks the next used index, descriptor identity
 and used length. The read that licenses completion precedes its acquire/device barrier;
-the descriptor head changes between laps to detect stale entries in reused slots. Ten
-cycles reuse all eight ring slots; they do **not** exercise65536 index
-wraparound. The guest never reads donated pages before deflate completion. It initializes
+the descriptor head changes between laps to detect stale entries in reused slots. Ten host-driven
+cycles reuse all eight ring slots. A separate local guest gate now performs65540 real
+inflate and65540 real deflate completions through full16-bit index wrap; it does not
+replace the host target/actual observation gates. The guest never reads donated pages before deflate completion. It initializes
 every returned byte before checking/reusing it. Device reset precedes ledger-ticket release.
 
 After the guest's final checks, it keeps running under a five-second deadline so the host
@@ -73,3 +74,7 @@ Actual physical reclaim needs a separate4KiB backing host and sufficiently large
 donor ranges, with host RSS/footprint/pressure observations and donor isolation. Adaptive
 pressure selection, Virtualization.framework/Applecontainer integration, live-VM recovery
 and Linux kernel ABI/hardening remain separate open work.
+
+The [donor lifecycle report](BalloonDonorLifecycle.md) documents the full-wrap,
+whole-extent erasure and real-device negative controls. Native VM target requests,
+guest actual acknowledgements and host physical backing observations remain separate.
