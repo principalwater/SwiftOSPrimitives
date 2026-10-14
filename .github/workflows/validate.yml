@@ -93,6 +93,17 @@ jobs:
               -emit-module -module-name BoundedMemory Sources/BoundedMemory/*.swift \
               -emit-module-path "$RUNNER_TEMP/BoundedMemory-ios18.swiftmodule"
           fi
+      - name: Build optional native VZ lab
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            swift build --package-path Examples/VirtualizationBalloonLab -c release --jobs 2 \
+              --product vz-balloon-lab -Xswiftc -warnings-as-errors
+          else
+            swift build --package-path Examples/VirtualizationBalloonLab -c release --jobs 2 \
+              --product vz-balloon-guest -Xswiftc -warnings-as-errors
+          fi
       - name: Validate optional Rust Linux references
         if: runner.os == 'Linux'
         shell: bash

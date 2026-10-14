@@ -1,0 +1,4 @@
+module NativeInit [system] {
+  header "NativeInit.h"
+  export *
+}
