@@ -95,7 +95,17 @@ import _Volatile
     #elseif GUEST_TRAP_OTHER
       guest_test_other_trap()
     #else
-      finish("GUEST_PASS\n")
+      #if GUEST_HOST_BALLOON
+        // Keep the disposable guest alive for the final actual query and host-owned QMP quit.
+        emit("GUEST_PASS\n")
+        let (deadline, overflow) = guest_timer_counter().addingReportingOverflow(
+          guest_timer_frequency() * 5)
+        guard !overflow else { finish("HOST_CLOCK_FAIL\n") }
+        while guest_timer_counter() < deadline {}
+        finish("HOST_FINAL_TIMEOUT\n")
+      #else
+        finish("GUEST_PASS\n")
+      #endif
     #endif
   #endif
 }

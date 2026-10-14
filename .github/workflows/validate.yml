@@ -45,6 +45,8 @@ jobs:
           swift run -c release --skip-build page-memory-probe footprint reusable
           swift run --package-path Examples/MemoryContracts -c release --jobs 2 \
             -Xswiftc -warnings-as-errors memory-contracts
+          swift test --package-path Examples/BalloonHostLab -c release --jobs 2 \
+            -Xswiftc -warnings-as-errors
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             swift run --package-path Examples/MemoryContracts -c release --jobs 2 \
               -Xswiftc -warnings-as-errors memory-faults

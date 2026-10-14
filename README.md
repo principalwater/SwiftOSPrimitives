@@ -7,6 +7,8 @@ allocator, runtime or Foundation replacement.
 Stable typed mapping ownership and real isolated IRQ/DMA/virtio-balloon experiments
 are described in [Stable mappings and guest devices](Documentation/StableMappingAndGuestDevices.md).
 The balloon experiment verifies a protocol round trip; physical host reclaim is qualified.
+Native host target planning, QMP control and repeated guest cycles are described in
+[Host balloon control](Documentation/HostBalloon.md).
 
 PageMemory owns anonymous private mappings without a class, ARC ownership or COW
 storage. It lends synchronous `Span`/`MutableSpan` views, retires contents before

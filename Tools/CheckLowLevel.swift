@@ -729,6 +729,7 @@ func checkLowLevel() throws {
           arenaSources[0],
           root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
           root.appendingPathComponent("Sources/BoundedMemory/FrameLedger.swift").path,
+          root.appendingPathComponent("Sources/BoundedMemory/BalloonBudget.swift").path,
         ]
         + [
           "Guest.swift", "MemoryFill.swift", "MemoryCopy.swift", "Platform.swift", "Frames.swift",
@@ -738,17 +739,41 @@ func checkLowLevel() throws {
           guest.appendingPathComponent($0).path
         }
       for (mode, definition, marker) in [
-        ("Success", "GUEST_BUILD", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nGUEST_PASS\n"),
+        (
+          "Success", "GUEST_BUILD",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nGUEST_PASS\n"
+        ),
         ("Guard", "GUEST_GUARD_FAILURE", "STACK_FAIL\n"),
         ("IRQTimeout", "GUEST_IRQ_MASK", "IRQ_TIMEOUT\n"),
         ("DMAAbsent", "GUEST_DMA_ABSENT", "IRQ_PASS\nDMA_MISSING\n"),
         ("DMAUnpublished", "GUEST_DMA_NO_PUBLISH", "IRQ_PASS\nDMA_TIMEOUT\n"),
         ("BalloonAbsent", "GUEST_BALLOON_ABSENT", "IRQ_PASS\nDMA_PASS\nBALLOON_MISSING\n"),
-        ("BalloonNoDeflate", "GUEST_BALLOON_NO_DEFLATE", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_DEFLATE_TIMEOUT\n"),
-        ("Memory", "GUEST_MEMORY_FAILURE", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nMEMORY_FAIL\n"),
+        (
+          "BalloonNoDeflate", "GUEST_BALLOON_NO_DEFLATE",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_DEFLATE_TIMEOUT\n"
+        ),
+        (
+          "HostTimeout", "GUEST_HOST_BALLOON",
+          "IRQ_PASS\nDMA_PASS\nHOST_READY\nHOST_TARGET_TIMEOUT\n"
+        ),
+        (
+          "StaleCompletion", "GUEST_STALE_COMPLETION",
+          "IRQ_PASS\nDMA_PASS\nVIRTIO_STALE_COMPLETION\n"
+        ),
+        ("WrongIdentity", "GUEST_WRONG_ID", "IRQ_PASS\nDMA_PASS\nVIRTIO_IDENTITY_FAIL\n"),
+        (
+          "Memory", "GUEST_MEMORY_FAILURE",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nMEMORY_FAIL\n"
+        ),
         ("Frames", "GUEST_FRAME_FAILURE", "IRQ_PASS\nFRAME_FAIL\n"),
-        ("Trap", "GUEST_TRAP_FAILURE", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nBRK_PASS\n"),
-        ("TrapOther", "GUEST_TRAP_OTHER", "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nTRAP\n"),
+        (
+          "Trap", "GUEST_TRAP_FAILURE",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nBRK_PASS\n"
+        ),
+        (
+          "TrapOther", "GUEST_TRAP_OTHER",
+          "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nTRAP\n"
+        ),
       ] {
         let name = "Guest" + mode
         let original = scratch.appendingPathComponent(name + ".ll")
@@ -818,17 +843,39 @@ func checkLowLevel() throws {
             "tcg,thread=single", "-cpu", "cortex-a72", "-m", "64M", "-smp", "1",
             "-nic", "none", "-display", "none", "-nodefaults", "-monitor", "none",
             "-serial", "stdio", "-no-reboot", "-kernel", image.path,
-          ] + (mode == "DMAAbsent" ? [] : [
-            "-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device",
-          ]) + (mode == "BalloonAbsent" ? [] : [
-            "-device", "virtio-balloon-device",
-          ]),
+          ]
+            + (mode == "DMAAbsent"
+              ? []
+              : [
+                "-global", "virtio-mmio.force-legacy=false", "-device", "virtio-rng-device",
+              ])
+            + (mode == "BalloonAbsent"
+              ? []
+              : [
+                "-device", "virtio-balloon-device",
+              ]),
           expectedOutput: marker,
           expectedDiagnostic: sysconf(Int32(_SC_PAGESIZE)) > 4096
-            && ["Success", "Memory", "Trap", "TrapOther", "BalloonNoDeflate"].contains(mode)
+            && ["Success", "Memory", "Trap", "TrapOther", "BalloonNoDeflate", "WrongIdentity"]
+              .contains(mode)
             ? "qemu-system-aarch64: warning: Balloon used with backing page size > 4kiB, this may not be reliable\n"
             : nil,
           timeoutSeconds: 15)
+        if mode == "HostTimeout",
+          let controller = ProcessInfo.processInfo.environment["GUEST_HOST_BIN"]
+        {
+          let host = URL(fileURLWithPath: controller).standardizedFileURL
+          guard files.isExecutableFile(atPath: host.path) else { throw CheckFailure.arguments }
+          for test in ["cycles", "absent", "cancel-inflated", "wrong-target"] {
+            try run(
+              "HostBalloon-" + test, executable: host,
+              arguments: [
+                qemu.path, image.path, scratch.appendingPathComponent("Host-" + test).path, test,
+              ],
+              expectedOutput: "PASS host balloon " + test + "; physical reclaim unverified\n",
+              timeoutSeconds: 120)
+          }
+        }
       }
     }
   }

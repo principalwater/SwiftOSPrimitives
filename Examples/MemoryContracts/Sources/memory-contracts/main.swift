@@ -108,6 +108,31 @@ private func checkFrames(_ region: inout PageRegion) throws -> UInt64 {
 private func run() throws {
   let cpuBefore = try ticks(CLOCK_PROCESS_CPUTIME_ID)
   let started = try ticks(CLOCK_MONOTONIC)
+  guard
+    let budget = BalloonBudget(
+      installedBytes: 65536, minimumResidentBytes: 16384, granuleBytes: 4096,
+      maximumStepBytes: 8192)
+  else { throw ContractFailure.failed }
+  var budgetChecksum: UInt64 = 0
+  for _ in 0..<1024 {
+    var observed: UInt64 = 65536
+    for _ in 0..<6 {
+      guard let next = budget.target(observedResidentBytes: observed, requestedResidentBytes: 1)
+      else { throw ContractFailure.failed }
+      observed = next
+      budgetChecksum += next
+    }
+    guard observed == 16384 else { throw ContractFailure.failed }
+    for _ in 0..<6 {
+      guard let next = budget.target(observedResidentBytes: observed, requestedResidentBytes: 65536)
+      else { throw ContractFailure.failed }
+      observed = next
+      budgetChecksum += next
+    }
+    guard observed == 65536 else { throw ContractFailure.failed }
+  }
+  guard budgetChecksum == 503_316_480 else { throw ContractFailure.failed }
+  print("BALLOON_BUDGET \(budgetChecksum)")
   let initial = try ProcessMemorySnapshot.capture()
   let destroyed = try checkValues()
   var compact = try MappedValue.allocate {

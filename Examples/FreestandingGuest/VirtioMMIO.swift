@@ -22,6 +22,11 @@ import _Volatile
 @unsafe func resetVirtio(_ device: UInt) {
   unsafe mmioWord(device + 0x70).store(0)
   guest_device_barrier()
+  let frequency = guest_timer_frequency()
+  guard frequency >= 1000, frequency <= 10_000_000_000 else { finish("VIRTIO_CLOCK_FAIL\n") }
+  let (deadline, overflow) = guest_timer_counter().addingReportingOverflow(frequency / 10)
+  guard !overflow else { finish("VIRTIO_CLOCK_FAIL\n") }
+  while unsafe mmioWord(device + 0x70).load() != 0 && guest_timer_counter() < deadline {}
   guard unsafe mmioWord(device + 0x70).load() == 0 else { finish("VIRTIO_RESET_FAIL\n") }
 }
 @unsafe func initializeVirtio(_ device: UInt) {
@@ -37,7 +42,7 @@ import _Volatile
   unsafe mmioWord(device + 0x70).store(11)
   guard unsafe mmioWord(device + 0x70).load() == 11 else { finish("VIRTIO_FEATURE_FAIL\n") }
 }
-// A ring uses 230 bytes inside a live, zeroed 4KiB frame. Each queue posts once in this fixture.
+// A ring uses230 bytes inside a live, zeroed4KiB frame; one descriptor outstanding at a time.
 @unsafe func prepareVirtioQueue(_ device: UInt, index: UInt32, ring: UInt) {
   unsafe mmioWord(device + 0x30).store(index)
   guard unsafe mmioWord(device + 0x34).load() >= 8 && mmioWord(device + 0x44).load() == 0 else {
@@ -59,28 +64,46 @@ import _Volatile
 }
 @unsafe func postVirtioBuffer(
   _ device: UInt, queue: UInt32, ring: UInt, buffer: UInt, length: UInt32,
-  deviceWrites: Bool, publish: Bool = true, timeoutMarker: StaticString = "DMA_TIMEOUT\n"
+  deviceWrites: Bool, publish: Bool = true, sequence: UInt16 = 0,
+  timeoutMarker: StaticString = "DMA_TIMEOUT\n"
 ) -> UInt32 {
-  unsafe VolatileMappedRegister<UInt64>(unsafeBitPattern: ring).store(UInt64(buffer))
-  unsafe mmioWord(ring + 8).store(length)
-  unsafe mmioHalf(ring + 12).store(deviceWrites ? 2 : 0)
-  guest_device_barrier()
-  if publish {
-    unsafe mmioHalf(ring + 130).store(1)
-    guest_device_barrier()
-    unsafe mmioWord(device + 0x50).store(queue)
-  }
+  guard unsafe mmioHalf(ring + 162).load() == sequence,
+    unsafe mmioHalf(ring + 130).load() == sequence
+  else { finish("VIRTIO_STALE_COMPLETION\n") }
+  let slot = UInt(sequence % 8)
+  // A changed head on each lap makes a stale entry at a reused ring slot detectable.
+  let head = (UInt(sequence) + UInt(sequence) / 8) % 8
+  let descriptor = ring + head * 16
+  let next = sequence &+ 1
   let start = guest_timer_counter()
   let frequency = guest_timer_frequency()
   guard frequency >= 1000 && frequency <= 10_000_000_000 else { finish("VIRTIO_CLOCK_FAIL\n") }
   let (deadline, overflow) = start.addingReportingOverflow(frequency / 10)
   guard !overflow else { finish("VIRTIO_CLOCK_FAIL\n") }
-  while unsafe mmioHalf(ring + 162).load() == 0 && guest_timer_counter() < deadline {}
+  unsafe VolatileMappedRegister<UInt64>(unsafeBitPattern: descriptor).store(UInt64(buffer))
+  unsafe mmioWord(descriptor + 8).store(length)
+  unsafe mmioHalf(descriptor + 12).store(deviceWrites ? 2 : 0)
+  unsafe mmioHalf(descriptor + 14).store(0)
+  unsafe mmioHalf(ring + 132 + slot * 2).store(UInt16(head))
   guest_device_barrier()
-  guard unsafe mmioHalf(ring + 162).load() == 1, unsafe mmioWord(ring + 164).load() == 0 else {
-    finish(timeoutMarker)
+  if publish {
+    unsafe mmioHalf(ring + 130).store(next)
+    guest_device_barrier()
+    unsafe mmioWord(device + 0x50).store(queue)
   }
-  let written = unsafe mmioWord(ring + 168).load()
+  while unsafe mmioHalf(ring + 162).load() == sequence && guest_timer_counter() < deadline {}
+  let completed = unsafe mmioHalf(ring + 162).load()
+  guest_device_barrier()
+  guard completed == next else { finish(timeoutMarker) }
+  #if GUEST_WRONG_ID
+    if queue == 0 && !deviceWrites {
+      unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))
+    }
+  #endif
+  guard unsafe mmioWord(ring + 164 + slot * 8).load() == UInt32(head) else {
+    finish("VIRTIO_IDENTITY_FAIL\n")
+  }
+  let written = unsafe mmioWord(ring + 168 + slot * 8).load()
   guard deviceWrites ? written > 0 && written <= length : written == 0 else {
     finish("VIRTIO_LENGTH_FAIL\n")
   }
