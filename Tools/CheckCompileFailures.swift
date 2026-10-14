@@ -29,6 +29,17 @@ func runChecks() throws {
   let cases: [(String, [String])] = [
     ("CompilerVersion", []),
     ("ArenaPositive", []),
+    ("FramePositive", []),
+    ("FrameCopy", ["7:19: error: 'copy' cannot be applied to noncopyable types"]),
+    ("FrameDoubleRelease", ["5:24: error: 'first' consumed more than once"]),
+    ("FrameEscape", ["3:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
+    ("FrameAlias", ["4:7: error: 'loan' used after consume"]),
+    (
+      "FrameReset",
+      [
+        "4:53: error: overlapping accesses to 'metadata', but modification requires exclusive access; consider copying to a local variable [#ExclusivityViolation]"
+      ]
+    ),
     ("TypedOwnerOuter", ["4:7: error: lifetime-dependent variable 'saved' escapes its scope"]),
     ("TypedNestedOwner", ["4:65: error: lifetime-dependent variable 'outer' escapes its scope"]),
     ("TypedRemainderAlias", ["4:72: error: lifetime-dependent variable 'rest' escapes its scope"]),

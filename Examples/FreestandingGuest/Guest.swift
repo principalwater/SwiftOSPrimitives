@@ -1,3 +1,4 @@
+import GuestABI
 import _Volatile
 
 // The counter pointer is valid throughout its enclosing native loan and all token destruction.
@@ -12,12 +13,17 @@ import _Volatile
 }
 
 @c(guest_main)
-@unsafe public func guestMain(_ raw: UnsafeMutableRawPointer?, _ capacity: Int) -> Never {
+@unsafe public func guestMain(
+  _ raw: UnsafeMutableRawPointer?, _ capacity: Int,
+  _ frames: UnsafeMutableRawPointer?, _ frameCount: Int
+) -> Never {
   guard let raw = unsafe raw, capacity == 4096 else { finish("BAD_BOOT_EXTENT\n") }
   #if GUEST_GUARD_FAILURE
     _ = guardProbe()
     finish("GUARD_BYPASSED\n")
   #else
+    guard let frames = unsafe frames, frameCount == 16 else { finish("BAD_FRAME_EXTENT\n") }
+    unsafe checkFrames(frames, count: frameCount)
     let bytes = unsafe raw.initializeMemory(as: UInt8.self, repeating: 71, count: capacity)
     let lengths: InlineArray<7, Int> = [0, 1, 7, 8, 9, 31, 65]
     for offset in 0..<16 {
@@ -81,6 +87,12 @@ import _Volatile
       unsafe VolatileMappedRegister<UInt8>(unsafeBitPattern: UInt(bitPattern: bytes)).store(0)
     #endif
     if unsafe bytes[0] != 71 { finish("MEMORY_FAIL\n") }
-    finish("GUEST_PASS\n")
+    #if GUEST_TRAP_FAILURE
+      guest_test_trap()
+    #elseif GUEST_TRAP_OTHER
+      guest_test_other_trap()
+    #else
+      finish("GUEST_PASS\n")
+    #endif
   #endif
 }

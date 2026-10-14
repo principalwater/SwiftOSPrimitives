@@ -208,6 +208,7 @@ func checkLowLevel() throws {
 
   func run(
     _ name: String, executable: URL, arguments: [String], expectedError: String? = nil,
+    expectedTrap: String? = nil,
     expectedOutput: String? = nil, timeoutSeconds: Int = 60
   )
     throws
@@ -255,6 +256,15 @@ func checkLowLevel() throws {
     child.waitUntilExit()
     let size = try files.attributesOfItem(atPath: log.path)[.size] as? NSNumber
     guard let size, size.intValue <= 262_144 else { throw CheckFailure.oversizedEvidence }
+    if let expectedTrap {
+      let text = try String(contentsOf: log, encoding: .utf8)
+      guard child.terminationReason == .uncaughtSignal,
+        child.terminationStatus == SIGILL || child.terminationStatus == SIGTRAP,
+        text.contains(expectedTrap)
+      else { throw CheckFailure.refused(name + ": " + text) }
+      print("PASS \(name): expected checked RAM-copy trap")
+      return
+    }
     if let expectedError {
       let text = String(decoding: try Data(contentsOf: log), as: UTF8.self)
       guard child.terminationReason == .exit, child.terminationStatus != 0,
@@ -464,6 +474,63 @@ func checkLowLevel() throws {
       "-o", fillImage.path,
     ])
   try run("FillExecution", executable: fillImage, arguments: [])
+  let copyImage = scratch.appendingPathComponent("CopyProbe")
+  try run(
+    "EmbeddedCopy", executable: compiler,
+    arguments: host + embedded + ["-no-allocations"] + [
+      root.appendingPathComponent("Examples/FreestandingGuest/MemoryCopy.swift").path,
+      root.appendingPathComponent("Examples/CopyProbe/main.swift").path,
+      "-o", copyImage.path,
+    ])
+  try run("CopyExecution", executable: copyImage, arguments: [])
+  for (definition, reason) in [
+    ("COPY_NIL", "Invalid RAM copy extent"),
+    ("COPY_COUNT", "Invalid RAM copy extent"),
+    ("COPY_OVERFLOW", "RAM copy address overflow"),
+    ("COPY_OVERLAP", "Overlapping RAM copy extents"),
+  ] {
+    let refusal = scratch.appendingPathComponent(definition)
+    try run(
+      definition + "Build", executable: compiler,
+      arguments: host.map { $0 == "-O" ? "-Onone" : $0 }
+        + ["-enable-experimental-feature", "Volatile", "-D", definition] + [
+          root.appendingPathComponent("Examples/FreestandingGuest/MemoryCopy.swift").path,
+          root.appendingPathComponent("Examples/CopyProbe/Refusal.swift").path,
+          "-o", refusal.path,
+        ])
+    try run(definition + "Execution", executable: refusal, arguments: [], expectedTrap: reason)
+  }
+
+  let frameImage = scratch.appendingPathComponent("FrameProbe")
+  let frameSources = [
+    root.appendingPathComponent("Sources/BoundedMemory/FrameLedger.swift").path,
+    root.appendingPathComponent("Examples/FrameTrace/FrameTrace.swift").path,
+  ]
+  try run(
+    "EmbeddedFrames", executable: compiler,
+    arguments: host + embedded + lifetimes + ["-no-allocations"] + frameSources + [
+      root.appendingPathComponent("Examples/FrameProbe/main.swift").path,
+      "-o", frameImage.path,
+    ])
+  try run("FrameExecution", executable: frameImage, arguments: [])
+
+  #if canImport(Darwin)
+    let benchmark = scratch.appendingPathComponent("FrameBenchmark")
+    try run(
+      "EmbeddedFrameBenchmark", executable: compiler,
+      arguments: host + embedded + lifetimes + ["-no-allocations"] + frameSources + [
+        root.appendingPathComponent("Examples/FrameBenchmark/main.swift").path,
+        "-o", benchmark.path,
+      ])
+    try run("FrameBenchmarkExecution", executable: benchmark, arguments: [])
+    let measurement = try String(
+      contentsOf: scratch.appendingPathComponent("FrameBenchmarkExecution.log"), encoding: .utf8
+    ).split(whereSeparator: \.isNewline).compactMap { UInt64($0) }
+    guard measurement.count == 4, measurement[0] > 0,
+      measurement[0] <= measurement[1], measurement[1] <= measurement[2],
+      measurement[3] == 65_472_000
+    else { throw CheckFailure.refused("Frame benchmark observation") }
+  #endif
 
   try run(
     "AllocatingControl", executable: compiler,
@@ -538,6 +605,7 @@ func checkLowLevel() throws {
           root.appendingPathComponent("Examples/TypedTrace/TypedTrace.swift").path,
         ]
       ),
+      ("Frames", "frame_trace", frameSources),
     ]
     for (kind, entry, sources) in traces {
       for target in ["aarch64-none-none-elf", "x86_64-unknown-none-elf"] {
@@ -575,7 +643,11 @@ func checkLowLevel() throws {
         ).trimmingCharacters(in: .whitespacesAndNewlines)
         // Retain compiler stack protection and zero restoration; audit this exact PAL boundary.
         let allowedImports: Set<String> =
-          kind == "TypedArena" ? ["memset", "__stack_chk_fail", "__stack_chk_guard"] : []
+          kind == "Arena"
+          ? []
+          : kind == "Frames"
+            ? ["memcpy", "memset", "__stack_chk_fail", "__stack_chk_guard"]
+            : ["memset", "__stack_chk_fail", "__stack_chk_guard"]
         let importedSymbols = imports.split(separator: "\n").compactMap {
           $0.split(separator: " ").last.map(String.init)
         }
@@ -649,14 +721,19 @@ func checkLowLevel() throws {
         [
           arenaSources[0],
           root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
+          root.appendingPathComponent("Sources/BoundedMemory/FrameLedger.swift").path,
         ]
-        + ["Guest.swift", "MemoryFill.swift", "Platform.swift"].map {
+        + ["Guest.swift", "MemoryFill.swift", "MemoryCopy.swift", "Platform.swift", "Frames.swift"]
+        .map {
           guest.appendingPathComponent($0).path
         }
       for (mode, definition, marker) in [
         ("Success", "GUEST_BUILD", "GUEST_PASS\n"),
         ("Guard", "GUEST_GUARD_FAILURE", "STACK_FAIL\n"),
         ("Memory", "GUEST_MEMORY_FAILURE", "MEMORY_FAIL\n"),
+        ("Frames", "GUEST_FRAME_FAILURE", "FRAME_FAIL\n"),
+        ("Trap", "GUEST_TRAP_FAILURE", "BRK_PASS\n"),
+        ("TrapOther", "GUEST_TRAP_OTHER", "TRAP\n"),
       ] {
         let name = "Guest" + mode
         let original = scratch.appendingPathComponent(name + ".ll")
@@ -670,7 +747,8 @@ func checkLowLevel() throws {
             + sources + ["-o", original.path])
         let reachable = scratch.appendingPathComponent(name + "-live.ll")
         let entries = [
-          "guest_main", "memset", "__stack_chk_guard", "__stack_chk_fail", "guard_probe",
+          "guest_main", "guest_trap", "memset", "memcpy", "__stack_chk_guard", "__stack_chk_fail",
+          "guard_probe",
         ]
         let preserved = entries.map { "preserve-gv=" + $0 }.joined(separator: ";")
         try run(

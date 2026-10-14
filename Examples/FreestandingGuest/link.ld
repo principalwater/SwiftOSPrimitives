@@ -23,10 +23,19 @@ SECTIONS {
     __stack_bottom = .;
     . += 65536;
     __stack_top = .;
+    . = ALIGN(4096);
+    . += 4096;
+    __trap_stack_top = .;
+    . += 4096;
+    __frames_start = .;
+    . += 16 * 4096;
+    __frames_end = .;
+    . += 4096;
+    __guest_end = .;
   } :data
   .symtab 0 : { *(.symtab) } :NONE
   .strtab 0 : { *(.strtab) } :NONE
   .shstrtab 0 : { *(.shstrtab) } :NONE
   /DISCARD/ : { *(.comment) *(.note.GNU-stack) *(.llvm_addrsig) }
-  ASSERT(__stack_top < 0x44000000, "Guest image exceeds the 64MiB RAM extent")
+  ASSERT(__guest_end < 0x44000000, "Guest image exceeds the 64MiB RAM extent")
 }

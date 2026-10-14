@@ -134,6 +134,10 @@ stack-guard failure and memory-boundary negative controls. A small assembly boot
 boundary remains necessary; this experiment adds no package runtime dependency.
 [FillBenchmark](Examples/FillBenchmark) compares two standalone Swift volatile
 fill variants on macOS and makes no language-performance ranking.
+[FrameLedger](Documentation/FrameLedger.md) adds retained, generation-bound frame
+reservations over borrowed fixed metadata, with explicit out-of-order release.
+Its Embedded trace and Mac benchmark validate allocation-free machine code;
+frame identifiers alone grant no physical-memory access.
 
 [Kernel Rust and Swift](Documentation/KernelRustAndSwift.md) explains the kernel
 contracts, current Swift capabilities and remaining compiler/subsystem work.

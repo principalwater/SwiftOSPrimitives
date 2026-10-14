@@ -22,6 +22,17 @@ func finish(_ text: StaticString) -> Never {
 @c(__stack_chk_fail)
 public func guestStackFailure() -> Never { finish("STACK_FAIL\n") }
 
+// Terminal diagnosis only: no exception recovery, interrupt dispatch or context restoration.
+@c(guest_trap)
+public func guestTrap(_ vector: UInt64, _ syndrome: UInt64, _ address: UInt64) -> Never {
+  #if GUEST_TRAP_FAILURE || GUEST_TRAP_OTHER
+    if vector == 4 && ((syndrome >> 26) & 0x3f) == 0x3c && (syndrome & 0xffff) == 0x641 {
+      finish("BRK_PASS\n")
+    }
+  #endif
+  finish("TRAP\n")
+}
+
 @c(guard_probe)
 @inline(never) public func guardProbe() -> Int {
   var counter = 0
