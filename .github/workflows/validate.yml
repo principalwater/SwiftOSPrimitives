@@ -4,6 +4,64 @@ permissions:
   contents: read
 
 jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: compnerd/gha-setup-swift@bbae8ce86bac5a3449f3992b3d88bc4ca25f2057
+        with:
+          swift-version: swift-6.4.1-release
+          swift-build: 6.4.1-RELEASE
+          build_arch: amd64
+      - name: Validate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = & swift --version
+          if ($LASTEXITCODE -ne 0 -or ($version -join "`n") -notmatch 'Swift version 6\.4\.1(?:\s|$)') {
+            throw 'Expected Swift 6.4.1'
+          }
+          $version
+          # Prevent cross-module inlining from dropping SwiftBuild's empty DLL test anchor.
+          & swift test -c release --jobs 2 -Xswiftc -warnings-as-errors -Xswiftc -disable-cmo
+          if ($LASTEXITCODE -ne 0) { throw 'Release tests failed' }
+          $tests = & swift test list --skip-build -c release
+          if ($LASTEXITCODE -ne 0 -or
+              @($tests | Where-Object { $_ -match '^PageMemoryTests\.' }).Count -ne 12 -or
+              @($tests | Where-Object { $_ -match '^BoundedMemoryTests\.' }).Count -ne 19) {
+            throw 'Expected all 31 Windows memory tests to be discovered'
+          }
+          $modules = (& swift build -c release --show-bin-path | Select-Object -Last 1)
+          if ($LASTEXITCODE -ne 0) { throw 'Module lookup failed' }
+          $compiler = (Get-Command swiftc).Source
+          $checker = Join-Path $env:RUNNER_TEMP 'CheckCompileFailures.exe'
+          & $compiler -swift-version 6 Tools/CheckCompileFailures.swift -o $checker
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler-check helper build failed' }
+          & $checker $compiler $modules Tests/CompileFail "$env:RUNNER_TEMP/ownership"
+          if ($LASTEXITCODE -ne 0) { throw 'Compiler ownership controls failed' }
+          & swift run -c release --skip-build page-memory-probe soak 300
+          if ($LASTEXITCODE -ne 0) { throw 'Native soak failed' }
+          & swift run -c release --skip-build page-memory-probe cycle reuse 1000 65536
+          if ($LASTEXITCODE -ne 0) { throw 'Native reuse cycle failed' }
+          & swift run -c release --skip-build page-memory-probe footprint reusable
+          if ($LASTEXITCODE -ne 0) { throw 'Native footprint observation failed' }
+          $frame = Join-Path $env:RUNNER_TEMP 'frame-hosted.exe'
+          & $compiler -swift-version 6 -O -wmo -parse-as-library -warnings-as-errors `
+            -enable-experimental-feature Lifetimes -enable-experimental-feature Volatile `
+            -strict-memory-safety Sources/BoundedMemory/FrameLedger.swift `
+            Examples/FrameComparison/main.swift -o $frame
+          if ($LASTEXITCODE -ne 0) { throw 'Native frame comparison build failed' }
+          $frameLog = Join-Path $env:RUNNER_TEMP 'frame-hosted.txt'
+          & $frame > $frameLog
+          if ($LASTEXITCODE -ne 0) { throw 'Native frame comparison failed' }
+          $inspector = Join-Path $env:RUNNER_TEMP 'InspectFrameComparison.exe'
+          & $compiler -swift-version 6 Tools/InspectFrameComparison.swift -o $inspector
+          if ($LASTEXITCODE -ne 0) { throw 'Frame inspector build failed' }
+          & $inspector $frameLog
+          if ($LASTEXITCODE -ne 0) { throw 'Frame comparison validation failed' }
   test:
     strategy:
       fail-fast: false

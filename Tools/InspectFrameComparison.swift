@@ -12,6 +12,7 @@ func inspectComparison() throws {
     throw ComparisonFailure.format
   }
   let text = try String(contentsOf: file, encoding: .utf8)
+    .replacingOccurrences(of: "\r\n", with: "\n")
   var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
   guard lines.last == "" else { throw ComparisonFailure.format }
   lines.removeLast()
