@@ -6,6 +6,9 @@ import _Volatile
   import Darwin
 #elseif canImport(Musl)
   import Musl
+#elseif os(Windows)
+  import WinSDK
+  import ucrt
 #else
   import Glibc
 #endif
@@ -14,6 +17,10 @@ import _Volatile
 func currentTicks() -> UInt64 {
   #if canImport(Darwin)
     return mach_absolute_time()
+  #elseif os(Windows)
+    var ticks = LARGE_INTEGER()
+    precondition(unsafe QueryPerformanceCounter(&ticks) && ticks.QuadPart >= 0)
+    return unsafe UInt64(ticks.QuadPart)
   #else
     var time = timespec(tv_sec: 0, tv_nsec: 0)
     precondition(unsafe clock_gettime(CLOCK_MONOTONIC_RAW, &time) == 0)
@@ -21,7 +28,6 @@ func currentTicks() -> UInt64 {
     return UInt64(time.tv_sec) * 1_000_000_000 + UInt64(time.tv_nsec)
   #endif
 }
-
 @inline(never)
 @unsafe func churnStep(
   _ ledger: inout FrameLedger, iteration: Int, request: UnsafePointer<UInt64>
@@ -48,7 +54,6 @@ func currentTicks() -> UInt64 {
   precondition(ledger.availableCount == ledger.capacity)
   return UInt64(firstFrame + secondFrame) + UInt64(iteration)
 }
-
 @inline(never)
 @unsafe func refusalStep(
   _ ledger: inout FrameLedger, iteration: Int, request: UnsafePointer<UInt64>, expectedFree: Int
@@ -62,7 +67,6 @@ func currentTicks() -> UInt64 {
   precondition(free == expectedFree)
   return UInt64(free) + UInt64(iteration)
 }
-
 func emit(_ value: UInt64) {
   var digits: InlineArray<20, UInt8> = .init(repeating: 0)
   var number = value
@@ -75,7 +79,6 @@ func emit(_ value: UInt64) {
   for index in (0..<count).reversed() { _ = putchar(Int32(digits[index])) }
   _ = putchar(10)
 }
-
 @unsafe func measure(
   _ ledger: inout FrameLedger, ticks: inout InlineArray<32, UInt64>,
   iterations: Int, mode: Int, request: UnsafePointer<UInt64>, expectedFree: Int
@@ -102,7 +105,6 @@ func emit(_ value: UInt64) {
   }
   return checksum
 }
-
 @main struct FrameComparison {
   static func main() {
     var metadata: InlineArray<65537, UInt64> = .init(repeating: 0)
@@ -112,6 +114,11 @@ func emit(_ value: UInt64) {
       precondition(unsafe mach_timebase_info(&info) == KERN_SUCCESS && info.denom != 0)
       let numerator = UInt64(info.numer)
       let denominator = UInt64(info.denom)
+    #elseif os(Windows)
+      var frequency = LARGE_INTEGER()
+      precondition(unsafe QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0)
+      let numerator: UInt64 = 1_000_000_000
+      let denominator = unsafe UInt64(frequency.QuadPart)
     #else
       let numerator: UInt64 = 1
       let denominator: UInt64 = 1

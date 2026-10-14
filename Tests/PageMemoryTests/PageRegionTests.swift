@@ -1,12 +1,14 @@
 import PageMemory
+
 import Testing
 
 #if os(Linux) && canImport(Glibc)
   import Glibc
 #elseif os(Linux) && canImport(Musl)
   import Musl
+#elseif os(Windows)
+  import WinSDK
 #endif
-
 @Suite struct PageRegionTests {
   @Test func roundingAndLimits() throws {
     let region = try PageRegion.allocate(byteCount: 1)
@@ -63,7 +65,7 @@ import Testing
     }
     #expect(try region.residentPageCount() > 0)
     _ = try region.discardContents()
-    #if os(Linux)
+    #if os(Linux) || os(Windows)
       #expect(try region.residentPageCount() == 0)
     #endif
     try region.release()
@@ -72,6 +74,9 @@ import Testing
     #expect(released)
     #expect(throws: PageMemoryError.unavailable) { _ = try region.residentPageCount() }
     #expect(throws: PageMemoryError.unavailable) { try region.resetToZero() }
+    #expect(throws: PageMemoryError.unavailable) { _ = try region.discardContents() }
+    #expect(throws: PageMemoryError.unavailable) { _ = try region.withBytes { $0.count } }
+    #expect(throws: PageMemoryError.unavailable) { try region.withMutableBytes { $0[0] = 1 } }
   }
   @Test func callbackFailureValueDoesNotInvalidateOwnership() throws {
     enum Failure: Error { case rejected }
@@ -84,6 +89,80 @@ import Testing
     #expect(try region.withBytes { $0[0] } == 73)
     try region.release()
   }
+  #if os(Windows)
+    @Test func residencyBatchesStayInsideOwnedReservation() throws {
+      var sizing = try PageRegion.allocate(byteCount: 1)
+      let step = sizing.pageSize
+      try sizing.release()
+      let pageCount = 1027
+      let byteCount = step * pageCount
+      var region = try PageRegion.allocate(
+        byteCount: byteCount, maximumMappedBytes: byteCount)
+      try region.withMutableBytes { bytes in
+        for index in stride(from: 0, to: bytes.count, by: step) { bytes[index] = 57 }
+      }
+      let resident = try region.residentPageCount()
+      #expect(resident > 0 && resident <= pageCount)
+      _ = try region.discardContents()
+      #expect(try region.residentPageCount() == 0)
+      try region.resetToZero()
+      #expect(try region.withBytes { $0[$0.count - 1] } == 0)
+      try region.release()
+    }
+    @Test func nativeReservationCommitAndReset() throws {
+      var information = unsafe SYSTEM_INFO()
+      unsafe GetSystemInfo(&information)
+      let step = unsafe Int(information.dwPageSize)
+      var region = try PageRegion.allocate(byteCount: step + 17, maximumMappedBytes: step * 2)
+      #expect(region.pageSize == step)
+      #expect(region.mappedByteCount == step * 2)
+      let address = try region.withMutableBytes { bytes in
+        for index in 0..<bytes.count { bytes[index] = 93 }
+        return bytes.withUnsafeMutableBufferPointer { buffer in
+          UInt(bitPattern: buffer.baseAddress!)
+        }
+      }
+      // Inspect only this owner's address; no foreign mapping is modified by the test.
+      @unsafe func state() -> MEMORY_BASIC_INFORMATION {
+        var value = unsafe MEMORY_BASIC_INFORMATION()
+        let expectedSize = unsafe SIZE_T(MemoryLayout<MEMORY_BASIC_INFORMATION>.size)
+        let size = unsafe VirtualQuery(UnsafeRawPointer(bitPattern: address), &value, expectedSize)
+        #expect(size == expectedSize)
+        return unsafe value
+      }
+      let committed = unsafe state()
+      #expect(unsafe committed.State == DWORD(MEM_COMMIT))
+      #expect(unsafe committed.Type == DWORD(MEM_PRIVATE))
+      #expect(unsafe committed.Protect == DWORD(PAGE_READWRITE))
+      #expect(unsafe committed.RegionSize == SIZE_T(region.mappedByteCount))
+      #expect(unsafe address % UInt(information.dwAllocationGranularity) == 0)
+      let report = try region.discardContents()
+      #expect(report.semantics == .discardAndZeroOnDemand)
+      let reserved = unsafe state()
+      #expect(unsafe reserved.State == DWORD(MEM_RESERVE))
+      #expect(unsafe reserved.AllocationBase == committed.AllocationBase)
+      #expect(unsafe reserved.RegionSize == SIZE_T(region.mappedByteCount))
+      #expect(try region.residentPageCount() == 0)
+      try region.resetToZero()
+      #expect(unsafe state().State == DWORD(MEM_COMMIT))
+      #expect(
+        try region.withBytes { bytes in
+          for index in 0..<bytes.count where bytes[index] != 0 { return false }
+          return true
+        })
+      try region.withMutableBytes { $0[$0.count - 1] = 57 }
+      // Reset must also zero active contents, not merely recommit already committed pages.
+      try region.resetToZero()
+      #expect(
+        try region.withBytes { bytes in
+          for index in 0..<bytes.count where bytes[index] != 0 { return false }
+          return true
+        })
+      try region.release()
+      let released = region.isReleased
+      #expect(released)
+    }
+  #endif
   @Test func throwingCallbacksPreserveErrorAndOwnership() throws {
     enum Rejected: Error, Equatable { case payload }
     var region = try PageRegion.allocate(byteCount: 1)

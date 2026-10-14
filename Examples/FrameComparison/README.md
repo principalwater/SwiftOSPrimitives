@@ -9,7 +9,10 @@ See [the report](../../Documentation/FrameComparison.md) for interpretation.
 
 Use pinned Swift 6.4.1 and a fresh scratch directory outside the checkout.
 On macOS set SDKROOT to the installed macOS SDK; Linux uses its native toolchain.
-The fixture requires macOS 27 or 64-bit Linux, not the package's iOS 18 floor.
+The fixture supports macOS 27, 64-bit Linux, and hosted Windows 10 x64. Windows
+uses native QueryPerformanceCounter/Frequency and the installed C runtime for
+output; it imports no POSIX compatibility layer. Windows Embedded and a Windows
+Rust comparison are not validated. This is separate from the package's iOS 18 floor.
 Heap allocation is forbidden in Embedded mode; overflow, bounds and exclusivity
 checks remain enabled.
 
@@ -24,6 +27,9 @@ swift Tools/InspectFrameComparison.swift /path/to/scratch/frame-embedded.txt
 ```
 
 For hosted Swift, omit Embedded and no-allocations; retain every other safety flag.
+On Windows, run the hosted command in the native Swift/MSVC/SDK environment and
+compile `Tools/InspectFrameComparison.swift` into an executable before invoking
+it with the output file. The inspector accepts both LF and CRLF output.
 On native Linux Embedded, add -Xcc -fmodule-map-file=Examples/FrameComparison/NativePOSIX.modulemap
 and -Xcc -isystem -Xcc /usr/include, plus the native architecture include directory
 (for example /usr/include/x86_64-linux-gnu). This minimal module imports existing
