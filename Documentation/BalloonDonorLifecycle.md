@@ -12,7 +12,7 @@ ledger reservations remain held through inflate and deflate. No donor read occur
 between inflate publication and real deflate completion. Every returned byte is
 initialized before any donor read or reuse. Successful device reset precedes freeing
 the reservations. Reset occurs before any frame write during setup, and final
-status0 plus both QueueReady0 observations precede release. PFNs are verified after
+status0 plus both QueueReady0 observations precede release. PFNs are verified before and after
 inflate, immediately before deflate and after its acknowledgement; actual avail and
 used indices on both queues are checked at the end. An adjacent-RAM canary checks
 the remaining extent. One descriptor
@@ -22,7 +22,8 @@ is outstanding per queue, with rotating heads and bounded native timer deadlines
 
 The full-wrap gate completes65540 inflate and65540 deflate used-ring operations.
 Both software counts end at65540 and both16-bit wire indices end at4. The injected
-count65536 is the first post-wrap submission; the actual crossing is65535 to65536.
+count65536 is the first post-wrap submission; the actual crossing is65535 to65536. A compiler-negative gate refuses combined
+host/full-wrap modes, and the success marker itself requires65540 cycles.
 Rotating heads detect the prior ring lap; they repeat every64 submissions and do
 not provide arbitrary replay resistance. This extends
 the separate RNG queue wrap proof to the actual balloon queues. Six device-boundary
@@ -41,8 +42,12 @@ Two additional one-cycle native controls corrupt the deflate PFN list and report
 QueueReady1 after reset. They must terminate at `BALLOON_LIST_FAIL` and
 `BALLOON_RESET_QUEUE_FAIL`, respectively, before donor initialization/ticket release.
 
-Identity/length faults are injected only AFTER an actual matching used-index
-completion. Withheld completion remains a real timeout, never a fabricated reply.
+These are guest-injected corruptions around real device operations; they do not
+claim QEMU naturally produces such faults. Identity controls snapshot the actual
+previous-lap used ID before publication and replay it only AFTER a new matching
+used-index completion. This independently detects loss of head rotation; the test
+does not manufacture a mismatching ID from the formula under test. Length corruption
+is also injected only after real completion. Withheld completion remains a real timeout, never a fabricated reply.
 Terminal failures retain all tickets until the whole disposable VM exits. They do
 not license live-driver reuse, cache maintenance, multicore/DMA quiescence or reset
 recovery. The experiments remain outside library products and have no host device
@@ -58,8 +63,8 @@ deliberate mutation of the new guard, not an unchanged historical release.
 ## Measurements and scope
 
 On macOS27.0.1/M2Max with Swift6.4.1, the isolated QEMU10.2/TCG whole-wrap run
-completed in6.221 seconds wall/7.577 seconds cumulative process CPU, with peak RSS
-37,175,296 bytes. It erased and reinitialized1,073,807,360 donor bytes each across
+completed in6.206 seconds wall/7.507 seconds cumulative process CPU, with peak RSS
+37,109,760 bytes. It erased and reinitialized1,073,807,360 donor bytes each across
 the cycles. The measurement includes VM boot, IRQ/DMA and guest checks; it is not
 a syscall/packet latency or a Swift-versus-Rust comparison. QEMU can have host
 threads even with one guest CPU and single-thread TCG.

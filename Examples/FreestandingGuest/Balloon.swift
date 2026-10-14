@@ -1,6 +1,10 @@
 import GuestABI
 import _Volatile
 
+#if GUEST_HOST_BALLOON && (GUEST_BALLOON_WRAP || GUEST_BALLOON_WRAP_INFLATE_ID || GUEST_BALLOON_WRAP_DEFLATE_ID || GUEST_BALLOON_WRAP_LENGTH || GUEST_BALLOON_WRAP_STALE || GUEST_BALLOON_WRAP_NO_DEFLATE || GUEST_BALLOON_DIRTY_DONOR)
+  #error("Host balloon and full-wrap modes must be separate builds")
+#endif
+
 @unsafe private func waitBalloonTarget(_ device: UInt, pages: UInt32) {
   let frequency = guest_timer_frequency()
   guard frequency >= 1000, frequency <= 10_000_000_000 else { finish("HOST_CLOCK_FAIL\n") }
@@ -112,6 +116,7 @@ import _Volatile
         unsafe mmioHalf(ring + 162).store(65535)
       }
     #endif
+    unsafe verifyBalloonPFNs(ring, firstFrame: donated.firstFrame)
     // Virtio permits voluntary supply when requested >= actual (both initially zero).
     // Do not access donated pages from publication through deflate acknowledgement.
     _ = unsafe postVirtioBuffer(
@@ -193,6 +198,9 @@ import _Volatile
     ledger.availableCount == count
   else { finish("BALLOON_RELEASE_FAIL\n") }
   #if GUEST_BALLOON_WRAP
+    guard inflate.completedCount == 65540, deflate.completedCount == 65540 else {
+      finish("BALLOON_WRAP_COUNT_FAIL\n")
+    }
     emit("BALLOON_WRAP_PASS 65540 65540\n")
   #endif
   emit("BALLOON_PASS\n")

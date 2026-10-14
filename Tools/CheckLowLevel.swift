@@ -739,6 +739,14 @@ func checkLowLevel() throws {
         .map {
           guest.appendingPathComponent($0).path
         }
+      try run(
+        "GuestConflictingBalloonModes", executable: compiler,
+        arguments: common + embedded + lifetimes + [
+          "-no-allocations", "-target", "aarch64-none-none-elf", "-I", guest.path,
+          "-D", "GUEST_BUILD", "-D", "GUEST_HOST_BALLOON", "-D", "GUEST_BALLOON_WRAP",
+          "-emit-ir",
+        ] + sources + ["-o", scratch.appendingPathComponent("GuestConflict.ll").path],
+        expectedError: "Host balloon and full-wrap modes must be separate builds")
       for (mode, definition, marker) in [
         (
           "Success", "GUEST_BUILD",

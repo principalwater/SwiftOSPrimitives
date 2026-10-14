@@ -80,6 +80,9 @@ import _Volatile
   let slot = UInt(sequence.ringSlot)
   // A changed head on each lap makes a stale entry at a reused ring slot detectable.
   let head = UInt(sequence.descriptorHead)
+  #if GUEST_WRAP_WRONG_ID || GUEST_BALLOON_WRAP_INFLATE_ID || GUEST_BALLOON_WRAP_DEFLATE_ID
+    let previousID = unsafe mmioWord(ring + 164 + slot * 8).load()
+  #endif
   let descriptor = ring + head * 16
   let next = wireIndex &+ 1
   let start = guest_timer_counter()
@@ -127,7 +130,8 @@ import _Volatile
   #if GUEST_WRAP_WRONG_ID
     if deviceWrites && sequence.completedCount == 65536 {
       emit("WRAP_INJECT_ID_65536\n")
-      unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))
+      guard previousID < 8 else { finish("VIRTIO_REPLAY_CONTROL_FAIL\n") }
+      unsafe mmioWord(ring + 164 + slot * 8).store(previousID)
     }
   #elseif GUEST_WRAP_WRONG_LENGTH
     if deviceWrites && sequence.completedCount == 65536 {
@@ -144,7 +148,8 @@ import _Volatile
       #endif
       if queue == selectedQueue {
         emit("BALLOON_INJECT_ID_65536\n")
-        unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))
+        guard previousID < 8 else { finish("VIRTIO_REPLAY_CONTROL_FAIL\n") }
+        unsafe mmioWord(ring + 164 + slot * 8).store(previousID)
       }
     }
   #elseif GUEST_BALLOON_WRAP_LENGTH
