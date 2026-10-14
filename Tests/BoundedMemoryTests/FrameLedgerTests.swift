@@ -58,7 +58,7 @@ import Testing
       (0, 1, FrameAllocationFailure.invalidSize), (-1, 1, .invalidSize),
       (Int.max, 1, .capacityExceeded), (1, 0, .invalidAlignment),
       (1, 3, .invalidAlignment), (3, 1, .capacityExceeded),
-      (1, Int.max, .invalidAlignment),
+      (1, Int.max, .invalidAlignment), (5, 3, .invalidAlignment),
     ] {
       switch ledger.reserve(frameCount: count, alignment: alignment) {
       case .refused(let reason): #expect(reason == expected)
@@ -133,6 +133,10 @@ import Testing
         return
       }
       #expect(ledger.availableCount == 0)
+      switch ledger.reserve(frameCount: 1) {
+      case .refused(.generationExhausted): break
+      default: Issue.record("Free-count shortcut changed exhaustion precedence")
+      }
       guard case .released = ledger.release(consume final) else {
         Issue.record("Final generation release failed")
         return
@@ -148,6 +152,20 @@ import Testing
     }
     // The caller-visible persistent counter is part of the documented metadata format.
     #expect(metadata[0] == UInt64.max && metadata[1] == 0 && metadata[2] == 0)
+    guard var exhausted = FrameLedger(metadata: metadata.mutableSpan) else {
+      Issue.record("Empty exhausted metadata refused")
+      return
+    }
+    for (count, alignment, expected) in [
+      (0, 1, FrameAllocationFailure.invalidSize), (1, 0, .invalidAlignment),
+      (3, 1, .capacityExceeded), (1, 1, .generationExhausted),
+    ] {
+      switch exhausted.reserve(frameCount: count, alignment: alignment) {
+      case .refused(let reason): #expect(reason == expected)
+      default: Issue.record("Exhausted initialization changed refusal precedence")
+      }
+      #expect(exhausted.availableCount == 2)
+    }
   }
 
   @Test func reusePreservesCounterAndDroppedTicketKeepsCapacity() {
@@ -185,6 +203,16 @@ import Testing
         return
       }
       _ = consume dropped
+      #expect(ledger.availableCount == 2)
+      for (count, alignment) in [(3, 1), (2, 4)] {
+        guard
+          case .refused(.capacityExceeded) = ledger.reserve(
+            frameCount: count, alignment: alignment)
+        else {
+          Issue.record("Unsatisfiable request admitted")
+          return
+        }
+      }
       #expect(ledger.availableCount == 2)
     }
     switch FrameLedger(metadata: metadata.mutableSpan) {
@@ -263,6 +291,7 @@ import Testing
         #expect(unsafe pointer[0] == header && pointer[1] == first && pointer[2] == second)
         if extent > 2 {
           // A later slot mismatch must not free the first matching slot.
+          // Only refused calls run before restoration; successful calls would desync the cache.
           unsafe pointer[2] = 0
           guard case .refused(let held) = current.release(consume live) else {
             Issue.record("Partial mismatch accepted")

@@ -47,27 +47,26 @@ public enum FrameRelease: ~Copyable, ~Escapable {
   private var metadata: MutableSpan<UInt64>
   private let identity: UInt
   private let baseFrame: UInt
+  private var freeCount: Int
 
   /// Returns nil for empty capacity, overflowing geometry or initially occupied frame slots.
   /// The exclusive end `firstFrame + capacity` must fit UInt; an exhausted counter is accepted.
   /// Unsafe pointer-backed callers must never decrease slot zero while stale tickets could exist.
+  /// Do not mutate metadata outside this ledger while it is live; availability is cached.
   @_lifetime(copy metadata)
   public init?(metadata: consuming MutableSpan<UInt64>, firstFrame: UInt = 0) {
     guard metadata.count > 1, UInt(metadata.count - 1) <= UInt.max - firstFrame else { return nil }
     for index in 1..<metadata.count { guard metadata[index] == 0 else { return nil } }
     self.identity = metadata.withUnsafeBufferPointer { UInt(bitPattern: $0.baseAddress) }
     self.baseFrame = firstFrame
+    self.freeCount = metadata.count - 1
     self.metadata = metadata
   }
 
   /// Total managed frame count.
   public var capacity: Int { metadata.count - 1 }
-  /// Number of currently free slots. Complexity: O(capacity).
-  public var availableCount: Int {
-    var count = 0
-    for index in 1..<metadata.count { if metadata[index] == 0 { count += 1 } }
-    return count
-  }
+  /// Number of currently free slots. Complexity: O(1).
+  public var availableCount: Int { freeCount }
 
   /// Reserves an aligned contiguous range; alignment is in frame units at the actual baseFrame.
   /// Fragmentation and unsatisfiable alignment both return capacityExceeded.
@@ -80,6 +79,7 @@ public enum FrameRelease: ~Copyable, ~Escapable {
     }
     guard frameCount <= capacity else { return .refused(.capacityExceeded) }
     guard metadata[0] < UInt64.max else { return .refused(.generationExhausted) }
+    guard frameCount <= freeCount else { return .refused(.capacityExceeded) }
     var offset = 0
     while offset <= capacity - frameCount {
       let padding = Int((0 &- (baseFrame + UInt(offset))) & UInt(alignment - 1))
@@ -91,6 +91,7 @@ public enum FrameRelease: ~Copyable, ~Escapable {
         let generation = metadata[0] + 1
         metadata[0] = generation
         for index in offset..<(offset + frameCount) { metadata[index + 1] = generation }
+        freeCount -= frameCount
         return .reserved(
           FrameReservation(
             metadata: metadata, identity: identity, generation: generation,
@@ -104,7 +105,7 @@ public enum FrameRelease: ~Copyable, ~Escapable {
   /// Checks the whole reservation before freeing any slot; a foreign/stale request is unchanged.
   @_lifetime(copy reservation)
   public mutating func release(_ reservation: consuming FrameReservation) -> FrameRelease {
-    guard reservation.identity == identity, reservation.offset >= 0,
+    guard reservation.identity == identity, reservation.generation > 0, reservation.offset >= 0,
       reservation.frameCount > 0, reservation.frameCount <= capacity,
       reservation.offset <= capacity - reservation.frameCount,
       reservation.firstFrame == baseFrame + UInt(reservation.offset)
@@ -112,9 +113,12 @@ public enum FrameRelease: ~Copyable, ~Escapable {
     for index in reservation.offset..<(reservation.offset + reservation.frameCount) {
       guard metadata[index + 1] == reservation.generation else { return .refused(reservation) }
     }
+    // Diagnose derived-state corruption before clearing any ownership slot.
+    precondition(freeCount <= capacity - reservation.frameCount)
     for index in reservation.offset..<(reservation.offset + reservation.frameCount) {
       metadata[index + 1] = 0
     }
+    freeCount += reservation.frameCount
     return .released
   }
 }

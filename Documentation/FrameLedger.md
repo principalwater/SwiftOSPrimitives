@@ -15,6 +15,9 @@ the caller supplies `8 * (N + 1)` bytes, with checked sizing in the backing owne
 There is no additional heap allocation, class, ARC table, Foundation dependency
 or synchronization inside the ledger. Ordinary hosted runtime initialization and
 page faults are not excluded by this source-level contract.
+The ledger retains one additional native Int for its exact free-slot count.
+Never modify frame words externally while it is live, even through an unsafe
+alias: availability is cached derived state, not an independent corruption census.
 
 `FrameLedger`, `FrameReservation`, `FrameAllocation` and `FrameRelease` are
 noncopyable and nonescapable. Reservations retain the backing loan's lifetime.
@@ -62,18 +65,24 @@ host examples using InlineArray require the applicable newer Apple availability.
 - Safe loan exclusivity prevents simultaneous aliasing/reset. Nonlocal exclusivity
   can be checked dynamically; do not disable it, bypass lifetimes or use Ounchecked.
 
-Reserve, release and availability observation are synchronous and O(capacity).
+All operations are synchronous. Construction and reserve are O(capacity);
+release is O(reservation.frameCount), and availableCount is O(1).
+Insufficient total free capacity is refused without scanning, after the existing
+argument and generation guards. Fragmented/alignment search still scans.
 This first-fit table is suited to small bounded pools, not claimed as a replacement
 for a complete Linux buddy allocator. It provides no locking, atomics, reclaim,
 GFP execution-context policy, DMA/IRQ safety, typed-object Pin or balloon driver.
 
 ## Acceptance
 
-Seven frame test methods cover alignment, fragmentation, out-of-order reuse,
+Eight frame test methods cover alignment, fragmentation, out-of-order reuse,
 foreign-ticket return, dropped tickets, generation exhaustion, UInt geometry,
 reconstruction, stale raw-pointer tickets and whole-range refusal before mutation.
-The raw-pointer fault tests intentionally own their storage and do not introduce
-a production test hook. Together with existing tests, release and ASan run 29 tests.
+The additional naive occupancy model covers 144 geometries independently of the
+production mask/skip search. Priority and refused-generation preservation cases
+protect the shortcut. The raw-pointer fault tests intentionally own their storage,
+restore transient scribbles before successful calls and add no production hook.
+Together with existing tests, release and ASan run 30 tests.
 
 Five additional emit-SIL negatives reject ticket copies, double consumption,
 escape, reuse of the consumed metadata loan and reset of the borrowed owner.
@@ -88,7 +97,7 @@ Whole reachable ARM64/x86-64 objects are audited for imports and FP/SIMD operand
 The guest validates the ledger against actual assigned RAM; see
 [FreestandingGuest](FreestandingGuest.md).
 
-## Scoped Mac measurement
+## Historical scanning baseline (experimental.4)
 
 `Examples/FrameBenchmark` uses the same changing trace and fixed stack storage,
 eight warmups and 128 measured batches of 1,000 cycles. It builds with Embedded,
@@ -110,8 +119,8 @@ A cycle includes three reservations, three releases, two complete availability
 scans over 128 slots and validation/checksum work. These percentiles describe
 batch averages, not individual-request tail latency. Concurrent host work was not
 disabled, so this is a reproducible baseline rather than a controlled language
-comparison or a production/network latency promise. No Rust comparator is added
-for this new API yet.
+comparison or a production/network latency promise. These measurements describe
+the experimental.4 scanning getter, before the cached counter.
 
 The measured executable imports only libSystem, with stack checks, bzero, entropy,
 clock and output functions; it does not import the normal dynamic Swift runtime.
@@ -124,3 +133,6 @@ To reproduce the Mac fixture, combine FrameLedger.swift, FrameTrace.swift and
 FrameBenchmark/main.swift with the pinned compiler and those flags. The ordinary
 low-level checker also builds/runs it on Darwin and checks the observation format
 and digest, without imposing a flaky timing threshold.
+
+See [the cached-counter comparison](FrameComparison.md) for current algorithm,
+CPU/RSS and Rust reference measurements, including preserved raw clock samples.

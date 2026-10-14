@@ -7,7 +7,8 @@ allocator, runtime or Foundation replacement.
 PageMemory owns anonymous private mappings without a class, ARC ownership or COW
 storage. It lends synchronous `Span`/`MutableSpan` views, retires contents before
 reclamation and explicitly releases mappings. The package has no third-party
-dependencies and contains no C, Rust, shell or Python implementations.
+dependencies; its package products are implemented entirely in Swift. An optional,
+standalone Rust benchmark reference is kept outside the products for comparisons.
 
 ## Requirements
 
@@ -138,6 +139,9 @@ fill variants on macOS and makes no language-performance ranking.
 reservations over borrowed fixed metadata, with explicit out-of-order release.
 Its Embedded trace and Mac benchmark validate allocation-free machine code;
 frame identifiers alone grant no physical-memory access.
+[FrameComparison](Examples/FrameComparison) compares the scanning baseline and
+cached counter with equivalent Rust reference algorithms. Its Swift fixture also
+runs on Linux; measurements remain separate from production acceptance.
 
 [Kernel Rust and Swift](Documentation/KernelRustAndSwift.md) explains the kernel
 contracts, current Swift capabilities and remaining compiler/subsystem work.

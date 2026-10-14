@@ -45,6 +45,19 @@ jobs:
           swift run -c release --skip-build page-memory-probe footprint reusable
           swift run --package-path Examples/NIOResourceLab -c release --jobs 2
           swift Tools/CheckLowLevel.swift "$(command -v swiftc)" . "$RUNNER_TEMP/low-level"
+          for mode in hosted embedded; do
+            flags=()
+            if [[ "$mode" == embedded ]]; then
+              flags=(-enable-experimental-feature Embedded -no-allocations)
+            fi
+            swiftc -swift-version 6 -O -wmo -parse-as-library \
+              -enable-experimental-feature Lifetimes -enable-experimental-feature Volatile \
+              -strict-memory-safety -warnings-as-errors "${flags[@]}" \
+              Sources/BoundedMemory/FrameLedger.swift Examples/FrameComparison/main.swift \
+              -o "$RUNNER_TEMP/frame-$mode"
+            "$RUNNER_TEMP/frame-$mode" > "$RUNNER_TEMP/frame-$mode.txt"
+            swift Tools/InspectFrameComparison.swift "$RUNNER_TEMP/frame-$mode.txt"
+          done
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             swiftc -swift-version 6 -strict-memory-safety -warnings-as-errors \
               -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
