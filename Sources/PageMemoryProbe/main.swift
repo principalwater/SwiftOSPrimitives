@@ -120,9 +120,77 @@ func cycleBenchmark(_ args: [String]) throws {
     "{\"mode\":\"\(args[2])\",\"cycles\":\(cycles),\"byte_count\":\(size),\"digest\":\(digest),\"wall_ns\":\(elapsed),\"cpu_ns\":\(cpu),\"p50_ns\":\(percentile(50)),\"p95_ns\":\(percentile(95)),\"p99_ns\":\(percentile(99)),\"before_rss_bytes\":\(before.residentBytes),\"after_rss_bytes\":\(after.residentBytes),\"before_footprint_bytes\":\(before.physicalFootprintBytes.map(String.init) ?? "null"),\"after_footprint_bytes\":\(after.physicalFootprintBytes.map(String.init) ?? "null")}"
   )
 }
+func reclaimProbe(_ args: [String]) throws {
+  guard args.count == 5, ["held", "anonymous", "reusable", "reclaimable"].contains(args[2]),
+    let cycles = Int(args[3]), (1...100).contains(cycles),
+    let size = Int(args[4]), (1...16_777_216).contains(size)
+  else { throw PageMemoryError.invalidSize }
+  let held = args[2] == "held"
+  var region = try PageRegion.allocate(
+    byteCount: size, backing: args[2] == "reclaimable" ? .reclaimable : .anonymous)
+  _ = try ProcessMemorySnapshot.capture()
+  let baseline = try ProcessMemorySnapshot.capture()
+  let started = try monotonicNanoseconds()
+  let cpuStart = processCpuNanoseconds()
+  func fields(_ value: ProcessMemorySnapshot) -> String {
+    "{\"rss\":\(value.residentBytes),\"footprint\":\(value.physicalFootprintBytes.map(String.init) ?? "null")}"
+  }
+  for cycle in 0..<cycles {
+    try region.withMutableBytes { bytes in
+      for index in 0..<bytes.count { bytes[index] = 73 }
+    }
+    let touchedPages = try region.residentPageCount()
+    let touched = try ProcessMemorySnapshot.capture()
+    let eraseStart = try monotonicNanoseconds()
+    try region.eraseContents()
+    let eraseNanoseconds = try monotonicNanoseconds() - eraseStart
+    let zeroed = try region.withBytes { bytes in
+      for index in 0..<bytes.count { if bytes[index] != 0 { return false } }
+      return true
+    }
+    guard zeroed else { throw PageMemoryError.unavailable }
+    let discardStart = try monotonicNanoseconds()
+    let report =
+      held
+      ? nil
+      : try region.discardContents(
+        using: args[2] == "reusable" ? .reusable : .platformDefault)
+    let discardNanoseconds = try monotonicNanoseconds() - discardStart
+    let discardedPages = try region.residentPageCount()
+    let discarded = try ProcessMemorySnapshot.capture()
+    if !held {
+      do {
+        _ = try region.withBytes { $0[0] }
+        throw PageMemoryError.unavailable
+      } catch PageMemoryError.contentsDiscarded {}
+      try region.resetToZero()
+    }
+    let resetZero = try region.withBytes { bytes in
+      for index in 0..<bytes.count { if bytes[index] != 0 { return false } }
+      return true
+    }
+    guard resetZero else { throw PageMemoryError.unavailable }
+    print(
+      "{\"mode\":\"reclaim\",\"strategy\":\"\(args[2])\",\"cycle\":\(cycle),\"page_size\":\(region.pageSize),\"mapped_bytes\":\(region.mappedByteCount),\"touched_pages\":\(touchedPages),\"discarded_pages\":\(discardedPages),\"erase_ns\":\(eraseNanoseconds),\"discard_ns\":\(discardNanoseconds),\"erase_verified\":true,\"reset_verified\":true,\"semantics\":\"\(report?.semantics.rawValue ?? "held")\",\"physical_released_bytes\":null,\"baseline\":\(fields(baseline)),\"touched\":\(fields(touched)),\"discarded\":\(fields(discarded))}"
+    )
+  }
+  try region.eraseContents()
+  try region.release()
+  let released = try ProcessMemorySnapshot.capture()
+  let cpuEnd = processCpuNanoseconds()
+  let cpu = cpuStart.flatMap { begin in cpuEnd.map { String($0 - begin) } } ?? "null"
+  print(
+    "{\"mode\":\"reclaim_summary\",\"strategy\":\"\(args[2])\",\"cycles\":\(cycles),\"wall_ns\":\(try monotonicNanoseconds() - started),\"cpu_ns\":\(cpu),\"released\":\(fields(released))}"
+  )
+}
+
 func run() throws {
   let args = CommandLine.arguments
   guard args.count >= 2 else { throw PageMemoryError.invalidSize }
+  if args[1] == "reclaim" {
+    try reclaimProbe(args)
+    return
+  }
   if args[1] == "cycle" {
     try cycleBenchmark(args)
     return

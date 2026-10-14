@@ -14,12 +14,19 @@
 public enum PageMemoryError: Error, Equatable, Sendable {
   case invalidSize, limitExceeded, unavailable, contentsDiscarded, operationMayBlock
   case systemCall(operation: Operation, code: Int32)
-  public enum Operation: String, Sendable { case pageSize, map, advise, unmap, residency }
+  case machCall(operation: Operation, code: Int32)
+  public enum Operation: String, Sendable {
+    case pageSize, map, advise, unmap, residency, purgeState, erase
+  }
 }
 public enum ReclamationSemantics: String, Sendable {
   case discardAndZeroOnDemand
   case lazyFree
+  case purgeRequested
 }
+/// Reclaimable uses an exclusively owned Mach purgeable object on Darwin;
+/// Linux uses the existing private anonymous mapping and DONTNEED.
+public enum PageBacking: Sendable { case anonymous, reclaimable }
 /// Selects native reclamation accounting without promising immediate physical release.
 public enum ReclamationStrategy: Sendable { case platformDefault, reusable }
 /// Caller-declared execution context; this does not inspect IRQ state or implement Linux GFP.
@@ -27,7 +34,8 @@ public enum AllocationContext: Sendable { case mayBlock, nonblocking }
 public struct Reclamation: Equatable, Sendable {
   public let advisedBytes: Int
   public let semantics: ReclamationSemantics
-  /// Darwin reusable-ledger accounting was applied; not a physical-release claim.
+  /// Darwin reusable advice was accepted or remains tracked after an earlier request.
+  /// Native ledger effects may be skipped; neither accounting nor physical release is measured.
   public let usesReusableAccounting: Bool
   /// Advice success does not measure physical/resident bytes actually released.
   public let physicalReleasedBytes: Int? = nil
@@ -41,14 +49,15 @@ public struct Reclamation: Equatable, Sendable {
   public let byteCount: Int
   public let mappedByteCount: Int
   public let pageSize: Int
-  private enum Contents { case active, retired, discarded }
+  private enum Contents { case active, retired, discarded, releasePending }
   private var contents: Contents
   #if canImport(Darwin)
     private var reusableAdviceMayApply = false
   #endif
   public var isReleased: Bool { unsafe pointer == nil }
 
-  private init(mapping: consuming PageMapping, pointer: UnsafeMutablePointer<UInt8>, byteCount: Int) {
+  private init(mapping: consuming PageMapping, pointer: UnsafeMutablePointer<UInt8>, byteCount: Int)
+  {
     unsafe self.pointer = unsafe pointer
     self.byteCount = byteCount
     mappedByteCount = mapping.byteCount
@@ -59,14 +68,15 @@ public struct Reclamation: Equatable, Sendable {
   /// The limit includes page rounding and applies to this region, not the entire process.
   public static func allocate(
     byteCount: Int, maximumMappedBytes: Int = 64 * 1024 * 1024,
-    context: AllocationContext = .mayBlock
+    context: AllocationContext = .mayBlock, backing: PageBacking = .anonymous
   )
     throws(PageMemoryError) -> PageRegion
   {
     let mapping = try PageMapping.allocate(
-      byteCount: byteCount, maximumMappedBytes: maximumMappedBytes, context: context)
+      byteCount: byteCount, maximumMappedBytes: maximumMappedBytes, context: context,
+      backing: backing)
     let raw = unsafe mapping.address.unsafelyUnwrapped
-    // MAP_ANONYMOUS initializes bytes to zero; only this owner binds and unmaps them.
+    // Both native anonymous allocation paths initialize bytes to zero.
     let pointer = unsafe raw.bindMemory(to: UInt8.self, capacity: mapping.byteCount)
     return unsafe PageRegion(mapping: mapping, pointer: pointer, byteCount: byteCount)
   }
@@ -119,10 +129,22 @@ public struct Reclamation: Equatable, Sendable {
   }
 
   /// Retires contents using the chosen native strategy; failure also retires access.
+  /// Reclaimable Darwin backing uses EMPTY for either strategy, without reusable accounting.
+  /// EMPTY can retain busy/wired pages; observe residency independently before claiming a drop.
   public mutating func discardContents(using strategy: ReclamationStrategy)
     throws(PageMemoryError) -> Reclamation
   {
-    guard let pointer = unsafe pointer else { throw .unavailable }
+    guard let pointer = unsafe pointer, contents != .releasePending else { throw .unavailable }
+    #if canImport(Darwin)
+      if mapping.isPurgeable {
+        contents = .retired
+        try mapping.setPurgeableState(.empty)
+        contents = .discarded
+        return Reclamation(
+          advisedBytes: mappedByteCount, semantics: .purgeRequested,
+          usesReusableAccounting: false)
+      }
+    #endif
     #if canImport(Darwin)
       let advice = strategy == .reusable ? MADV_FREE_REUSABLE : MADV_FREE
       let semantics: ReclamationSemantics = .lazyFree
@@ -166,8 +188,10 @@ public struct Reclamation: Equatable, Sendable {
 
   /// Initializes logical bytes. Darwin touches pages; Linux uses zero-on-demand when possible.
   /// If Linux advice is refused, explicit zeroing restores this exclusively owned live mapping.
+  /// This is not secure erasure: Linux can discard dirty frames before overwriting.
+  /// Erase sensitive bytes before reset. Calls without a context parameter may block.
   public mutating func resetToZero() throws(PageMemoryError) {
-    guard let pointer = unsafe pointer else { throw .unavailable }
+    guard let pointer = unsafe pointer, contents != .releasePending else { throw .unavailable }
     #if os(Linux)
       // Successful DONTNEED already guarantees zero-on-demand without a second syscall.
       if contents == .discarded {
@@ -175,14 +199,9 @@ public struct Reclamation: Equatable, Sendable {
         return
       }
     #endif
-    contents = .retired
+    try prepareForInitialization()
     #if canImport(Darwin)
-      if reusableAdviceMayApply {
-        guard unsafe madvise(pointer, mappedByteCount, MADV_FREE_REUSE) == 0 else {
-          throw .systemCall(operation: .advise, code: NativeMemorySystem.errorCode)
-        }
-        reusableAdviceMayApply = false
-      }
+      // EMPTY can skip pages; never replace this initialization with the Linux fast path.
       _ = unsafe memset(pointer, 0, byteCount)
     #else
       if unsafe madvise(pointer, mappedByteCount, MADV_DONTNEED) != 0 {
@@ -191,9 +210,41 @@ public struct Reclamation: Equatable, Sendable {
     #endif
     contents = .active
   }
+
+  /// Overwrites the entire mapped extent with a native, non-elidable erase.
+  /// This cannot erase earlier copies, registers, swap, dumps or device-owned buffers.
+  /// Failure retires access; nonblocking refusal preserves the previous state.
+  public mutating func eraseContents(context: AllocationContext = .mayBlock)
+    throws(PageMemoryError)
+  {
+    guard let pointer = unsafe pointer, contents != .releasePending else { throw .unavailable }
+    guard context == .mayBlock else { throw .operationMayBlock }
+    try prepareForInitialization()
+    #if canImport(Darwin)
+      let code = unsafe memset_s(pointer, mappedByteCount, 0, mappedByteCount)
+      guard code == 0 else { throw .systemCall(operation: .erase, code: code) }
+    #else
+      unsafe explicit_bzero(pointer, mappedByteCount)
+    #endif
+    contents = .active
+  }
+
+  private mutating func prepareForInitialization() throws(PageMemoryError) {
+    contents = .retired
+    #if canImport(Darwin)
+      if mapping.isPurgeable {
+        try mapping.setPurgeableState(.nonvolatile)
+      } else if reusableAdviceMayApply {
+        guard unsafe madvise(pointer, mappedByteCount, MADV_FREE_REUSE) == 0 else {
+          throw .systemCall(operation: .advise, code: NativeMemorySystem.errorCode)
+        }
+        reusableAdviceMayApply = false
+      }
+    #endif
+  }
   /// Page residency is separate from allocator accounting and physical footprint.
   public borrowing func residentPageCount() throws(PageMemoryError) -> Int {
-    guard let pointer = unsafe pointer else { throw .unavailable }
+    guard let pointer = unsafe pointer, contents != .releasePending else { throw .unavailable }
     #if canImport(Darwin)
       typealias ResidencyByte = Int8
     #else
@@ -217,8 +268,13 @@ public struct Reclamation: Equatable, Sendable {
       return resident
     }
   }
-  /// On failure ownership remains retryable; success is idempotent. Destruction may block.
+  /// Success is idempotent; failed unmap allows release retry only, with byte access retired.
+  /// Release and destruction do not erase. Destruction may block and cannot report failure.
   public mutating func release(context: AllocationContext = .mayBlock) throws(PageMemoryError) {
+    if isReleased { return }
+    guard context == .mayBlock else { throw .operationMayBlock }
+    // An unmap error does not authorize byte access or reinitializing uncertain backing.
+    contents = .releasePending
     try mapping.release(context: context)
     unsafe self.pointer = nil
   }

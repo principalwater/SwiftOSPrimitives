@@ -184,3 +184,7 @@ pinned Swift6.4.1 lifetime features. The typed API uses standard OutputSpan dest
 and restores reserved bytes after success or partial failure; constructors/destructors
 remain caller work. See [the contract](Documentation/BoundedMemory.md).
 This research branch does not yet combine the independently developed Windows main.
+
+Opt-in native [page reclamation and erasure](Documentation/MemorySecurityAndReclamation.md)
+adds Mach purgeable backing and measured physical-residency controls. This experimental
+building block is not a deployed VM balloon controller or a kernel/DMA allocator.

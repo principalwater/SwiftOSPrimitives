@@ -43,6 +43,9 @@ jobs:
           swift run -c release --skip-build page-memory-probe soak 300
           swift run -c release --skip-build page-memory-probe cycle reuse 1000 65536
           swift run -c release --skip-build page-memory-probe footprint reusable
+          for mode in held anonymous reusable reclaimable; do
+            swift run -c release --skip-build page-memory-probe reclaim "$mode" 8 2097152
+          done
           swift run --package-path Examples/MemoryContracts -c release --jobs 2 \
             -Xswiftc -warnings-as-errors memory-contracts
           swift test --package-path Examples/BalloonHostLab -c release --jobs 2 \
@@ -72,6 +75,14 @@ jobs:
             swift Tools/InspectFrameComparison.swift "$RUNNER_TEMP/frame-$mode.txt"
           done
           if [[ "$RUNNER_OS" == "macOS" ]]; then
+            swiftc -swift-version 6 -O -wmo -parse-as-library \
+              -strict-memory-safety -warnings-as-errors Sources/PageMemory/*.swift \
+              Examples/MachMemoryFaults/main.swift -o "$RUNNER_TEMP/mach-memory-faults" \
+              -Xlinker -alias -Xlinker _swiftos_fault_allocate -Xlinker _mach_vm_allocate \
+              -Xlinker -alias -Xlinker _swiftos_fault_state -Xlinker _mach_vm_purgable_control \
+              -Xlinker -alias -Xlinker _swiftos_fault_release -Xlinker _mach_vm_deallocate \
+              -Xlinker -alias -Xlinker _swiftos_fault_erase -Xlinker _memset_s
+            "$RUNNER_TEMP/mach-memory-faults"
             swiftc -swift-version 6 -strict-memory-safety -warnings-as-errors \
               -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
               -emit-module -module-name PageMemory Sources/PageMemory/*.swift \

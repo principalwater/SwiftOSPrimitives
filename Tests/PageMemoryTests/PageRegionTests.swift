@@ -7,6 +7,11 @@ import Testing
   import Musl
 #endif
 
+private func allZero(_ bytes: Span<UInt8>) -> Bool {
+  for index in 0..<bytes.count { if bytes[index] != 0 { return false } }
+  return true
+}
+
 @Suite struct PageRegionTests {
   @Test func roundingAndLimits() throws {
     let region = try PageRegion.allocate(byteCount: 1)
@@ -140,6 +145,59 @@ import Testing
       #expect(snapshot.physicalFootprintBytes == nil)
     #endif
   }
+  @Test func reclaimableBackingRetiresAndReusesOnlyAfterInitialization() throws {
+    var region = try PageRegion.allocate(byteCount: 262_145, backing: .reclaimable)
+    let step = region.pageSize
+    for _ in 0..<8 {
+      try region.withMutableBytes { bytes in
+        for index in stride(from: 0, to: bytes.count, by: step) { bytes[index] = 73 }
+      }
+      #expect(try region.residentPageCount() > 0)
+      let report = try region.discardContents()
+      #expect(report.advisedBytes == region.mappedByteCount)
+      #expect(report.physicalReleasedBytes == nil)
+      // EMPTY may retain busy pages; physical drops are measured in the controlled probe.
+      #expect(throws: PageMemoryError.contentsDiscarded) { _ = try region.withBytes { $0[0] } }
+      #if canImport(Darwin)
+        #expect(try region.discardContents().advisedBytes == region.mappedByteCount)
+      #else
+        #expect(try region.discardContents().advisedBytes == 0)
+      #endif
+      try region.resetToZero()
+      #expect(try region.withBytes { allZero($0) })
+    }
+    try region.release()
+    try region.release()
+    let released = region.isReleased
+    #expect(released)
+    #expect(throws: PageMemoryError.unavailable) { try region.eraseContents() }
+  }
+  @Test(arguments: [PageBacking.anonymous, .reclaimable])
+  func explicitErasureAndNonblockingRefusal(backing: PageBacking) throws {
+    var region = try PageRegion.allocate(byteCount: 262_145, backing: backing)
+    try region.withMutableBytes { bytes in
+      for index in 0..<bytes.count { bytes[index] = 91 }
+    }
+    #expect(throws: PageMemoryError.operationMayBlock) {
+      try region.eraseContents(context: .nonblocking)
+    }
+    #expect(throws: PageMemoryError.operationMayBlock) {
+      try region.release(context: .nonblocking)
+    }
+    #expect(try region.withBytes { $0[0] == 91 && $0[$0.count - 1] == 91 })
+    try region.eraseContents()
+    #expect(try region.withBytes { allZero($0) })
+    try region.withMutableBytes {
+      $0[0] = 73
+      $0[$0.count - 1] = 91
+    }
+    try region.resetToZero()
+    #expect(try region.withBytes { allZero($0) })
+    _ = try region.discardContents(using: .reusable)
+    try region.eraseContents()
+    #expect(try region.withBytes { allZero($0) })
+    try region.release()
+  }
   #if canImport(Darwin)
     @Test func discardedRegionCanUpgradeReusableAccounting() throws {
       var region = try PageRegion.allocate(byteCount: 1)
@@ -174,6 +232,8 @@ import Testing
       #expect(throws: PageMemoryError.contentsDiscarded) {
         try region.withMutableBytes { $0[0] = 1 }
       }
+      try region.eraseContents()
+      #expect(try region.withBytes { allZero($0) })
       try region.resetToZero()
       #expect(try region.withBytes { $0[0] } == 0)
       #expect(try region.withBytes { $0[$0.count - 1] } == 0)

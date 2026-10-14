@@ -178,6 +178,27 @@ private func run() throws {
     throw ContractFailure.failed
   }
   try region.release()
+  var reclaimable = try PageRegion.allocate(byteCount: 2 * 1_048_576, backing: .reclaimable)
+  try reclaimable.withMutableBytes { bytes in
+    for index in 0..<bytes.count { bytes[index] = 91 }
+  }
+  let reclaimTouched = try reclaimable.residentPageCount()
+  try reclaimable.eraseContents()
+  guard
+    try reclaimable.withBytes({ bytes in
+      for index in 0..<bytes.count { if bytes[index] != 0 { return false } }
+      return true
+    })
+  else { throw ContractFailure.failed }
+  _ = try reclaimable.discardContents()
+  let reclaimDiscarded = try reclaimable.residentPageCount()
+  guard reclaimTouched > 0, reclaimDiscarded == 0 else { throw ContractFailure.failed }
+  try reclaimable.resetToZero()
+  guard try reclaimable.withBytes({ $0[0] == 0 && $0[$0.count - 1] == 0 }) else {
+    throw ContractFailure.failed
+  }
+  try reclaimable.release()
+  print("RECLAIMABLE_PAGES \(reclaimTouched) \(reclaimDiscarded)")
   let final = try ProcessMemorySnapshot.capture()
   let cpu = try ticks(CLOCK_PROCESS_CPUTIME_ID) - cpuBefore
   let wall = try ticks(CLOCK_MONOTONIC) - started
