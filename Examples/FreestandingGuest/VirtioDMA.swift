@@ -26,6 +26,8 @@ import _Volatile
   guard var sequence = SplitRingSequence(queueSize: 8) else { finish("VIRTIO_SEQUENCE_FAIL\n") }
   #if GUEST_RING_WRAP || GUEST_WRAP_WRONG_ID || GUEST_WRAP_WRONG_LENGTH || GUEST_WRAP_STALE || GUEST_WRAP_USED_INDEX
     let submissions = 65540
+  #elseif GUEST_WRAP_INDEX_NO_COMPLETION
+    let submissions = 65540
   #else
     let submissions = 1
   #endif
@@ -42,9 +44,15 @@ import _Volatile
         unsafe mmioHalf(ring + 162).store(65535)
       }
     #endif
+    #if GUEST_WRAP_INDEX_NO_COMPLETION
+      let shouldPublish = sequence.completedCount != 65536
+      if !shouldPublish { emit("WRAP_WITHHOLD_65536\n") }
+    #else
+      let shouldPublish = publish
+    #endif
     let written = unsafe postVirtioBuffer(
       device, queue: 0, ring: ring, buffer: payload, length: 32, deviceWrites: true,
-      sequence: &sequence, publish: publish)
+      sequence: &sequence, publish: shouldPublish)
     largestWritten = max(largestWritten, written)
   }
   guard sequence.completedCount == UInt64(submissions),

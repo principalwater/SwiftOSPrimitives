@@ -105,16 +105,20 @@ import _Volatile
     }
   #endif
   while unsafe mmioHalf(ring + 162).load() == wireIndex && guest_timer_counter() < deadline {}
-  #if GUEST_WRAP_USED_INDEX
-    if deviceWrites && sequence.completedCount == 65536 {
-      emit("WRAP_INJECT_INDEX_65536\n")
-      unsafe mmioHalf(ring + 162).store(next &+ 1)
-    }
-  #endif
   let completed = unsafe mmioHalf(ring + 162).load()
   guest_device_barrier()
   guard completed != wireIndex else { finish(timeoutMarker) }
   guard completed == next else { finish("VIRTIO_USED_INDEX_FAIL\n") }
+  #if GUEST_WRAP_USED_INDEX || GUEST_WRAP_INDEX_NO_COMPLETION
+    if deviceWrites && sequence.completedCount == 65536 {
+      // Inject only after actual completion; a missing device reply must stay a timeout.
+      emit("WRAP_INJECT_INDEX_65536\n")
+      unsafe mmioHalf(ring + 162).store(next &+ 1)
+      let corruptedIndex = unsafe mmioHalf(ring + 162).load()
+      guest_device_barrier()
+      guard corruptedIndex == next else { finish("VIRTIO_USED_INDEX_FAIL\n") }
+    }
+  #endif
   #if GUEST_WRONG_ID
     if queue == 0 && !deviceWrites {
       unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))

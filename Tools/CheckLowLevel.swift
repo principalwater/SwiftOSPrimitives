@@ -765,6 +765,10 @@ func checkLowLevel() throws {
           "IRQ_PASS\nWRAP_INJECT_INDEX_65536\nVIRTIO_USED_INDEX_FAIL\n"
         ),
         (
+          "WrapWithheldCompletion", "GUEST_WRAP_INDEX_NO_COMPLETION",
+          "IRQ_PASS\nWRAP_WITHHOLD_65536\nDMA_TIMEOUT\n"
+        ),
+        (
           "DMAUnpublishedIndex", "GUEST_DMA_UNPUBLISHED_INDEX",
           "IRQ_PASS\nDMA_UNPUBLISHED_INDEX_INJECT\nVIRTIO_USED_INDEX_FAIL\n"
         ),

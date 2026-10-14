@@ -47,7 +47,10 @@ used descriptor ID, an actual used length, the completion index, or the pre-publ
 used index. Each emits its exact count 65,536 injection marker before corrupting memory,
 then its exact refusal marker, never the positive wrap marker. A separate unpublished-index
 control injects an unexpected index without publication; it must refuse as an index
-violation rather than masquerade as an expected timeout. These are real-device
+violation rather than masquerade as an expected timeout. Index corruption is injected only after
+validating the actual expected completion. A separate case withholds publication at
+count 65,536 and requires the timeout without an injection marker, so the control
+cannot manufacture a missing device completion. These are real-device
 completion-path fault controls with deliberate RAM corruption, not proof that QEMU
 spontaneously produces those failures. None reads or releases donated balloon pages
 after a terminal failure.
@@ -66,7 +69,7 @@ device under test. Balloon physical reclaim remains qualified on a 16 KiB backin
 
 Use Swift 6.4.1, LLVM22.1 and QEMU 10.2. With `KERNEL_LLVM_BIN` and `GUEST_QEMU_BIN` set
 to verified executables, run `Tools/CheckLowLevel.swift` with compiler, repository and
-an owned scratch directory. This runs 20 audited guest cases, including the new six.
+an owned scratch directory. This runs 21 audited guest cases, including the new seven.
 Set `GUEST_HOST_BIN` to an independently validated BalloonHostLab executable to retain
 its four actual host-control gates. Never run QEMU/install kernels on a live VPS merely
 because its home-gateway role is standby.

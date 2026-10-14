@@ -20,7 +20,7 @@ Embedded -no-allocations. This is not a whole-process RSS or runtime replacement
 | iOS18 deployment target using SDK27 |BoundedMemory compiled; no device claim |
 | Static Linux musl consumer |Built and ran in the strict native VPS sandbox |
 | Embedded allocation-free whole ARM64/x86 profiles |Passed |
-| Actual audited ARM64 guest |20 cases passed after Opus corrections |
+| Actual audited ARM64 guest |21 cases passed after Opus and injection precondition corrections |
 | Actual host/QMP control |Four cases passed using independently accepted host controller |
 | Pre-fix classification guard mutation |Refused1 with wrong DMA_TIMEOUT attribution |
 | Corrected unpublished-index case |Passed0 with exact VIRTIO_USED_INDEX_FAIL |
@@ -30,7 +30,9 @@ used-ring completions, crossing the65,536 wire wrap and continuing to index4. It
 its frame ticket until native reset and bounds checking. Four wrap negatives require an
 exact count 65,536 injection marker and distinct ID/length/index/stale refusal. A fifth
 unpublished-index control verifies that an unexpected completion index cannot masquerade
-as an expected timeout. Existing no-publication/missing-device/timeout/IRQ/balloon/guard/
+as an expected timeout. The final control withholds publication at count65536 and must produce a timeout
+without an injection marker: synthetic corruption cannot mask absent actual completion.
+Existing no-publication/missing-device/timeout/IRQ/balloon/guard/
 trap/memory cases remain enforced. No fresh-payload-on-every-request claim is made.
 
 The regression-before artifact is an isolated source copy restoring exactly the old index
