@@ -69,3 +69,21 @@ jobs:
               -emit-module -module-name BoundedMemory Sources/BoundedMemory/*.swift \
               -emit-module-path "$RUNNER_TEMP/BoundedMemory-ios18.swiftmodule"
           fi
+      - name: Validate optional Rust Linux references
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.96.0 --profile minimal --no-self-update
+          for mode in baseline cached; do
+            flags=()
+            if [[ "$mode" == cached ]]; then flags=(--cfg cached); fi
+            RUSTC_BOOTSTRAP=1 rustup run 1.96.0 rustc --edition 2021 \
+              -C opt-level=3 -C panic=abort -C overflow-checks=yes \
+              -Z stack-protector=strong -D warnings "${flags[@]}" \
+              Examples/FrameComparison/reference.rs -o "$RUNNER_TEMP/frame-rust-$mode"
+            nm --undefined-only "$RUNNER_TEMP/frame-rust-$mode" > "$RUNNER_TEMP/rust-imports-$mode.txt"
+            grep -q '__stack_chk_fail' "$RUNNER_TEMP/rust-imports-$mode.txt"
+            /usr/bin/time -v "$RUNNER_TEMP/frame-rust-$mode" > "$RUNNER_TEMP/frame-rust-$mode.txt"
+            swift Tools/InspectFrameComparison.swift "$RUNNER_TEMP/frame-rust-$mode.txt"
+          done
