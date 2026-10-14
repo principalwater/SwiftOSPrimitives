@@ -9,7 +9,8 @@
 #endif
 
 // Byte-free backing owner: mapping ownership must not imply a live UInt8 or Element binding.
-@safe struct PageMapping: ~Copyable {
+// Generic noncopyable owners need this storage metadata across a framework boundary.
+@usableFromInline @safe struct PageMapping: ~Copyable {
   private(set) var address: UnsafeMutableRawPointer?
   let byteCount: Int
   let pageSize: Int

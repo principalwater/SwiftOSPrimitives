@@ -42,6 +42,12 @@ process-local timestamps. Earlier final-core replicates used5.54–6.35ms CPU an
 or a fair unthrottled Mac/Rust performance comparison. The actual standby host has
 about3.72GiB RAM and two virtual CPUs; the probe's32MiB/10% cgroup models a small budget.
 
+The initial macOS CI caught a framework-boundary link failure for internal PageMapping
+metadata used by a specialized generic owner. Marking that internal storage type
+`@usableFromInline` fixes ABI visibility without adding public API. The separate-package
+default-build-system consumer is a CI regression gate. Its macOS framework-loaded RSS
+is higher than the static native consumer's RSS; build/link layout matters to this metric.
+
 No working service was stopped or restarted, no routes/PF/Xray configuration/public
 client links were changed, and no loadable kernel code or physical host device was
 used. Checks do not prove every real client experienced zero jitter during observation.
