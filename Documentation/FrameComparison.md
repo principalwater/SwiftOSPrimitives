@@ -29,6 +29,8 @@ experimental flag; actual guard heuristics and placement differ between compiler
 so identical whole-program hardening is not claimed.
 
 Three observations per executable were interleaved, with the middle order reversed.
+The Mac observations precede Linux-only declaration/personality binding fixes;
+the timed Darwin algorithm and workloads are unchanged.
 Processes ran at nice 19. The first observation included cold process-launch work;
 initialization, sorting/output and metadata checks are outside the timed batches.
 Other host activity remained enabled. All 18 runs agreed on all 15 independent

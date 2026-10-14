@@ -4,6 +4,15 @@
 
 use core::{marker::PhantomData, panic::PanicInfo};
 
+#[cfg(not(all(
+    target_pointer_width = "64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux")
+)))]
+compile_error!(
+    "This standalone native ABI fixture supports only 64-bit macOS/Linux x86-64/AArch64."
+);
+
 #[derive(Debug)]
 enum Failure {
     InvalidSize,
@@ -189,6 +198,20 @@ fn current_ticks() -> u64 {
 #[panic_handler]
 fn panic(_: &PanicInfo<'_>) -> ! {
     // SAFETY: abort is the process-terminal platform contract; no unwind or cleanup is claimed.
+    unsafe { abort() }
+}
+
+// Prebuilt Linux core retains this ABI reference even with panic=abort; never pretend to unwind.
+#[cfg(target_os = "linux")]
+#[no_mangle]
+extern "C" fn rust_eh_personality(
+    _version: i32,
+    _actions: i32,
+    _exception_class: u64,
+    _exception: *mut core::ffi::c_void,
+    _context: *mut core::ffi::c_void,
+) -> i32 {
+    // SAFETY: the native terminal call dereferences no argument and never returns to an unwinder.
     unsafe { abort() }
 }
 

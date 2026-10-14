@@ -51,6 +51,10 @@ Swift -target-cpu apple-m2 and Rust -C target-cpu=apple-m2. Use an appropriate
 common CPU on other hosts; neither flag is a universal target.
 The prepared Rust Linux ABI assumes x86-64/AArch64 two-i64 timespec and libc.
 Both algorithms have a separate Linux CI execution gate with actual guard imports.
+The distributed Linux core also retains a personality metadata reference despite
+panic=abort. The fixture defines that five-argument native boundary to abort if
+called; it provides no unwinding. The ABI is checked against
+[Rust 1.96's implementation](https://github.com/rust-lang/rust/blob/1.96.0/library/std/src/sys/personality/gcc.rs).
 
 ## Observation format (version 2)
 
