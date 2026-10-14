@@ -133,6 +133,18 @@ private func run() throws {
   }
   guard budgetChecksum == 503_316_480 else { throw ContractFailure.failed }
   print("BALLOON_BUDGET \(budgetChecksum)")
+  guard var sequence = SplitRingSequence(queueSize: 8) else { throw ContractFailure.failed }
+  var sequenceChecksum: UInt64 = 0
+  for _ in 0..<131080 {
+    sequenceChecksum += UInt64(sequence.wireIndex)
+    guard sequence.ringSlot < 8 && sequence.descriptorHead < 8, sequence.advance() else {
+      throw ContractFailure.failed
+    }
+  }
+  guard sequence.completedCount == 131080, sequence.wireIndex == 8,
+    sequenceChecksum == 4_294_901_788
+  else { throw ContractFailure.failed }
+  print("SPLIT_RING_SEQUENCE \(sequenceChecksum)")
   let initial = try ProcessMemorySnapshot.capture()
   let destroyed = try checkValues()
   var compact = try MappedValue.allocate {

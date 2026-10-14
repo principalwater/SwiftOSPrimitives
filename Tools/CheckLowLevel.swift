@@ -730,6 +730,7 @@ func checkLowLevel() throws {
           root.appendingPathComponent("Sources/BoundedMemory/TypedAllocation.swift").path,
           root.appendingPathComponent("Sources/BoundedMemory/FrameLedger.swift").path,
           root.appendingPathComponent("Sources/BoundedMemory/BalloonBudget.swift").path,
+          root.appendingPathComponent("Sources/BoundedMemory/SplitRingSequence.swift").path,
         ]
         + [
           "Guest.swift", "MemoryFill.swift", "MemoryCopy.swift", "Platform.swift", "Frames.swift",
@@ -742,6 +743,30 @@ func checkLowLevel() throws {
         (
           "Success", "GUEST_BUILD",
           "IRQ_PASS\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nGUEST_PASS\n"
+        ),
+        (
+          "RingWrap", "GUEST_RING_WRAP",
+          "IRQ_PASS\nDMA_WRAP_PASS 65540\nDMA_PASS\nBALLOON_INFLATED\nBALLOON_PASS\nGUEST_PASS\n"
+        ),
+        (
+          "WrapIdentity", "GUEST_WRAP_WRONG_ID",
+          "IRQ_PASS\nWRAP_INJECT_ID_65536\nVIRTIO_IDENTITY_FAIL\n"
+        ),
+        (
+          "WrapLength", "GUEST_WRAP_WRONG_LENGTH",
+          "IRQ_PASS\nWRAP_INJECT_LENGTH_65536\nVIRTIO_LENGTH_FAIL\n"
+        ),
+        (
+          "WrapStale", "GUEST_WRAP_STALE",
+          "IRQ_PASS\nWRAP_INJECT_STALE_65536\nVIRTIO_STALE_COMPLETION\n"
+        ),
+        (
+          "WrapUsedIndex", "GUEST_WRAP_USED_INDEX",
+          "IRQ_PASS\nWRAP_INJECT_INDEX_65536\nVIRTIO_USED_INDEX_FAIL\n"
+        ),
+        (
+          "DMAUnpublishedIndex", "GUEST_DMA_UNPUBLISHED_INDEX",
+          "IRQ_PASS\nDMA_UNPUBLISHED_INDEX_INJECT\nVIRTIO_USED_INDEX_FAIL\n"
         ),
         ("Guard", "GUEST_GUARD_FAILURE", "STACK_FAIL\n"),
         ("IRQTimeout", "GUEST_IRQ_MASK", "IRQ_TIMEOUT\n"),
@@ -856,11 +881,14 @@ func checkLowLevel() throws {
               ]),
           expectedOutput: marker,
           expectedDiagnostic: sysconf(Int32(_SC_PAGESIZE)) > 4096
-            && ["Success", "Memory", "Trap", "TrapOther", "BalloonNoDeflate", "WrongIdentity"]
-              .contains(mode)
+            && [
+              "Success", "RingWrap", "Memory", "Trap", "TrapOther", "BalloonNoDeflate",
+              "WrongIdentity",
+            ]
+            .contains(mode)
             ? "qemu-system-aarch64: warning: Balloon used with backing page size > 4kiB, this may not be reliable\n"
             : nil,
-          timeoutSeconds: 15)
+          timeoutSeconds: mode.hasPrefix("Wrap") || mode == "RingWrap" ? 75 : 15)
         if mode == "HostTimeout",
           let controller = ProcessInfo.processInfo.environment["GUEST_HOST_BIN"]
         {

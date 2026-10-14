@@ -58,23 +58,30 @@ import _Volatile
     unsafe mmioWord(device + offset + 4).store(UInt32(truncatingIfNeeded: pointer >> 32))
   }
   unsafe mmioHalf(ring + 128).store(1)
-  unsafe mmioHalf(ring + 132).store(0)
+  unsafe mmioHalf(ring + 130).store(0)
+  // Poison unused device-owned entries before QueueReady; completion must overwrite identity.
+  for slot in 0..<8 {
+    unsafe mmioWord(ring + 164 + UInt(slot * 8)).store(UInt32.max)
+    unsafe mmioWord(ring + 168 + UInt(slot * 8)).store(UInt32.max)
+  }
   guest_device_barrier()
   unsafe mmioWord(device + 0x44).store(1)
 }
 @unsafe func postVirtioBuffer(
   _ device: UInt, queue: UInt32, ring: UInt, buffer: UInt, length: UInt32,
-  deviceWrites: Bool, publish: Bool = true, sequence: UInt16 = 0,
+  deviceWrites: Bool, sequence: inout SplitRingSequence, publish: Bool = true,
   timeoutMarker: StaticString = "DMA_TIMEOUT\n"
 ) -> UInt32 {
-  guard unsafe mmioHalf(ring + 162).load() == sequence,
-    unsafe mmioHalf(ring + 130).load() == sequence
+  guard sequence.queueSize == 8, !sequence.isExhausted else { finish("VIRTIO_SEQUENCE_FAIL\n") }
+  let wireIndex = sequence.wireIndex
+  guard unsafe mmioHalf(ring + 162).load() == wireIndex,
+    unsafe mmioHalf(ring + 130).load() == wireIndex
   else { finish("VIRTIO_STALE_COMPLETION\n") }
-  let slot = UInt(sequence % 8)
+  let slot = UInt(sequence.ringSlot)
   // A changed head on each lap makes a stale entry at a reused ring slot detectable.
-  let head = (UInt(sequence) + UInt(sequence) / 8) % 8
+  let head = UInt(sequence.descriptorHead)
   let descriptor = ring + head * 16
-  let next = sequence &+ 1
+  let next = wireIndex &+ 1
   let start = guest_timer_counter()
   let frequency = guest_timer_frequency()
   guard frequency >= 1000 && frequency <= 10_000_000_000 else { finish("VIRTIO_CLOCK_FAIL\n") }
@@ -91,13 +98,37 @@ import _Volatile
     guest_device_barrier()
     unsafe mmioWord(device + 0x50).store(queue)
   }
-  while unsafe mmioHalf(ring + 162).load() == sequence && guest_timer_counter() < deadline {}
+  #if GUEST_DMA_UNPUBLISHED_INDEX
+    if !publish {
+      emit("DMA_UNPUBLISHED_INDEX_INJECT\n")
+      unsafe mmioHalf(ring + 162).store(next &+ 1)
+    }
+  #endif
+  while unsafe mmioHalf(ring + 162).load() == wireIndex && guest_timer_counter() < deadline {}
+  #if GUEST_WRAP_USED_INDEX
+    if deviceWrites && sequence.completedCount == 65536 {
+      emit("WRAP_INJECT_INDEX_65536\n")
+      unsafe mmioHalf(ring + 162).store(next &+ 1)
+    }
+  #endif
   let completed = unsafe mmioHalf(ring + 162).load()
   guest_device_barrier()
-  guard completed == next else { finish(timeoutMarker) }
+  guard completed != wireIndex else { finish(timeoutMarker) }
+  guard completed == next else { finish("VIRTIO_USED_INDEX_FAIL\n") }
   #if GUEST_WRONG_ID
     if queue == 0 && !deviceWrites {
       unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))
+    }
+  #endif
+  #if GUEST_WRAP_WRONG_ID
+    if deviceWrites && sequence.completedCount == 65536 {
+      emit("WRAP_INJECT_ID_65536\n")
+      unsafe mmioWord(ring + 164 + slot * 8).store(UInt32((head + 1) % 8))
+    }
+  #elseif GUEST_WRAP_WRONG_LENGTH
+    if deviceWrites && sequence.completedCount == 65536 {
+      emit("WRAP_INJECT_LENGTH_65536\n")
+      unsafe mmioWord(ring + 168 + slot * 8).store(length + 1)
     }
   #endif
   guard unsafe mmioWord(ring + 164 + slot * 8).load() == UInt32(head) else {
@@ -107,5 +138,6 @@ import _Volatile
   guard deviceWrites ? written > 0 && written <= length : written == 0 else {
     finish("VIRTIO_LENGTH_FAIL\n")
   }
+  guard sequence.advance() else { finish("VIRTIO_SEQUENCE_FAIL\n") }
   return written
 }

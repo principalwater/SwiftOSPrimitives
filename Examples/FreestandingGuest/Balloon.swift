@@ -59,12 +59,15 @@ import _Volatile
   #else
     let cycles = 1
   #endif
-  for cycle in 0..<cycles {
-    #if GUEST_STALE_COMPLETION
-      let sequence: UInt16 = 1
-    #else
-      let sequence = UInt16(cycle)
-    #endif
+  #if GUEST_STALE_COMPLETION
+    let initialCount: UInt64 = 1
+  #else
+    let initialCount: UInt64 = 0
+  #endif
+  guard var inflate = SplitRingSequence(queueSize: 8, completedCount: initialCount),
+    var deflate = SplitRingSequence(queueSize: 8)
+  else { finish("VIRTIO_SEQUENCE_FAIL\n") }
+  for _ in 0..<cycles {
     #if GUEST_HOST_BALLOON
       emit("HOST_READY\n")
       unsafe waitBalloonTarget(device, pages: 4)
@@ -73,7 +76,7 @@ import _Volatile
     // Do not access donated pages from publication through deflate acknowledgement.
     _ = unsafe postVirtioBuffer(
       device, queue: 0, ring: ring, buffer: ring + 256, length: 16, deviceWrites: false,
-      sequence: sequence, timeoutMarker: "BALLOON_INFLATE_TIMEOUT\n")
+      sequence: &inflate, timeoutMarker: "BALLOON_INFLATE_TIMEOUT\n")
     for index in 0..<4 {
       guard
         unsafe mmioWord(ring + 256 + UInt(index * 4)).load()
@@ -92,13 +95,13 @@ import _Volatile
     #if GUEST_BALLOON_NO_DEFLATE
       _ = unsafe postVirtioBuffer(
         device, queue: 1, ring: ring + 4096, buffer: ring + 256, length: 16,
-        deviceWrites: false, publish: false, sequence: sequence,
+        deviceWrites: false, sequence: &deflate, publish: false,
         timeoutMarker: "BALLOON_DEFLATE_TIMEOUT\n")
       finish("BALLOON_NEGATIVE_BYPASSED\n")
     #else
       _ = unsafe postVirtioBuffer(
         device, queue: 1, ring: ring + 4096, buffer: ring + 256, length: 16, deviceWrites: false,
-        sequence: sequence, timeoutMarker: "BALLOON_DEFLATE_TIMEOUT\n")
+        sequence: &deflate, timeoutMarker: "BALLOON_DEFLATE_TIMEOUT\n")
       unsafe mmioWord(device + 0x104).store(0)
       guest_device_barrier()
       // Deflated memory is uninitialized: reinitialize before any CPU read or allocator reuse.

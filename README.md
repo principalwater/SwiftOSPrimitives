@@ -9,6 +9,8 @@ are described in [Stable mappings and guest devices](Documentation/StableMapping
 The balloon experiment verifies a protocol round trip; physical host reclaim is qualified.
 Native host target planning, QMP control and repeated guest cycles are described in
 [Host balloon control](Documentation/HostBalloon.md).
+Full split-ring wire-index wrap and post-wrap fault controls are described in
+[Split-ring progress](Documentation/SplitRingProgress.md).
 
 PageMemory owns anonymous private mappings without a class, ARC ownership or COW
 storage. It lends synchronous `Span`/`MutableSpan` views, retires contents before
