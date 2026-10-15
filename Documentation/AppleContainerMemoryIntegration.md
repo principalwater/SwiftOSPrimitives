@@ -150,7 +150,7 @@ Those rights do not extend to another service's VZ-owned mappings. Assembly cann
 create that ownership. No custom hypervisor/kernel backend, stock-service rollout,
 host pressure test or production Macray adoption is included in this experiment.
 
-## Validation record and remaining qualification
+## G14 baseline validation and remaining qualification
 
 The final owner was strengthened after actual Opus5.5 and Sonnet5.5 reviews:
 explicit native floor, strong local stop observation, mandatory executed cancel
@@ -180,3 +180,21 @@ process watchdog is mandatory. All selected normal/ignored/cancel paths joined;
 all-await cancellation injection, kernel-wedge forced recovery, OOM auto-deflate,
 host-pressure lending and hostile-container isolation remain unqualified. This
 research lab is not an unattended production memory manager.
+
+## G15 native recovery and real workload extension
+
+The current [ClickHouse qualification](ClickHouseMemoryLab.md) adds the native
+retireAndStop capability,10release host tests, real paused/paused+cancel teardown
+and a pinned official ClickHouse server workload. The finite paused cases now
+verify raw stopped state, wake response readers after stop, retain every cleanup
+stage error and require successful NIO shutdown. Seven controller modes and both
+held/adaptive database modes pass. This extends the G14 evidence above; its seven
+ASan tests are historical, not a claim that the new source was ASan-tested.
+
+Physical VZ host release, a real dead-kernel panic control, every-await faults and
+persistent in-process reuse remain unqualified. The stock kernel has no SysRq;
+the attempted panic injection refused and is retained as failure. Current upstream
+VZInstance.stop checks running state before the only TimeSyncer.close, leaving a
+public cleanup gap after raw stop. A separately reviewed upstream Swift lifecycle
+patch or a supervised process-per-epoch boundary is needed before persistent use.
+No production rollout or stock global service change is implied.

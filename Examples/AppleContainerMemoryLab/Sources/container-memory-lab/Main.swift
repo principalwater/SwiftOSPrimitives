@@ -15,12 +15,16 @@ private let initDigest = "sha256:4c1836052eafcbc944c403fb23ded06562962d2402c9dcc
 private let workloadDigest =
   "sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1"
 
-private final class LabVMGuard: VZInstanceExtension {
+final class LabVMGuard: VZInstanceExtension {
   private struct State {
     weak var instance: VZVirtualMachineInstance?
     var resources: (cpus: Int, memory: UInt64, networkDevices: Int)?
   }
   private let state = Mutex(State())
+  private let expectedMemoryBytes: UInt64
+  init(expectedMemoryBytes: UInt64 = 512 * mib) {
+    self.expectedMemoryBytes = expectedMemoryBytes
+  }
   var instance: VZVirtualMachineInstance? { state.withLock { $0.instance } }
   var resources: (cpus: Int, memory: UInt64, networkDevices: Int)? {
     state.withLock { $0.resources }
@@ -29,7 +33,7 @@ private final class LabVMGuard: VZInstanceExtension {
     _ config: inout VZVirtualMachineConfiguration, allocator: any AddressAllocator<Character>,
     storageDeviceCount: Int, mountsByID: [String: [Containerization.Mount]]
   ) throws {
-    guard config.networkDevices.isEmpty, config.cpuCount == 1, config.memorySize == 512 * mib else {
+    guard config.networkDevices.isEmpty, config.cpuCount == 1, config.memorySize == expectedMemoryBytes else {
       throw LabFailure.invariant
     }
     try state.withLock { state in
@@ -45,7 +49,7 @@ private final class LabVMGuard: VZInstanceExtension {
   }
 }
 
-private struct LabManager: VirtualMachineManager {
+struct LabManager: VirtualMachineManager {
   let base: VZVirtualMachineManager
   let device: ContainerBalloonDevice?
   let share: LabVMGuard
@@ -66,8 +70,15 @@ private struct LabManager: VirtualMachineManager {
       let args = Array(CommandLine.arguments.dropFirst())
       if args.count == 2, args[0] == "prepare" {
         try await prepare(URL(filePath: args[1]))
+      } else if args.count == 2, args[0] == "prepare-clickhouse" {
+        try await ClickHouseLab.prepare(URL(filePath: args[1]))
+      } else if args.count == 7, args[0] == "clickhouse", ["held", "adaptive"].contains(args[6]) {
+        try await ClickHouseLab.run(
+          prepared: URL(filePath: args[1]), initfs: URL(filePath: args[2]),
+          kernel: URL(filePath: args[3]), probeDirectory: URL(filePath: args[4]),
+          output: URL(filePath: args[5]), adaptive: args[6] == "adaptive")
       } else if args.count == 6, args[0] == "run",
-        ["policy", "held", "absent", "ignored", "cancel"].contains(args[5])
+        ["policy", "held", "absent", "ignored", "cancel", "paused", "paused-cancel"].contains(args[5])
       {
         try await run(
           prepared: URL(filePath: args[1]), kernel: URL(filePath: args[2]),
@@ -80,7 +91,7 @@ private struct LabManager: VirtualMachineManager {
       exit(1)
     }
   }
-  private static func fresh(_ path: URL) throws {
+  static func fresh(_ path: URL) throws {
     guard path.path.hasPrefix("/"), path.standardizedFileURL == path,
       path.resolvingSymlinksInPath() == path,
       !FileManager.default.fileExists(atPath: path.path)
@@ -110,7 +121,7 @@ private struct LabManager: VirtualMachineManager {
       .write(to: root.appending(path: "PREPARED"), options: .withoutOverwriting)
     print("CONTAINER_MEMORY_PREPARED")
   }
-  private static func scanInput(_ path: URL, maximumBytes: Int, chunk: (Data) -> Void) throws {
+  static func scanInput(_ path: URL, maximumBytes: Int, chunk: (Data) -> Void) throws {
     guard path.path.hasPrefix("/"), path.standardizedFileURL == path,
       path.resolvingSymlinksInPath() == path
     else { throw LabFailure.arguments }
@@ -118,12 +129,17 @@ private struct LabManager: VirtualMachineManager {
     guard fd >= 0 else { throw LabFailure.arguments }
     let input = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
     do {
+      // Large image hashes must not populate the host's file cache.
+      guard maximumBytes <= 64 << 20 || fcntl(fd, F_NOCACHE, 1) == 0 else {
+        throw LabFailure.arguments
+      }
       var info = stat()
       guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
         info.st_size > 0, info.st_size <= maximumBytes
       else { throw LabFailure.arguments }
       var total = 0
-      while let data = try input.read(upToCount: 65536), !data.isEmpty {
+      while let data = try autoreleasepool(invoking: { try input.read(upToCount: 65536) }),
+        !data.isEmpty {
         guard data.count <= maximumBytes - total else { throw LabFailure.arguments }
         total += data.count
         chunk(data)
@@ -135,10 +151,18 @@ private struct LabManager: VirtualMachineManager {
       throw error
     }
   }
-  private static func digest(_ path: URL) throws -> String {
+  static func digest(_ path: URL, maximumBytes: Int = 64 << 20) throws -> String {
     var hash = SHA256()
-    try scanInput(path, maximumBytes: 64 << 20) { hash.update(data: $0) }
+    try scanInput(path, maximumBytes: maximumBytes) { hash.update(data: $0) }
     return hash.finalize().map { String(format: "%02x", $0) }.joined()
+  }
+  static func nativeStopped(_ instance: VZVirtualMachineInstance?) async -> Bool {
+    guard let instance else { return false }
+    return await withCheckedContinuation { reply in
+      instance.vmQueue.async {
+        reply.resume(returning: instance.vzVirtualMachine.state == .stopped)
+      }
+    }
   }
   private static func run(
     prepared: URL, kernel: URL, share directory: URL, output: URL, mode: String
@@ -212,6 +236,14 @@ private struct LabManager: VirtualMachineManager {
     var observations: [[String: UInt64]] = []
     var expectedTimeout = false
     var cancelledAfterCompletion = false
+    var injectedFailure = false
+    var forced = false
+    var forceOutcome = ""
+    var forceError = ""
+    var cleanupCompleted = false
+    var cleanupStages: [String] = []
+    var cleanupFailures: [String] = []
+    var nioShutdownSucceeded = false
     do {
       try await container.create()
       ownedInstance = share.instance
@@ -257,7 +289,7 @@ private struct LabManager: VirtualMachineManager {
       guard warm.residentPages == 22528 else { throw LabFailure.invariant }
       var shrinks = 0
       var grows = 0
-      for phase in 0..<3 {
+      phases: for phase in 0..<3 {
         let previousShrinks = shrinks
         let previousGrows = grows
         let memory = try await workload.observe(phase == 1 ? "T" : "E")
@@ -321,6 +353,18 @@ private struct LabManager: VirtualMachineManager {
             }
             idle = 0
           } else if controller.pendingRequest == nil {
+            if (mode == "paused" || mode == "paused-cancel"), shrinks > 0 {
+              try await instance.pause()
+              let paused = await withCheckedContinuation { reply in
+                instance.vmQueue.async {
+                  reply.resume(returning: instance.vzVirtualMachine.state == .paused)
+                }
+              }
+              guard paused else { throw LabFailure.invariant }
+              injectedFailure = true
+              if mode == "paused-cancel" { withUnsafeCurrentTask { $0?.cancel() } }
+              break phases
+            }
             if mode == "cancel", shrinks > 0 {
               cancelledAfterCompletion = true
               withUnsafeCurrentTask { $0?.cancel() }
@@ -352,35 +396,94 @@ private struct LabManager: VirtualMachineManager {
     device?.retire()
     let process = diagnosticProcess
     let probe = diagnostic
+    let cleanupBegan = ContinuousClock.now
+    let watchdog = Task { @MainActor in
+      do { try await Task.sleep(for: injectedFailure ? .seconds(1) : .seconds(10)) }
+      catch { return }
+      guard !cleanupCompleted, let device else { return }
+      forced = true
+      do {
+        forceOutcome = String(describing: try await device.retireAndStop())
+        // Native stopped state makes every remaining response impossible.
+        probe?.close()
+        workload.close()
+      }
+      catch { forceError = String(describing: error) }
+    }
     let stopping = Task { @MainActor in
       var first: (any Error)?
-      if let probe {
-        do {
-          try await probe.quit()
-          if let process {
-            let status = try await process.wait(timeoutInSeconds: 3)
-            guard status.exitCode == 0 else { throw LabFailure.invariant }
-            try await process.delete()
-          }
-        } catch { first = error }
+      if let probe, let process {
+        var quitClean = true
+        do { try await probe.quit() } catch {
+          first = error
+          cleanupFailures.append("diagnostic quit: \(error)")
+          quitClean = false
+        }
         probe.close()
-      }
+        if !quitClean {
+          do { try await process.kill(.kill) } catch {
+            first = first ?? error
+            cleanupFailures.append("diagnostic kill: \(error)")
+          }
+        }
+        do {
+          let status = try await process.wait(timeoutInSeconds: 3)
+          guard status.exitCode == 0 else { throw LabFailure.invariant }
+        } catch {
+          first = first ?? error
+          cleanupFailures.append("diagnostic wait: \(error)")
+        }
+        do { try await process.delete() } catch {
+          first = first ?? error
+          cleanupFailures.append("diagnostic delete: \(error)")
+        }
+        cleanupStages.append("diagnostic-ended")
+      } else { probe?.close() }
       do {
         try await workload.quit()
         let status = try await container.wait()
         guard status.exitCode == 0 else { throw LabFailure.invariant }
-      } catch { first = first ?? error }
-      workload.close()
-      do { try await container.stop() } catch { first = first ?? error }
-      if let instance = ownedInstance, instance.state == .running {
-        do { try await instance.stop() } catch { first = first ?? error }
+      } catch {
+        first = first ?? error
+        cleanupFailures.append("workload: \(error)")
       }
-      do { try await group.shutdownGracefully() } catch { first = first ?? error }
+      workload.close()
+      cleanupStages.append("workload-ended")
+      do { try await container.stop() } catch {
+        first = first ?? error
+        cleanupFailures.append("runtime: \(error)")
+      }
+      if let instance = ownedInstance, instance.state == .running {
+        do { try await instance.stop() } catch {
+          first = first ?? error
+          cleanupFailures.append("VM: \(error)")
+        }
+      }
+      cleanupStages.append("runtime-stop-ended")
+      do {
+        try await group.shutdownGracefully()
+        nioShutdownSucceeded = true
+      } catch {
+        first = first ?? error
+        cleanupFailures.append("NIO: \(error)")
+      }
+      cleanupStages.append("nio-shutdown-ended")
+      cleanupCompleted = true
       return first
     }
     cleanup = await stopping.value
+    watchdog.cancel()
+    await watchdog.value
+    let cleanupElapsed = cleanupBegan.duration(to: .now).components
+    var stopRetry = ""
+    var lateSetterRefused = false
+    if forced, let device, forceError.isEmpty {
+      stopRetry = String(describing: try await device.retireAndStop())
+      do { _ = try await device.request(512 * mib) }
+      catch ContainerBalloonDevice.Failure.retired { lateSetterRefused = true }
+    }
     let hostAfter = try ProcessMemorySnapshot.capture()
-    let stopped = ownedInstance?.state == .stopped
+    let stopped = await nativeStopped(ownedInstance)
     let finalProbeDigest = try digest(probeFile)
     let finalKernelDigest = try digest(kernel)
     guard probeDigest == finalProbeDigest, kernelDigest == finalKernelDigest,
@@ -392,6 +495,15 @@ private struct LabManager: VirtualMachineManager {
       "agentTranscript": probe?.transcript ?? [], "stopped": stopped,
       "primaryError": primary.map { String(describing: $0) } ?? "",
       "cleanupError": cleanup.map { String(describing: $0) } ?? "",
+      "injectedFailure": injectedFailure, "forced": forced,
+      "callerCancelledAtCleanup": Task.isCancelled,
+      "forceOutcome": forceOutcome, "forceError": forceError,
+      "stopRetry": stopRetry, "lateSetterRefused": lateSetterRefused,
+      "cleanupJoined": cleanupCompleted, "cleanupStages": cleanupStages,
+      "cleanupFailures": cleanupFailures, "nioShutdownSucceeded": nioShutdownSucceeded,
+      "cleanupElapsedNanoseconds": UInt64(cleanupElapsed.seconds) * 1_000_000_000
+        + UInt64(cleanupElapsed.attoseconds / 1_000_000_000),
+      "upstreamInternalTaskClosure": forced ? "UNQUALIFIED: TimeSyncer public cleanup gap" : "normal",
       "expectedTimeout": expectedTimeout, "cancelledAfterCompletion": cancelledAfterCompletion,
       "networkDevices": share.resources?.networkDevices ?? -1,
       "vmCPUs": share.resources?.cpus ?? -1, "vmInstalledBytes": 512 * mib,
@@ -410,7 +522,15 @@ private struct LabManager: VirtualMachineManager {
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: output.appending(path: "result.json"), options: .withoutOverwriting)
-    guard primary == nil, cleanup == nil, stopped else { throw LabFailure.invariant }
+    guard primary == nil, stopped, cleanupCompleted, nioShutdownSucceeded, forceError.isEmpty else {
+      throw LabFailure.invariant
+    }
+    if mode == "paused" || mode == "paused-cancel" {
+      guard injectedFailure, forced, forceOutcome == "stopped", stopRetry == "alreadyStopped",
+        lateSetterRefused else { throw LabFailure.invariant }
+    } else {
+      guard !forced, cleanup == nil else { throw LabFailure.invariant }
+    }
     print("CONTAINER_MEMORY_LAB_PASS \(mode)")
   }
 }

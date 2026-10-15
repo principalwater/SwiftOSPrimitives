@@ -139,5 +139,8 @@ struct ProbeObservation {
       words[4] == "1", words[5] == "0", words[6] == "0"
     else { throw LabFailure.invariant }
   }
-  func close() { input.finish() }
+  func close() {
+    input.finish()
+    output.close()
+  }
 }

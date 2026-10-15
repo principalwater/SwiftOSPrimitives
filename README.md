@@ -212,3 +212,9 @@ for faults, measurements and the remaining physical VM integration boundary.
 
 Native host reclamation and assembly boundaries are documented in
 [NativeHostReclamation](Documentation/NativeHostReclamation.md).
+
+A [real ClickHouse memory workload](Documentation/ClickHouseMemoryLab.md) now
+qualifies the optional Apple Container adapter with800k synthetic rows, native
+cgroup/CPU/Mach observations and actual shrink/grow/reclaim completion. It also
+covers finite paused-VM recovery. Physical VZ host RAM release and persistent
+in-process forced recovery remain explicitly unqualified.

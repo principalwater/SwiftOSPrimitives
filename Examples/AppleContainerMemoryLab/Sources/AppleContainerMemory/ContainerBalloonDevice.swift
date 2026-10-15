@@ -7,13 +7,14 @@ import Synchronization
 /// One VM's native request channel. Guest completion and held budget belong to its serial owner.
 public final class ContainerBalloonDevice: VZInstanceExtension {
   public enum Failure: Error, Equatable {
-    case duplicateConfiguration, unexpectedDevice, invalidTarget, unbound, retired, state
+    case duplicateConfiguration, unexpectedDevice, invalidTarget, unbound, retired, state, stopInProgress
   }
   private struct State {
     weak var instance: VZVirtualMachineInstance?
     var ceiling: UInt64 = 0
     var bound = false
     var retired = false
+    var stopInFlight = false
   }
   private let state = Mutex(State())
   private let minimumResidentBytes: UInt64
@@ -51,6 +52,46 @@ public final class ContainerBalloonDevice: VZInstanceExtension {
   /// Close admission before the owner joins IO/stops/pauses its VM. This never stops transport.
   public func retire() { state.withLock { $0.retired = true } }
   public func willStop(_ instance: VZVirtualMachineInstance) async throws { retire() }
+
+  public enum StopOutcome: Sendable, Equatable { case stopped, alreadyStopped }
+
+  /// Destructively stop this exact VM after closing balloon admission, including when paused.
+  /// This bypasses guest RPCs and upstream lifecycle cleanup. The owner must still join IO/runtime
+  /// work. Once issued, caller cancellation does not abandon the native callback; an external
+  /// process deadline remains necessary if the framework itself cannot complete.
+  public func retireAndStop() async throws -> StopOutcome {
+    let instance = try state.withLock { state in
+      state.retired = true
+      guard !state.stopInFlight else { throw Failure.stopInProgress }
+      guard let instance = state.instance else { throw Failure.unbound }
+      state.stopInFlight = true
+      return instance
+    }
+    defer { state.withLock { $0.stopInFlight = false } }
+    return try await withCheckedThrowingContinuation {
+      (reply: CheckedContinuation<StopOutcome, any Error>) in
+      instance.vmQueue.async {
+        let vm = instance.vzVirtualMachine
+        if vm.state == .stopped {
+          reply.resume(returning: .alreadyStopped)
+          return
+        }
+        guard vm.canStop else {
+          reply.resume(throwing: Failure.state)
+          return
+        }
+        vm.stop { error in
+          if let error {
+            reply.resume(throwing: error)
+          } else if vm.state == .stopped {
+            reply.resume(returning: .stopped)
+          } else {
+            reply.resume(throwing: Failure.state)
+          }
+        }
+      }
+    }
+  }
 
   /// Setter delivery/readback only. The owner still needs a fresh guest observation to complete it.
   public func request(_ bytes: UInt64) async throws -> UInt64 {

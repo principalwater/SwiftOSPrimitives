@@ -53,6 +53,23 @@ import Testing
     }
   }
 
+  @Test func unboundEmergencyStopStillClosesSetterAdmission() async throws {
+    let device = ContainerBalloonDevice(minimumResidentBytes: 256 << 20)
+    await #expect(throws: ContainerBalloonDevice.Failure.unbound) {
+      try await device.retireAndStop()
+    }
+    await #expect(throws: ContainerBalloonDevice.Failure.retired) {
+      try await device.request(256 << 20)
+    }
+    var config = VZVirtualMachineConfiguration()
+    config.memorySize = 512 << 20
+    #expect(throws: ContainerBalloonDevice.Failure.duplicateConfiguration) {
+      try device.configureVZ(
+        &config, allocator: Character.blockDeviceTagAllocator(), storageDeviceCount: 0,
+        mountsByID: [:])
+    }
+  }
+
   @Test func framingHandlesFragmentationCloseAndRefusesOversize() throws {
     let output = ProbeOutput()
     try output.write(Data("PROBE_".utf8))
@@ -81,6 +98,25 @@ import Testing
     input.finish()
     #expect(await iterator.next() == nil)
     #expect(throws: LabFailure.disconnected) { try input.send(Data("S 3\n".utf8)) }
+  }
+
+  @Test func outputOverflowIsStickyAndPreservesAcceptedPrefix() throws {
+    let output = BoundedOutput()
+    try output.write(Data(repeating: 65, count: 1 << 20))
+    #expect(!output.overflowed)
+    #expect(throws: BoundedOutput.Failure.limit) { try output.write(Data([66])) }
+    output.close()
+    #expect(output.overflowed)
+    #expect(output.text.utf8.count == 1 << 20)
+    #expect(output.text.utf8.allSatisfy { $0 == 65 })
+  }
+
+  @MainActor @Test func closingEndpointInterruptsResponseWait() async {
+    let endpoint = ProbeChannel(input: CommandInput(), output: ProbeOutput(), began: .now)
+    endpoint.close()
+    await #expect(throws: LabFailure.disconnected) {
+      try await endpoint.ready(expectedDriver: "none")
+    }
   }
 
   @MainActor @Test func protocolRejectsWrongSequenceAndDriverSuffix() async throws {
