@@ -246,18 +246,24 @@ public struct Reclamation: Equatable, Sendable {
   public borrowing func residentPageCount() throws(PageMemoryError) -> Int {
     guard let pointer = unsafe pointer, contents != .releasePending else { throw .unavailable }
     #if canImport(Darwin)
+      try requireNativeObservationMode()
       typealias ResidencyByte = Int8
     #else
       typealias ResidencyByte = UInt8
     #endif
     // Bounded temporary storage avoids an Array owner and supports the iOS 18 target.
-    return try withUnsafeTemporaryAllocation(of: ResidencyByte.self, capacity: 1024) {
+    let result = try withUnsafeTemporaryAllocation(of: ResidencyByte.self, capacity: 1024) {
       storage throws(PageMemoryError) -> Int in
       guard let vector = storage.baseAddress else { throw .unavailable }
       var offset = 0
       var resident = 0
       while offset < mappedByteCount {
-        let length = min(mappedByteCount - offset, 1024 * pageSize)
+        #if canImport(Darwin)
+          // shortcut: XNU query geometry is at least4KiB; revisit if new kernel modes are added.
+          let length = min(mappedByteCount - offset, 1024 * min(pageSize, 4096))
+        #else
+          let length = min(mappedByteCount - offset, 1024 * pageSize)
+        #endif
         guard unsafe mincore(pointer.advanced(by: offset), length, vector) == 0 else {
           throw .systemCall(operation: .residency, code: NativeMemorySystem.errorCode)
         }
@@ -267,7 +273,77 @@ public struct Reclamation: Equatable, Sendable {
       }
       return resident
     }
+    #if canImport(Darwin)
+      try requireNativeObservationMode()
+    #endif
+    return result
   }
+  #if os(macOS)
+    /// Counts native page-disposition flags without accessing the region's bytes.
+    /// O(mapped pages), bounded 1KiB scratch; kernel queries may allocate/block.
+    /// Flags can overlap and the multi-query observation is not atomic. PRESENT is
+    /// XNU's reported state, not a physical address or a global released-byte count.
+    public borrowing func darwinPageDispositionCounts(context: AllocationContext = .mayBlock)
+      throws(PageMemoryError) -> DarwinPageDispositionCounts
+    {
+      guard let pointer = unsafe pointer, contents != .releasePending else { throw .unavailable }
+      guard context == .mayBlock else { throw .operationMayBlock }
+      try requireNativeObservationMode()
+      let result = try withUnsafeTemporaryAllocation(of: integer_t.self, capacity: 256) {
+        storage throws(PageMemoryError) -> DarwinPageDispositionCounts in
+        guard let buffer = storage.baseAddress else { throw .unavailable }
+        var offset = 0
+        var present = 0
+        var pagedOut = 0
+        var reusable = 0
+        while offset < mappedByteCount {
+          let length = min(mappedByteCount - offset, 255 * pageSize)
+          let pages = length / pageSize
+          var count = mach_vm_size_t(pages + 1)
+          let code = unsafe mach_vm_page_range_query(
+            mach_task_self_, mach_vm_address_t(UInt(bitPattern: pointer.advanced(by: offset))),
+            mach_vm_size_t(length), mach_vm_address_t(UInt(bitPattern: buffer)), &count)
+          guard code == KERN_SUCCESS else { throw .machCall(operation: .residency, code: code) }
+          // Never inspect uninitialized entries or accept partial observations.
+          guard count == pages else { throw .unavailable }
+          for index in 0..<pages {
+            let flags = unsafe buffer[index]
+            if flags & VM_PAGE_QUERY_PAGE_PRESENT != 0 { present += 1 }
+            if flags & VM_PAGE_QUERY_PAGE_PAGED_OUT != 0 { pagedOut += 1 }
+            if flags & VM_PAGE_QUERY_PAGE_REUSABLE != 0 { reusable += 1 }
+          }
+          offset += length
+        }
+        return DarwinPageDispositionCounts(
+          pageCount: mappedByteCount / pageSize, presentPages: present,
+          pagedOutPages: pagedOut, reusablePages: reusable)
+      }
+      try requireNativeObservationMode()
+      return result
+    }
+
+  #endif
+  #if canImport(Darwin)
+    private static func selfRegionSetting(_ name: StaticString) throws(PageMemoryError) -> Int32 {
+      var value: Int32 = 0
+      var size = MemoryLayout<Int32>.size
+      guard name.hasPointerRepresentation else { throw .unavailable }
+      let key = unsafe UnsafeRawPointer(name.utf8Start).assumingMemoryBound(to: CChar.self)
+      guard unsafe sysctlbyname(key, &value, &size, nil, 0) == 0 else {
+        throw .systemCall(operation: .residency, code: NativeMemorySystem.errorCode)
+      }
+      guard size == MemoryLayout<Int32>.size else { throw .unavailable }
+      return value
+    }
+
+    private borrowing func requireNativeObservationMode() throws(PageMemoryError) {
+      // XNU reports 1 when the thread uses automatic page geometry (shift zero).
+      let observedSize = try Self.selfRegionSetting("vm.self_region_page_size")
+      guard observedSize == 1 || observedSize == pageSize,
+        try Self.selfRegionSetting("vm.self_region_footprint") == 0
+      else { throw .unavailable }
+    }
+  #endif
   /// Success is idempotent; failed unmap allows release retry only, with byte access retired.
   /// Release and destruction do not erase. Destruction may block and cannot report failure.
   public mutating func release(context: AllocationContext = .mayBlock) throws(PageMemoryError) {

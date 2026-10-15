@@ -199,6 +199,53 @@ private func allZero(_ bytes: Span<UInt8>) -> Bool {
     try region.release()
   }
   #if canImport(Darwin)
+    #if os(macOS)
+      @Test(arguments: [1, 254, 255, 256, 511])
+      func darwinDispositionIncludesEveryRoundedBatch(pages: Int) throws {
+        let sizing = try PageRegion.allocate(byteCount: 1)
+        let step = sizing.pageSize
+        var region = try PageRegion.allocate(
+          byteCount: (pages - 1) * step + 1, backing: .reclaimable)
+        #expect(try region.residentPageCount() == 0)
+        let cold = try region.darwinPageDispositionCounts()
+        #expect(cold.pageCount == pages && cold.presentPages == 0 && cold.pagedOutPages == 0)
+        #expect(try region.residentPageCount() == 0)
+        try region.withMutableBytes { bytes in
+          for index in stride(from: 0, to: bytes.count, by: step) { bytes[index] = 73 }
+        }
+        #expect(throws: PageMemoryError.operationMayBlock) {
+          _ = try region.darwinPageDispositionCounts(context: .nonblocking)
+        }
+        let touched = try region.darwinPageDispositionCounts()
+        #expect(touched.pageCount == pages)
+        #expect(touched.presentPages + touched.pagedOutPages == pages)
+        #expect(touched.pagedOutPages <= pages && touched.reusablePages <= pages)
+        #expect(try region.withBytes { $0[0] == 73 && $0[$0.count - 1] == 73 })
+        _ = try region.discardContents()
+        let discarded = try region.darwinPageDispositionCounts()
+        #expect(discarded.pageCount == pages)
+        #expect(throws: PageMemoryError.contentsDiscarded) { _ = try region.withBytes { $0[0] } }
+        try region.resetToZero()
+        #expect(try region.withBytes { allZero($0) })
+        try region.release()
+        #expect(throws: PageMemoryError.unavailable) {
+          _ = try region.darwinPageDispositionCounts()
+        }
+      }
+      @Test func darwinDispositionTracksReusableLifecycle() throws {
+        var region = try PageRegion.allocate(byteCount: 1_048_576)
+        let step = region.pageSize
+        try region.withMutableBytes { bytes in
+          for index in stride(from: 0, to: bytes.count, by: step) { bytes[index] = 73 }
+        }
+        _ = try region.discardContents(using: .reusable)
+        let advised = try region.darwinPageDispositionCounts()
+        #expect(advised.reusablePages == advised.presentPages)
+        try region.resetToZero()
+        #expect(try region.darwinPageDispositionCounts().reusablePages == 0)
+        try region.release()
+      }
+    #endif
     @Test func discardedRegionCanUpgradeReusableAccounting() throws {
       var region = try PageRegion.allocate(byteCount: 1)
       _ = try region.discardContents()

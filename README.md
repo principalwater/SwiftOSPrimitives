@@ -196,3 +196,6 @@ extent before every inflate publication, waits for real deflate completion and
 initializes the returned bytes before reading. Its isolated full-wrap gate exercises
 65540 completions on each queue. See [donor lifecycle](Documentation/BalloonDonorLifecycle.md)
 for faults, measurements and the remaining physical VM integration boundary.
+
+Native host reclamation and assembly boundaries are documented in
+[NativeHostReclamation](Documentation/NativeHostReclamation.md).

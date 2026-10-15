@@ -187,6 +187,12 @@ func reclaimProbe(_ args: [String]) throws {
 func run() throws {
   let args = CommandLine.arguments
   guard args.count >= 2 else { throw PageMemoryError.invalidSize }
+  #if os(macOS)
+    if args[1] == "native-reclaim" {
+      try nativeReclaimProbe(args)
+      return
+    }
+  #endif
   if args[1] == "reclaim" {
     try reclaimProbe(args)
     return

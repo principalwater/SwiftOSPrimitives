@@ -88,7 +88,8 @@ import _Volatile
   let start = guest_timer_counter()
   let frequency = guest_timer_frequency()
   guard frequency >= 1000 && frequency <= 10_000_000_000 else { finish("VIRTIO_CLOCK_FAIL\n") }
-  let (deadline, overflow) = start.addingReportingOverflow(frequency / 10)
+  // QEMU may schedule completions late; the prototype keeps a1s ack cap plus60/120s wrap caps.
+  let (deadline, overflow) = start.addingReportingOverflow(frequency)
   guard !overflow else { finish("VIRTIO_CLOCK_FAIL\n") }
   unsafe VolatileMappedRegister<UInt64>(unsafeBitPattern: descriptor).store(UInt64(buffer))
   unsafe mmioWord(descriptor + 8).store(length)

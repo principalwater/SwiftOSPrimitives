@@ -81,8 +81,21 @@ jobs:
               -Xlinker -alias -Xlinker _swiftos_fault_allocate -Xlinker _mach_vm_allocate \
               -Xlinker -alias -Xlinker _swiftos_fault_state -Xlinker _mach_vm_purgable_control \
               -Xlinker -alias -Xlinker _swiftos_fault_release -Xlinker _mach_vm_deallocate \
-              -Xlinker -alias -Xlinker _swiftos_fault_erase -Xlinker _memset_s
+              -Xlinker -alias -Xlinker _swiftos_fault_erase -Xlinker _memset_s \
+              -Xlinker -alias -Xlinker _swiftos_fault_query -Xlinker _mach_vm_page_range_query
+            nm -gU "$modules/page-memory-probe" > "$RUNNER_TEMP/product-symbols.txt"
+            if grep -E ' (_swiftos_fault_|_mach_vm_(allocate|deallocate|purgable_control|page_range_query)$|_memset_s$)' "$RUNNER_TEMP/product-symbols.txt"; then
+              echo "Fault fixture definitions leaked into a package product" >&2
+              exit 1
+            fi
             "$RUNNER_TEMP/mach-memory-faults"
+            for mode in held erased anonymous reusable reclaimable; do
+              swift run -c release --skip-build page-memory-probe native-reclaim "$mode" 4 2097152
+            done
+            swiftc -swift-version 6 -O -wmo -parse-as-library \
+              -strict-memory-safety -warnings-as-errors Sources/PageMemory/*.swift \
+              Examples/NativeMemoryAlternatives/main.swift -o "$RUNNER_TEMP/native-alternatives"
+            "$RUNNER_TEMP/native-alternatives"
             swiftc -swift-version 6 -strict-memory-safety -warnings-as-errors \
               -target arm64-apple-ios18.0 -sdk "$(xcrun --sdk iphoneos --show-sdk-path)" \
               -emit-module -module-name PageMemory Sources/PageMemory/*.swift \
