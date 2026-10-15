@@ -11,6 +11,9 @@ Native host target planning, QMP control and repeated guest cycles are described
 [Host balloon control](Documentation/HostBalloon.md).
 [Native VZ balloon lab](Documentation/NativeVirtualizationBalloon.md) boots an isolated Linux VM
 with Swift host/guest control, actual PCI balloon counts and cancellation-safe teardown.
+[Owned HVF RAM lab](Examples/HypervisorMemoryLab/README.md) distinguishes guest unmapping
+from actual owned backing deallocation using a real Embedded Swift EL1 guest.
+It does not change Apple Container or claim VZ backing-release authority.
 Full split-ring wire-index wrap and post-wrap fault controls are described in
 [Split-ring progress](Documentation/SplitRingProgress.md).
 

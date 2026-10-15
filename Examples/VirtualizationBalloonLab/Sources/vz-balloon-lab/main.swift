@@ -55,7 +55,10 @@ private struct Observation {
   private static func run() async throws {
     let args = CommandLine.arguments
     guard args.count == 5,
-      ["cycles", "absent", "ignored", "cancel-inflated", "policy"].contains(args[4]),
+      [
+        "cycles", "absent", "ignored", "cancel-inflated", "policy", "host-pages", "host-held",
+        "host-ignored", "host-late",
+      ].contains(args[4]),
       VZVirtualMachine.isSupported
     else { throw Failure.arguments }
     let kernel = URL(filePath: args[1])
@@ -99,7 +102,8 @@ private struct Observation {
     boot.initialRamdiskURL = initramfs
     boot.commandLine =
       "console=hvc0 rdinit=/init panic=0 quiet"
-      + (mode == "ignored" ? " initcall_blacklist=virtio_balloon_driver_init" : "")
+      + (["ignored", "host-ignored"].contains(mode)
+        ? " initcall_blacklist=virtio_balloon_driver_init" : "")
     config.bootLoader = boot
     config.cpuCount = 1
     config.memorySize = installed
@@ -114,6 +118,8 @@ private struct Observation {
     guard config.networkDevices.isEmpty, config.storageDevices.isEmpty,
       config.directorySharingDevices.isEmpty, config.socketDevices.isEmpty
     else { throw Failure.arguments }
+    let backingObserver = mode.hasPrefix("host-") ? GuestBackingObserver() : nil
+    try backingObserver?.configure(config)
     try config.validate()
     let vm = VZVirtualMachine(configuration: config)
     var buffer = Data()
@@ -123,6 +129,7 @@ private struct Observation {
     var baseline: UInt64 = 0
     var pageSize: UInt64 = 0
     var guestDriverState = ""
+    var guestPhysicalBase: UInt64?
     let began = ContinuousClock.now
     let deadline = began.advanced(by: .seconds(120))
     func line(boot: Bool = false) async throws -> String {
@@ -182,6 +189,13 @@ private struct Observation {
         let rss = UInt64(words[5]), rss <= installed,
         let requested = UInt32(words[6]), let actual = UInt32(words[7])
       else { throw Failure.framing }
+      let backing = try backingObserver.flatMap { observer -> [String: UInt64]? in
+        if mode == "host-late", !label.hasPrefix("settled-") { return nil }
+        guard vm.state == .running, let base = guestPhysicalBase else { throw Failure.state }
+        let snapshot = try observer.snapshot(at: base, bytes: Int(installed))
+        guard vm.state == .running else { throw Failure.state }
+        return snapshot
+      }
       let host = try ProcessMemorySnapshot.capture()
       let elapsed = began.duration(to: .now).components
       let nanos =
@@ -192,6 +206,7 @@ private struct Observation {
         "guestAvailableBytes": available, "guestRegionResidentPages": pages,
         "guestRSSBytes": rss, "balloonRequestedPages": requested, "balloonActualPages": actual,
         "hostControllerRSSBytes": host.residentBytes,
+        "mappedGuestBacking": backing.map { $0 as Any } ?? NSNull(),
         "hostControllerFootprintBytes": host.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
       ])
       return Observation(
@@ -222,9 +237,24 @@ private struct Observation {
       pageSize = size
       baseline = total
       guestDriverState = String(ready[4])
+      if backingObserver != nil {
+        sequence += 1
+        let request = Data("M \(sequence)\n".utf8)
+        let written = request.withUnsafeBytes {
+          write(input.fileHandleForWriting.fileDescriptor, $0.baseAddress, $0.count)
+        }
+        guard written == request.count else { throw Failure.disconnected }
+        let layout = try await line().split(separator: " ")
+        guard layout.count == 5, layout[0] == "PROBE_RAM", UInt64(layout[1]) == sequence,
+          layout[2] == "1", let start = UInt64(layout[3]), let end = UInt64(layout[4]),
+          end >= start, end < UInt64.max, end - start + 1 == installed
+        else { throw Failure.framing }
+        guestPhysicalBase = start
+      }
       switch mode {
       case "absent": guard guestDriverState == "none" else { throw Failure.mismatch }
-      case "ignored": guard guestDriverState == "unbound" else { throw Failure.mismatch }
+      case "ignored", "host-ignored":
+        guard guestDriverState == "unbound" else { throw Failure.mismatch }
       default:
         guard guestDriverState.hasPrefix("bound:"), guestDriverState.count >= 70,
           guestDriverState.count <= 262,
@@ -322,7 +352,9 @@ private struct Observation {
           _ = try await observe("E", label: "policy-final-erase")
           cycles = 1
         } else {
-          for cycle in 0..<(mode == "cycles" ? 4 : 1) {
+          for cycle
+            in 0..<(["cycles", "host-pages", "host-held", "host-late"].contains(mode) ? 4 : 1)
+          {
             let touched = try await observe("T", label: "touched-\(cycle)")
             guard touched.total == baseline, touched.regionPages == 64 * 1024 * 1024 / pageSize
             else { throw Failure.mismatch }
@@ -330,12 +362,19 @@ private struct Observation {
             guard erased.regionPages == 0, erased.available >= reduction + 32 * 1024 * 1024 else {
               throw Failure.mismatch
             }
+            if mode == "host-held" {
+              try await Task.sleep(for: .seconds(1))
+              let held = try await observe("S", label: "held-\(cycle)")
+              guard held.actual == 0, held.requested == 0 else { throw Failure.mismatch }
+              cycles += 1
+              continue
+            }
             guard vm.state == .running else { throw Failure.state }
             balloon.targetVirtualMachineMemorySize = installed - reduction
             guard balloon.targetVirtualMachineMemorySize == installed - reduction else {
               throw Failure.mismatch
             }
-            if mode == "ignored" {
+            if ["ignored", "host-ignored"].contains(mode) {
               do {
                 try await waitBalloon(UInt32(reduction / 4096), label: "ignored", seconds: 2)
                 throw Failure.mismatch
@@ -347,6 +386,12 @@ private struct Observation {
               break
             }
             try await waitBalloon(UInt32(reduction / 4096), label: "inflated-\(cycle)", seconds: 8)
+            if backingObserver != nil {
+              // Native driver completion precedes a separate bounded backing-settlement window.
+              try await Task.sleep(for: .seconds(1))
+              try await waitBalloon(
+                UInt32(reduction / 4096), label: "settled-\(cycle)", seconds: 2)
+            }
             if mode == "cancel-inflated" {
               withUnsafeCurrentTask { $0?.cancel() }
               break
@@ -359,7 +404,7 @@ private struct Observation {
             try await waitBalloon(0, label: "deflated-\(cycle)", seconds: 8)
             cycles += 1
           }
-          if mode == "cycles" {
+          if ["cycles", "host-pages", "host-held", "host-late"].contains(mode) {
             let reused = try await observe("T", label: "final-reuse")
             guard reused.regionPages == 64 * 1024 * 1024 / pageSize else { throw Failure.mismatch }
             _ = try await observe("E", label: "final-erase")
@@ -373,6 +418,7 @@ private struct Observation {
       guard vm.state == .stopped else { throw Failure.state }
     }
     do { try await stop.value } catch { cleanup = error }
+    backingObserver?.retire()
     let result: [String: Any] = [
       "kernelSHA256": inputHashes[0], "initramfsSHA256": inputHashes[1],
       "commandLine": boot.commandLine, "guestBalloonDriverState": guestDriverState,
@@ -382,6 +428,7 @@ private struct Observation {
         "fixed owned VM ceiling; no host pressure induced or fleet reservation",
 
       "installedBytes": installed, "reductionRequestedBytes": reduction,
+      "guestPhysicalBase": guestPhysicalBase.map { $0 as Any } ?? NSNull(),
       "guestBaselineTotalBytes": baseline, "guestPageSize": pageSize,
       "stopped": vm.state == .stopped, "callerCancelled": Task.isCancelled,
       "networkDevices": config.networkDevices.count,

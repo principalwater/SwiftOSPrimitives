@@ -198,6 +198,25 @@ private func command() throws -> String {
           "PROBE_INFO \(sequence) \(maximum) \(capabilities) \(noNewPrivileges) \(executable >= 0 || !readOnly ? 1 : 0) \(mem >= 0 ? 1 : 0)\n"
         )
         continue
+      case "M":
+        guard mode == .boot else { throw Failure.framing }
+        var ranges: [(UInt64, UInt64)] = []
+        for line in try readFile("/proc/iomem").split(separator: "\n") {
+          guard line.hasSuffix("System RAM") else { continue }
+          let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+          guard fields.count == 4, fields[1] == ":", fields[2] == "System", fields[3] == "RAM"
+          else { throw Failure.framing }
+          let limits = fields[0].split(separator: "-")
+          guard limits.count == 2, let start = UInt64(limits[0], radix: 16),
+            let end = UInt64(limits[1], radix: 16), end > start, end < UInt64.max,
+            ranges.count < 8
+          else { throw Failure.framing }
+          ranges.append((start, end))
+        }
+        guard !ranges.isEmpty else { throw Failure.framing }
+        let encoded = ranges.map { "\($0.0) \($0.1)" }.joined(separator: " ")
+        try send("PROBE_RAM \(sequence) \(ranges.count) \(encoded)\n")
+        continue
       case "S": break
       case "T":
         guard mode != .agent else { throw Failure.framing }

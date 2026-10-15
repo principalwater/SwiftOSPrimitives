@@ -142,3 +142,32 @@ Sources: [Apple balloon API](https://developer.apple.com/documentation/virtualiz
 [Linux6.18.35 balloon driver](https://github.com/gregkh/linux/blob/v6.18.35/drivers/virtio/virtio_balloon.c),
 [Kata release](https://github.com/kata-containers/kata-containers/releases/tag/3.32.0),
 [Apple container overview](https://github.com/apple/container/blob/main/docs/technical-overview.md).
+
+## SDK27 guest-memory view and owned HVF backing research
+
+Optional `host-pages`, `host-held`, `host-ignored` and `host-late` modes add a public
+custom Virtio diagnostic device. The fresh Swift PID1 probe reports actual System
+RAM ranges from bounded `/proc/iomem`; the host requires one exact configured
+range. It does not assume QEMU's GPA base. On the tested VZ machine it was
+0x70000000 for256MiB. The custom transport can still be probed/reset by Linux;
+unbound function-driver status does not establish a completely untouched VM.
+
+`GuestBackingObserver` takes an ephemeral `guestMemoryMapping`, retains its
+lifetime explicitly, queries native16KiB Mach dispositions without reading bytes,
+and drops the mapping within an autorelease pool before returning. The main VM
+and custom-device queues are both main. VM state brackets each synchronous query.
+The package requires macOS27; no older-system fallback is advertised.
+
+The early arm observes before/during inflation; `host-late` first creates a view
+only after128MiB balloon acknowledgement and a separate1s settlement window.
+Both real four-cycle arms still observed PRESENT|REUSABLE pages, not an observed
+PRESENT reduction. Held/no-ack controls remain distinct. These are sequential,
+unpaused mapped-view diagnostics: identity/shadow/coverage and absence of device
+or mapping interference are unqualified. Aggregate flags never become a physical
+release claim, and neither result transfers to Apple Container. No purge, advice,
+unmap or deallocate is performed on Apple's memory.
+
+The separate [owned HVF lab](../Examples/HypervisorMemoryLab/README.md) controls
+allocation lifetime itself and demonstrates why guest unmap/RSS reduction and
+backing deallocation are separate operations. A production backend decision is
+still pending; no Containerization or VZ guest RAM ownership has been changed.
