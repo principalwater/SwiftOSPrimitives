@@ -106,6 +106,11 @@ guarantee recovery from OOM killing or implement VM ballooning.
 
 ## Apple Container balloon policy
 
+The optional [Apple Container1.5.0 memory lab](Documentation/AppleContainerMemoryIntegration.md)
+now integrates the controller with its pinned Containerization0.47.0 core runtime,
+real OCI workload/cgroup and native VZ extension. The trusted diagnostic remains
+experimental; physical VZ host RAM return is unknown.
+
 The allocation-bounded `BalloonController` plans guest allowance using a reserve,
 hysteresis, fixed per-VM grant and delivery/completion fencing. The optional native
 VZ lab exercises free/load/free policy decisions on an owned disposable VM.

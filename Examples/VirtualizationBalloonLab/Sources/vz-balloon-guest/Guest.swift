@@ -109,29 +109,52 @@ private func command() throws -> String {
 }
 
 @main private struct Guest {
+  private enum Mode { case boot, agent, workload }
+
   static func main() {
-    do { try run() } catch {
+    do {
+      let arguments = Array(CommandLine.arguments.dropFirst())
+      let mode: Mode
+      switch arguments {
+      case []: mode = .boot
+      case ["--agent"]: mode = .agent
+      case ["--workload"]: mode = .workload
+      default: throw Failure.framing
+      }
+      try run(mode: mode)
+    } catch {
       try? send("PROBE_FAIL \(error)\n")
-      while true { _ = pause() }
+      if CommandLine.arguments.count == 1 {
+        while true { _ = pause() }
+      }
+      exit(1)
     }
   }
 
-  private static func run() throws {
-    guard getpid() == 1 else { throw Failure.system }
-    // PID1 inherits the kernel console. Disable terminal echo and canonical buffering.
-    var terminal = termios()
-    guard tcgetattr(STDIN_FILENO, &terminal) == 0 else { throw Failure.system }
-    cfmakeraw(&terminal)
-    guard tcsetattr(STDIN_FILENO, TCSANOW, &terminal) == 0 else { throw Failure.system }
-    var region = try PageRegion.allocate(byteCount: 64 * 1024 * 1024, backing: .reclaimable)
+  private static func run(mode: Mode) throws {
+    if mode == .boot {
+      guard getpid() == 1 else { throw Failure.system }
+      // Boot PID1 inherits a terminal; agent/container modes use pipe/vsock streams.
+      var terminal = termios()
+      guard tcgetattr(STDIN_FILENO, &terminal) == 0 else { throw Failure.system }
+      cfmakeraw(&terminal)
+      guard tcsetattr(STDIN_FILENO, TCSANOW, &terminal) == 0 else { throw Failure.system }
+    } else if mode == .agent {
+      guard getpid() > 1, geteuid() == 0 else { throw Failure.system }
+    }
+    let byteCount = mode == .agent ? 4096 : (mode == .workload ? 88 : 64) * 1024 * 1024
+    var region = try PageRegion.allocate(
+      byteCount: byteCount, maximumMappedBytes: byteCount, backing: .reclaimable)
     var canary = try PageRegion.allocate(byteCount: 8 * 1024 * 1024)
     try canary.withMutableBytes { bytes in
       for index in bytes.indices { bytes[index] = 0x3c }
     }
-    let balloon = try BalloonState()
+    let balloon: BalloonState?
+    if mode == .workload { balloon = nil } else { balloon = try BalloonState() }
     let before = try memory()
+    let driver = mode == .workload ? "workload" : try driverState()
     try send(
-      "PROBE_READY \(region.pageSize) \(before.total) \(before.available) \(try driverState())\n")
+      "PROBE_READY \(region.pageSize) \(before.total) \(before.available) \(driver)\n")
     var previous: UInt64 = 0
     for _ in 0..<1000 {
       let words = try command().split(separator: " ")
@@ -141,8 +164,43 @@ private func command() throws -> String {
       previous = sequence
       guard try canary.withBytes({ matches($0, 0x3c) }) else { throw Failure.memory }
       switch words[0] {
+      case "I":
+        guard mode == .workload else { throw Failure.framing }
+        let limit = try readFile("/sys/fs/cgroup/memory.max").split(separator: "\n")
+        guard limit.count == 1, let maximum = UInt64(limit[0]) else { throw Failure.framing }
+        let status = try readFile("/proc/self/status").split(separator: "\n")
+        func statusField(_ key: String) throws -> Substring {
+          let lines = status.filter { $0.hasPrefix(key + ":") }
+          guard lines.count == 1 else { throw Failure.framing }
+          let fields = lines[0].split(whereSeparator: { $0 == " " || $0 == "\t" })
+          guard fields.count == 2 else { throw Failure.framing }
+          return fields[1]
+        }
+        let capabilities = try statusField("CapEff")
+        let noNewPrivileges = try statusField("NoNewPrivs")
+        var filesystem = statvfs()
+        guard statvfs("/probe", &filesystem) == 0 else { throw Failure.system }
+        let readOnly = UInt64(filesystem.f_flag) & UInt64(ST_RDONLY) != 0
+        let executable = open("/probe/probe", O_WRONLY | O_CLOEXEC)
+        if executable >= 0 {
+          _ = close(executable)
+        } else {
+          // An executing inode can refuse with ETXTBSY before the mount's EROFS check.
+          guard errno == EROFS || errno == ETXTBSY else { throw Failure.system }
+        }
+        let mem = open("/dev/mem", O_RDONLY | O_CLOEXEC)
+        if mem >= 0 {
+          _ = close(mem)
+        } else {
+          guard errno == ENOENT || errno == EACCES || errno == EPERM else { throw Failure.system }
+        }
+        try send(
+          "PROBE_INFO \(sequence) \(maximum) \(capabilities) \(noNewPrivileges) \(executable >= 0 || !readOnly ? 1 : 0) \(mem >= 0 ? 1 : 0)\n"
+        )
+        continue
       case "S": break
       case "T":
+        guard mode != .agent else { throw Failure.framing }
         guard try memory().available >= 96 * 1024 * 1024 else { throw Failure.memory }
         try region.resetToZero()
         let zero = try region.withBytes { matches($0, 0) }
@@ -155,16 +213,26 @@ private func command() throws -> String {
           try region.residentPageCount() == region.mappedByteCount / region.pageSize
         else { throw Failure.memory }
       case "E":
+        guard mode != .agent else { throw Failure.framing }
         try region.eraseContents()
         let erased = try region.withBytes { matches($0, 0) }
         guard erased else { throw Failure.memory }
         _ = try region.discardContents()
         guard try region.residentPageCount() == 0 else { throw Failure.memory }
+      case "Q":
+        guard mode != .boot else { throw Failure.framing }
+        try region.eraseContents()
+        guard try region.withBytes({ matches($0, 0) }) else { throw Failure.memory }
+        _ = try region.discardContents()
+        try canary.eraseContents()
+        guard try canary.withBytes({ matches($0, 0) }) else { throw Failure.memory }
+        try send("PROBE_DONE \(sequence)\n")
+        return
       default: throw Failure.framing
       }
       let current = try memory()
       let own = try ProcessMemorySnapshot.capture()
-      let state = try balloon.observe()
+      let state = try balloon?.observe()
       try send(
         "PROBE_OBS \(sequence) \(current.total) \(current.available) \(try region.residentPageCount()) \(own.residentBytes) \(state?.requested ?? UInt32.max) \(state?.actual ?? UInt32.max)\n"
       )

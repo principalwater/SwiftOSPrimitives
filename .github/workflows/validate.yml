@@ -117,6 +117,13 @@ jobs:
             swift build --package-path Examples/VirtualizationBalloonLab -c release --jobs 2 \
               --product vz-balloon-guest -Xswiftc -warnings-as-errors
           fi
+      - name: Validate optional Apple Container memory adapter
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift test --package-path Examples/AppleContainerMemoryLab -c release --jobs 2 \
+            -Xswiftc -warnings-as-errors
       - name: Validate optional Rust Linux references
         if: runner.os == 'Linux'
         shell: bash
