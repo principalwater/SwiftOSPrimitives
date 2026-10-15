@@ -1,3 +1,4 @@
+import BoundedMemory
 import CryptoKit
 import Darwin
 import Foundation
@@ -8,6 +9,8 @@ private enum Failure: Error {
   case arguments, framing, guest, deadline, noAcknowledgement, state, mismatch, disconnected
 }
 private struct Observation {
+  let sequence: UInt64
+  let capturedAtNanoseconds: UInt64
   let total: UInt64
   let available: UInt64
   let regionPages: UInt64
@@ -51,7 +54,8 @@ private struct Observation {
 
   private static func run() async throws {
     let args = CommandLine.arguments
-    guard args.count == 5, ["cycles", "absent", "ignored", "cancel-inflated"].contains(args[4]),
+    guard args.count == 5,
+      ["cycles", "absent", "ignored", "cancel-inflated", "policy"].contains(args[4]),
       VZVirtualMachine.isSupported
     else { throw Failure.arguments }
     let kernel = URL(filePath: args[1])
@@ -156,7 +160,13 @@ private struct Observation {
       }
       throw Failure.deadline
     }
+    func elapsedNanoseconds() -> UInt64 {
+      let elapsed = began.duration(to: .now).components
+      return UInt64(elapsed.seconds) * 1_000_000_000
+        + UInt64(elapsed.attoseconds / 1_000_000_000)
+    }
     func observe(_ command: String, label: String) async throws -> Observation {
+      let captureStart = elapsedNanoseconds()
       sequence += 1
       let request = Data("\(command) \(sequence)\n".utf8)
       let written = request.withUnsafeBytes {
@@ -185,6 +195,7 @@ private struct Observation {
         "hostControllerFootprintBytes": host.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
       ])
       return Observation(
+        sequence: sequence, capturedAtNanoseconds: captureStart,
         total: total, available: available, regionPages: pages, guestRSS: rss, requested: requested,
         actual: actual)
     }
@@ -200,6 +211,7 @@ private struct Observation {
     var primary: (any Error)?
     var cleanup: (any Error)?
     var cycles = 0
+    var policyRequests: [[String: Any]] = []
     do {
       try await transition(vm, start: true)
       let ready = try await line(boot: true).split(separator: " ")
@@ -214,7 +226,8 @@ private struct Observation {
       case "absent": guard guestDriverState == "none" else { throw Failure.mismatch }
       case "ignored": guard guestDriverState == "unbound" else { throw Failure.mismatch }
       default:
-        guard guestDriverState.hasPrefix("bound:"), guestDriverState.count >= 70, guestDriverState.count <= 262,
+        guard guestDriverState.hasPrefix("bound:"), guestDriverState.count >= 70,
+          guestDriverState.count <= 262,
           guestDriverState.dropFirst(6).allSatisfy({ $0 == "0" || $0 == "1" })
         else { throw Failure.framing }
       }
@@ -225,45 +238,132 @@ private struct Observation {
         guard vm.memoryBalloonDevices.count == 1,
           let balloon = vm.memoryBalloonDevices[0] as? VZVirtioTraditionalMemoryBalloonDevice
         else { throw Failure.mismatch }
-        for cycle in 0..<(mode == "cycles" ? 4 : 1) {
-          let touched = try await observe("T", label: "touched-\(cycle)")
-          guard touched.total == baseline, touched.regionPages == 64 * 1024 * 1024 / pageSize
-          else { throw Failure.mismatch }
-          let erased = try await observe("E", label: "erased-\(cycle)")
-          guard erased.regionPages == 0, erased.available >= reduction + 32 * 1024 * 1024 else {
-            throw Failure.mismatch
+        if mode == "policy" {
+          let mib: UInt64 = 1 << 20
+          guard VZVirtualMachineConfiguration.minimumAllowedMemorySize <= 192 * mib,
+            let budget = BalloonBudget(
+              installedBytes: installed, minimumResidentBytes: 192 * mib, granuleBytes: mib,
+              maximumStepBytes: 32 * mib),
+            var controller = BalloonController(
+              budget: budget, epoch: 1, guestReserveBytes: 96 * mib, hysteresisBytes: 16 * mib,
+              maximumObservationAgeNanoseconds: 3_000_000_000,
+              cooldownNanoseconds: 100_000_000, completionTimeoutNanoseconds: 8_000_000_000)
+          else { throw Failure.arguments }
+          defer { controller.retire() }
+          let warm = try await observe("T", label: "policy-warm")
+          guard warm.regionPages == 64 * mib / pageSize else { throw Failure.mismatch }
+          var grows = 0
+          var shrinks = 0
+          // One isolated VM/pipe namespace; epoch1 is never restored into another transport.
+          for phase in 0..<3 {
+            let region = try await observe(phase == 1 ? "T" : "E", label: "policy-phase-\(phase)")
+            if phase != 1 && region.regionPages != 0 { throw Failure.mismatch }
+            if phase == 0 && region.available < 160 * mib { throw Failure.mismatch }
+            var settled = false
+            var idleSamples = 0
+            for _ in 0..<32 {
+              try controller.checkDeadline(nowNanoseconds: elapsedNanoseconds())
+              let current = try await observe("S", label: "policy-state-\(phase)")
+              let actualBytes = UInt64(current.actual) * 4096
+              let requestedBytes = UInt64(current.requested) * 4096
+              guard actualBytes <= installed, requestedBytes <= installed else {
+                throw Failure.mismatch
+              }
+              let allowance = installed - actualBytes
+              let observation = BalloonController.Observation(
+                epoch: 1, sequence: current.sequence,
+                capturedAtNanoseconds: current.capturedAtNanoseconds,
+                actualResidentBytes: allowance, requestedResidentBytes: installed - requestedBytes,
+                guestAvailableBytes: current.available,
+                hostResidentLimitBytes: installed,
+                hostUnderPressure: false, guestUnderPressure: false)
+              if let request = try controller.observe(
+                observation, nowNanoseconds: elapsedNanoseconds())
+              {
+                guard vm.state == .running, request.targetResidentBytes % mib == 0,
+                  request.targetResidentBytes >= budget.minimumResidentBytes,
+                  request.targetResidentBytes <= installed
+                else { throw Failure.state }
+                if request.targetResidentBytes < allowance { shrinks += 1 } else { grows += 1 }
+                balloon.targetVirtualMachineMemorySize = request.targetResidentBytes
+                guard balloon.targetVirtualMachineMemorySize == request.targetResidentBytes else {
+                  throw Failure.mismatch
+                }
+                try controller.didApply(
+                  request, afterObservationSequence: sequence, atNanoseconds: elapsedNanoseconds())
+                idleSamples = 0
+                policyRequests.append([
+                  "epoch": request.epoch, "sequence": request.sequence,
+                  "initialResidentBytes": allowance,
+                  "targetResidentBytes": request.targetResidentBytes,
+                  "guestAvailableBytes": current.available,
+                  "issuedAtNanoseconds": request.issuedAtNanoseconds,
+                ])
+              } else if controller.pendingRequest == nil {
+                idleSamples += 1
+                if idleSamples >= 2 {
+                  settled = true
+                  break
+                }
+              } else {
+                idleSamples = 0
+              }
+              try await Task.sleep(for: .milliseconds(100))
+            }
+            guard settled, controller.pendingRequest == nil else { throw Failure.noAcknowledgement }
           }
-          guard vm.state == .running else { throw Failure.state }
-          balloon.targetVirtualMachineMemorySize = installed - reduction
-          guard balloon.targetVirtualMachineMemorySize == installed - reduction else {
-            throw Failure.mismatch
-          }
-          if mode == "ignored" {
-            do {
-              try await waitBalloon(UInt32(reduction / 4096), label: "ignored", seconds: 2)
-              throw Failure.mismatch
-            } catch Failure.noAcknowledgement {}
-            let late = try await observe("S", label: "ignored-deadline")
-            guard late.actual == 0, late.requested == UInt32(reduction / 4096) else {
+          guard grows > 0, shrinks >= 2 else { throw Failure.mismatch }
+          controller.retire()
+          // Manual final restore follows policy retirement; it is not a policy decision.
+          balloon.targetVirtualMachineMemorySize = installed
+          try await waitBalloon(0, label: "policy-end-restore", seconds: 8)
+          let reused = try await observe("T", label: "policy-final-reuse")
+          guard reused.regionPages == 64 * mib / pageSize else { throw Failure.mismatch }
+          _ = try await observe("E", label: "policy-final-erase")
+          cycles = 1
+        } else {
+          for cycle in 0..<(mode == "cycles" ? 4 : 1) {
+            let touched = try await observe("T", label: "touched-\(cycle)")
+            guard touched.total == baseline, touched.regionPages == 64 * 1024 * 1024 / pageSize
+            else { throw Failure.mismatch }
+            let erased = try await observe("E", label: "erased-\(cycle)")
+            guard erased.regionPages == 0, erased.available >= reduction + 32 * 1024 * 1024 else {
               throw Failure.mismatch
             }
-            break
+            guard vm.state == .running else { throw Failure.state }
+            balloon.targetVirtualMachineMemorySize = installed - reduction
+            guard balloon.targetVirtualMachineMemorySize == installed - reduction else {
+              throw Failure.mismatch
+            }
+            if mode == "ignored" {
+              do {
+                try await waitBalloon(UInt32(reduction / 4096), label: "ignored", seconds: 2)
+                throw Failure.mismatch
+              } catch Failure.noAcknowledgement {}
+              let late = try await observe("S", label: "ignored-deadline")
+              guard late.actual == 0, late.requested == UInt32(reduction / 4096) else {
+                throw Failure.mismatch
+              }
+              break
+            }
+            try await waitBalloon(UInt32(reduction / 4096), label: "inflated-\(cycle)", seconds: 8)
+            if mode == "cancel-inflated" {
+              withUnsafeCurrentTask { $0?.cancel() }
+              break
+            }
+            guard vm.state == .running else { throw Failure.state }
+            balloon.targetVirtualMachineMemorySize = installed
+            guard balloon.targetVirtualMachineMemorySize == installed else {
+              throw Failure.mismatch
+            }
+            try await waitBalloon(0, label: "deflated-\(cycle)", seconds: 8)
+            cycles += 1
           }
-          try await waitBalloon(UInt32(reduction / 4096), label: "inflated-\(cycle)", seconds: 8)
-          if mode == "cancel-inflated" {
-            withUnsafeCurrentTask { $0?.cancel() }
-            break
+          if mode == "cycles" {
+            let reused = try await observe("T", label: "final-reuse")
+            guard reused.regionPages == 64 * 1024 * 1024 / pageSize else { throw Failure.mismatch }
+            _ = try await observe("E", label: "final-erase")
           }
-          guard vm.state == .running else { throw Failure.state }
-          balloon.targetVirtualMachineMemorySize = installed
-          guard balloon.targetVirtualMachineMemorySize == installed else { throw Failure.mismatch }
-          try await waitBalloon(0, label: "deflated-\(cycle)", seconds: 8)
-          cycles += 1
-        }
-        if mode == "cycles" {
-          let reused = try await observe("T", label: "final-reuse")
-          guard reused.regionPages == 64 * 1024 * 1024 / pageSize else { throw Failure.mismatch }
-          _ = try await observe("E", label: "final-erase")
         }
       }
     } catch { primary = error }
@@ -277,6 +377,10 @@ private struct Observation {
       "kernelSHA256": inputHashes[0], "initramfsSHA256": inputHashes[1],
       "commandLine": boot.commandLine, "guestBalloonDriverState": guestDriverState,
       "mode": mode, "cycles": cycles, "observations": observations,
+      "policyRequests": policyRequests,
+      "policyHostBudgetScope":
+        "fixed owned VM ceiling; no host pressure induced or fleet reservation",
+
       "installedBytes": installed, "reductionRequestedBytes": reduction,
       "guestBaselineTotalBytes": baseline, "guestPageSize": pageSize,
       "stopped": vm.state == .stopped, "callerCancelled": Task.isCancelled,

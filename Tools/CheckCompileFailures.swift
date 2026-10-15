@@ -30,6 +30,8 @@ func runChecks() throws {
     ("CompilerVersion", []),
     ("ArenaPositive", []),
     ("FramePositive", []),
+    ("BalloonPositive", []),
+    ("BalloonCopy", ["3:7: error: 'copy' cannot be applied to noncopyable types"]),
     ("MappedPositive", []),
     (
       "MappedEscape",

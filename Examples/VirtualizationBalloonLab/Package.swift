@@ -8,7 +8,10 @@ let package = Package(
   targets: [
     .executableTarget(
       name: "vz-balloon-lab",
-      dependencies: [.product(name: "PageMemory", package: "SwiftOSPrimitives")]),
+      dependencies: [
+        .product(name: "PageMemory", package: "SwiftOSPrimitives"),
+        .product(name: "BoundedMemory", package: "SwiftOSPrimitives"),
+      ]),
     .executableTarget(
       name: "vz-balloon-guest",
       dependencies: [.product(name: "PageMemory", package: "SwiftOSPrimitives")],

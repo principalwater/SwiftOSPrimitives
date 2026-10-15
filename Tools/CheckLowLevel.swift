@@ -360,6 +360,17 @@ func checkLowLevel() throws {
     ])
   try run("EmbeddedPageExecution", executable: pageImage, arguments: [])
 
+  let balloonImage = scratch.appendingPathComponent("EmbeddedBalloonProbe")
+  try run(
+    "EmbeddedBalloon", executable: compiler,
+    arguments: host + embedded + ["-no-allocations", "-D", "BOUNDEDMEMORY_STANDALONE"] + [
+      root.appendingPathComponent("Sources/BoundedMemory/BalloonBudget.swift").path,
+      root.appendingPathComponent("Sources/BoundedMemory/BalloonController.swift").path,
+      root.appendingPathComponent("Examples/EmbeddedBalloonProbe/main.swift").path,
+      "-o", balloonImage.path,
+    ])
+  try run("BalloonControlExecution", executable: balloonImage, arguments: [])
+
   let trace = root.appendingPathComponent("Examples/RegisterTrace/RegisterTrace.swift").path
   let traceImage = scratch.appendingPathComponent("RegisterTrace")
   try run(

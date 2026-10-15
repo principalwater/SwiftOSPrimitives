@@ -104,6 +104,14 @@ Mapped bytes may be reclaimed without reducing code/runtime RSS. This component
 does not replace the Swift runtime, provide a global malloc implementation,
 guarantee recovery from OOM killing or implement VM ballooning.
 
+## Apple Container balloon policy
+
+The allocation-bounded `BalloonController` plans guest allowance using a reserve,
+hysteresis, fixed per-VM grant and delivery/completion fencing. The optional native
+VZ lab exercises free/load/free policy decisions on an owned disposable VM.
+[Design, current native evidence and Apple integration limits](Documentation/AppleContainerBallooning.md)
+distinguish protocol completion from unproven physical host-memory return.
+
 ## Validation
 
 ```text
