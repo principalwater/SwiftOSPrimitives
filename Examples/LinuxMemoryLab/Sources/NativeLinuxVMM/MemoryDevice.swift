@@ -12,6 +12,7 @@ final class MemoryDevice {
     var pointer: UnsafeMutableRawPointer?
     var mapped = false
     var plugged = false
+    var freshAllocation = false
   }
   let thread = pthread_self()
   let held: Bool
@@ -104,7 +105,8 @@ final class MemoryDevice {
   private func provide(_ index: Int) throws {
     let extent = extents[index]
     guard !extent.plugged, !extent.mapped else { throw DeviceFailure.request }
-    if extent.pointer == nil { try native(hv_vm_allocate(&extent.pointer, Self.block, 0)) }
+    extent.freshAllocation = extent.pointer == nil
+    if extent.freshAllocation { try native(hv_vm_allocate(&extent.pointer, Self.block, 0)) }
     guard let pointer = extent.pointer else { throw DeviceFailure.request }
     // Held pages also regain zero semantics, never expose an old guest's data.
     memset(pointer, 0, Self.block)
@@ -129,6 +131,8 @@ final class MemoryDevice {
   }
   private func retire(_ index: Int) throws {
     let extent = extents[index]
+    guard extent.plugged || extent.mapped else { return }
+    guard observations.count < 1024 else { throw DeviceFailure.request }
     if extent.mapped {
       try native(hv_vm_unmap(Self.base + UInt64(index * Self.block), Self.block))
       extent.mapped = false
@@ -148,13 +152,14 @@ final class MemoryDevice {
         try native(mach_vm_region_recurse(mach_task_self_, &address, &size, &depth, $0, &count))
       }
     }
-    guard count == words, address == original, size >= Self.block, info.is_submap == 0,
+    guard count == words, address == original, size == Self.block, info.offset == 0,
+      info.is_submap == 0,
       info.external_pager == 0, info.shadow_depth == 0, info.object_id_full != 0,
       info.ref_count == 1, info.pages_wired == 0,
       info.user_wired_count == 0
     else {
       throw DeviceFailure.observation(
-        "index=\(index) start=\(address) original=\(original) size=\(size) count=\(count) submap=\(info.is_submap) external=\(info.external_pager) shadow=\(info.shadow_depth) object=\(info.object_id_full) refs=\(info.ref_count) swapped=\(info.pages_swapped_out) wired=\(info.pages_wired) userWired=\(info.user_wired_count)"
+        "index=\(index) start=\(address) original=\(original) size=\(size) offset=\(info.offset) count=\(count) submap=\(info.is_submap) external=\(info.external_pager) shadow=\(info.shadow_depth) object=\(info.object_id_full) refs=\(info.ref_count) swapped=\(info.pages_swapped_out) wired=\(info.pages_wired) userWired=\(info.user_wired_count)"
       )
     }
     // Paged-out pages are still owned; deallocate them without counting them as resident RAM.
@@ -165,7 +170,11 @@ final class MemoryDevice {
     }
     let after = try ProcessMemorySnapshot.capture()
     observations.append([
-      "index": index, "held": held, "oldVirtualRangeAbsent": !held, "objectID": info.object_id_full,
+      "index": index, "held": held,
+      "nativeEntryBytes": size, "nativeObjectOffset": info.offset,
+      "freshAllocation": extent.freshAllocation, "hostInitializedBytes": Self.block,
+      "residentObservationIncludesHostZeroing": true, "oldVirtualRangeAbsent": !held,
+      "objectID": info.object_id_full,
       "residentPagesBefore": info.pages_resident,
       "pagedOutPagesBefore": info.pages_swapped_out,
       "residentBytesObservedBefore": UInt64(info.pages_resident)
@@ -175,7 +184,6 @@ final class MemoryDevice {
       "footprintAfter": after.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
       "physicalReleasedBytes": NSNull(),
     ])
-    guard observations.count < 1024 else { throw DeviceFailure.request }
   }
   private func requireAbsent(_ original: UInt64) throws {
     var start = original

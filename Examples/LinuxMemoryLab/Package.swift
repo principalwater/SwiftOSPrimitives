@@ -1,13 +1,36 @@
 // swift-tools-version: 6.4
+import Foundation
 import PackageDescription
+
+guard
+  let containerizationPath = ProcessInfo.processInfo.environment["SWIFTOS_CONTAINERIZATION_PATH"]
+else {
+  fatalError("Set an explicit path to the reviewed Containerization patch; see README")
+}
 
 let package = Package(
   name: "LinuxMemoryLab", platforms: [.macOS("27.0")],
-  dependencies: [.package(path: "../..")],
+  products: [.library(name: "NativeLinuxVMM", targets: ["NativeLinuxVMM"])],
+  dependencies: [
+    .package(path: "../.."),
+    .package(name: "containerization", path: containerizationPath),
+    .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
+  ],
   targets: [
+    .target(
+      name: "NativeLinuxVMM",
+      dependencies: [
+        .product(name: "PageMemory", package: "SwiftOSPrimitives"),
+        .product(name: "Containerization", package: "containerization"),
+        .product(name: "NIOPosix", package: "swift-nio"),
+      ]),
+    .executableTarget(name: "linux-memory-lab", dependencies: ["NativeLinuxVMM"]),
+    .executableTarget(name: "container-native-lab", dependencies: ["NativeLinuxVMM"]),
     .executableTarget(
-      name: "linux-memory-lab",
-      dependencies: [.product(name: "PageMemory", package: "SwiftOSPrimitives")]),
+      name: "container-memory-probe",
+      dependencies: [
+        .product(name: "PageMemory", package: "SwiftOSPrimitives")
+      ]),
     .systemLibrary(name: "NativeLinux"),
     .executableTarget(
       name: "linux-memory-guest",
@@ -15,5 +38,5 @@ let package = Package(
         "NativeLinux",
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
       ]),
-    .testTarget(name: "LinuxMemoryLabTests", dependencies: ["linux-memory-lab"]),
+    .testTarget(name: "LinuxMemoryLabTests", dependencies: ["NativeLinuxVMM"]),
   ], swiftLanguageModes: [.v6])

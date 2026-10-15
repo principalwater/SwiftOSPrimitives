@@ -1,0 +1,35 @@
+diff --git a/Sources/Containerization/VirtualMachineAgent.swift b/Sources/Containerization/VirtualMachineAgent.swift
+index 1bbaf78..4b5e2f3 100644
+--- a/Sources/Containerization/VirtualMachineAgent.swift
++++ b/Sources/Containerization/VirtualMachineAgent.swift
+@@ -20,5 +20,11 @@ import ContainerizationOCI
+ import Foundation
+
+-public struct WriteFileFlags {
++public struct WriteFileFlags: Sendable {
++    public init(create: Bool = false, append: Bool = false, createParentDirectories: Bool = false) {
++        self.create = create
++        self.append = append
++        self.createParentDirectories = createParentDirectories
++    }
++
+     public var createParentDirectories = false
+     public var append = false
+diff --git a/Sources/Containerization/VsockListener.swift b/Sources/Containerization/VsockListener.swift
+index 0a20d81..c06e0e9 100644
+--- a/Sources/Containerization/VsockListener.swift
++++ b/Sources/Containerization/VsockListener.swift
+@@ -34,5 +34,5 @@ public final class VsockListener: NSObject, Sendable, AsyncSequence {
+     private let finished: Mutex<Bool>
+
+-    package init(port: UInt32, stopListen: @Sendable @escaping (_ port: UInt32) throws -> Void) {
++    public init(port: UInt32, stopListen: @Sendable @escaping (_ port: UInt32) throws -> Void) {
+         self.port = port
+         let (stream, continuation) = AsyncStream.makeStream(of: FileHandle.self)
+@@ -66,5 +66,5 @@ public final class VsockListener: NSObject, Sendable, AsyncSequence {
+     /// cloud-hypervisor backend on Linux). On macOS the VZ delegate hits
+     /// `cont.yield(_:)` directly via same-class access.
+-    package func yield(_ handle: FileHandle) -> AsyncStream<FileHandle>.Continuation.YieldResult {
++    public func yield(_ handle: FileHandle) -> AsyncStream<FileHandle>.Continuation.YieldResult {
+         cont.yield(handle)
+     }

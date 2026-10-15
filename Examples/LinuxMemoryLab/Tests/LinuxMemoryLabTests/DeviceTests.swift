@@ -2,10 +2,10 @@ import Darwin
 import Foundation
 import Testing
 
-@testable import linux_memory_lab
+@testable import NativeLinuxVMM
 
 // Golden little-endian virtio bytes; no hypervisor or emulated result generator.
-private final class RingFixture {
+final class RingFixture {
   let bytes = UnsafeMutableRawPointer.allocate(byteCount: 16384, alignment: 16)
   var queue = SplitQueue(size: 8, descriptors: 0, available: 256, used: 512, ready: true)
   init() {
@@ -109,7 +109,9 @@ func requiresVersionAndOfferedFeatures(_ missingMemoryFeature: Bool) throws {
 }
 
 @Test func unsupportedDiskCommandReturnsStatusWithoutIO() throws {
-  let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+  let temporaryPath = try #require(ProcessInfo.processInfo.environment["TMPDIR"])
+  let root = URL(filePath: temporaryPath, directoryHint: .isDirectory)
+    .appending(path: UUID().uuidString)
   let artifacts = root.appending(path: "artifacts")
   let marker = root.appending(path: "OWNER.json")
   let disk = artifacts.appending(path: "clickhouse-run-unit.ext4")
@@ -122,7 +124,7 @@ func requiresVersionAndOfferedFeatures(_ missingMemoryFeature: Bool) throws {
   }
   try JSONSerialization.data(withJSONObject: [
     "root": root.path, "uid": Int(getuid()),
-    "purpose": "isolated-linux-backing-G17",
+    "purpose": "isolated-container-native-G18",
   ])
   .write(to: marker, options: .withoutOverwriting)
   let descriptor = open(disk.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)

@@ -4,7 +4,7 @@ import Hypervisor
 import PageMemory
 import Synchronization
 
-private enum Failure: Error {
+enum Failure: Error {
   case arguments, boundary, deadline, protocolError
   case unexpectedExit(UInt32, UInt64, UInt64)
   case native(String, Int32)
@@ -14,9 +14,10 @@ private func check(_ code: Int32, _ operation: String) throws {
 }
 
 // Only the synchronous creating pthread can execute a CPU or mutate its mappings.
-private final class LinuxMachine {
+final class LinuxMachine {
   let thread = pthread_self()
   var created = false
+  var wasCreated = false
   var memory: UnsafeMutableRawPointer?
   var capacity = 512 << 20
   let base: UInt64 = 0x4000_0000
@@ -33,6 +34,9 @@ private final class LinuxMachine {
   var osLock = false
   var dynamicMemory: MemoryDevice?
   var disk: BlockDevice?
+  var rootDisk: BlockDevice?
+  var vsock: VsockDevice?
+  var control: NativeControl?
   var guestEvents: [String] = []
   var input = Data()
   var inputOffset = 0
@@ -66,6 +70,10 @@ private final class LinuxMachine {
     }
   }
   func consoleLine(_ text: String) throws {
+    if control != nil {
+      if text.contains("Kernel panic") { throw Failure.protocolError }
+      return
+    }
     if text.hasPrefix("CH_") {
       guard guestEvents.count < 32 else { throw Failure.protocolError }
       guestEvents.append(text.trimmingCharacters(in: .newlines))
@@ -115,8 +123,10 @@ private final class LinuxMachine {
     device.transport.interruptStatus |= 2
     try check(hv_gic_set_spi(device.transport.interrupt, true), "memory-config-irq")
   }
-  func blockMMIO(_ offset: UInt64, width: Int, write: UInt32?) throws -> UInt64 {
-    guard let disk else { throw Failure.protocolError }
+  func blockMMIO(_ offset: UInt64, width: Int, write: UInt32?, target: BlockDevice? = nil) throws
+    -> UInt64
+  {
+    guard let disk = target ?? disk else { throw Failure.protocolError }
     if offset >= 0x100 {
       let bytes = disk.config()
       guard write == nil, width <= 4, offset - 0x100 < UInt64(bytes.count),
@@ -143,6 +153,7 @@ private final class LinuxMachine {
     return UInt64(transport.read(offset))
   }
   func dataPointer(_ address: UInt64, _ count: Int) throws -> UnsafeMutableRawPointer {
+    try requireStopped()
     if address >= MemoryDevice.base, let device = dynamicMemory, count > 0 {
       let offset = address - MemoryDevice.base
       guard offset < UInt64(MemoryDevice.capacity),
@@ -198,6 +209,7 @@ private final class LinuxMachine {
     guard pthread_equal(thread, pthread_self()) != 0, !running else { throw Failure.boundary }
   }
   func pointer(_ address: UInt64, _ count: Int) throws -> UnsafeMutableRawPointer {
+    try requireStopped()
     guard let memory, mapped, count >= 0, address >= base,
       address - base <= UInt64(capacity), UInt64(count) <= UInt64(capacity) - (address - base)
     else { throw Failure.boundary }
@@ -218,11 +230,12 @@ private final class LinuxMachine {
   }
   func boot(kernel: Data, initrd: Data) throws {
     try requireStopped()
-    guard !initrd.isEmpty, kernel.count >= 64,
+    guard !initrd.isEmpty || control != nil, kernel.count >= 64,
       kernel[56..<60].elementsEqual([0x41, 0x52, 0x4d, 0x64])
     else { throw Failure.arguments }
     try check(hv_vm_create(nil), "create")
     created = true
+    wasCreated = true
     let gic = hv_gic_config_create()
     try check(hv_gic_config_set_distributor_base(gic, 0x0800_0000), "gic-dist")
     try check(hv_gic_config_set_redistributor_base(gic, 0x080a_0000), "gic-redist")
@@ -235,19 +248,23 @@ private final class LinuxMachine {
     mapped = true
     let initrdAddress: UInt64 = base + 128 * 1024 * 1024
     let dtbAddress: UInt64 = base + 120 * 1024 * 1024
-    let command =
+    var command =
       "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 rdinit=/init panic=-1 nokaslr loglevel=6 memhp_default_state=online_movable memory_hotplug.memmap_on_memory=0 irqchip.gicv3_nolpi=1"
+    if control != nil {
+      command = command.replacingOccurrences(
+        of: "rdinit=/init", with: "root=/dev/vda rootfstype=ext4 ro init=/sbin/vminitd")
+    }
     let tree = DeviceTree.linux(
       memoryBytes: UInt64(capacity),
       initrd: initrdAddress..<(initrdAddress + UInt64(initrd.count)), command: command,
-      memoryDevice: dynamicMemory != nil, blockDevice: disk != nil)
+      memoryDevice: dynamicMemory != nil, blockDevice: disk != nil, container: control != nil)
     guard kernel.count < 100 << 20, initrd.count < 64 << 20 else { throw Failure.arguments }
     let textOffset = kernel[8..<16].enumerated().reduce(UInt64(0)) {
       $0 | (UInt64($1.element) << ($1.offset * 8))
     }
     guard textOffset <= 0x80000 else { throw Failure.arguments }
     try load(kernel, at: base + textOffset)
-    try load(initrd, at: initrdAddress)
+    if !initrd.isEmpty { try load(initrd, at: initrdAddress) }
     try load(tree, at: dtbAddress)
     var handle: hv_vcpu_t = 0
     try check(hv_vcpu_create(&handle, &exitInfo, nil), "cpu-create")
@@ -272,7 +289,8 @@ private final class LinuxMachine {
         }
       }
     }
-    timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(500))
+    let tick = DispatchTimeInterval.milliseconds(control == nil ? 500 : 2)
+    timer.schedule(deadline: .now() + tick, repeating: tick)
     timer.resume()
     defer {
       exitTarget.withLock { $0.cpu = nil }
@@ -280,8 +298,33 @@ private final class LinuxMachine {
       timerQueue.sync {}
     }
     let deadline = ContinuousClock.now.advanced(by: .seconds(disk == nil ? 45 : 120))
-    while dynamicMemory == nil ? !ready : !memoryComplete {
-      try memoryProgress()
+    control?.state.withLock { $0.running = true }
+    while control != nil || (dynamicMemory == nil ? !ready : !memoryComplete) {
+      if let control, let vsock {
+        let update = control.state.withLock { state in
+          state.plugged = dynamicMemory?.plugged ?? 0
+          return (state.stop, state.requested)
+        }
+        if update.0 { break }
+        // Pop one ownership transfer at a time; an exception leaves every other fd in State.
+        for _ in 0..<64 {
+          let command = control.state.withLock { state -> NativeControl.Command? in
+            guard !state.stop, !state.commands.isEmpty else { return nil }
+            return state.commands.removeFirst()
+          }
+          guard let command else { break }
+          switch command {
+          case .open(let port, let fd, let token):
+            try vsock.open(port, descriptor: fd, token: token)
+          case .cancel(let token): vsock.cancel(token)
+          }
+        }
+        if dynamicMemory?.requested != update.1 { try requestMemory(update.1) }
+        try vsock.poll(memory: pointer, payloadMemory: dataPointer)
+        try check(hv_gic_set_spi(38, vsock.transport.interruptStatus != 0), "vsock-irq")
+      } else {
+        try memoryProgress()
+      }
       try check(exitTarget.withLock { $0.error }, "watchdog-exit")
       guard ContinuousClock.now < deadline, exits < 3_000_000 else { throw Failure.deadline }
       running = true
@@ -334,6 +377,43 @@ private final class LinuxMachine {
         let address = event.exception.physical_address
         let rt = UInt32((syndrome >> 16) & 31)
         let width = 1 << Int((syndrome >> 22) & 3)
+        if address >= 0x0a00_3000, address < 0x0a00_4000, let vsock {
+          let write = syndrome & 64 != 0
+          let offset = address - 0x0a00_3000
+          let value: UInt64
+          if offset >= 0x100 {
+            guard !write, width <= 4, offset <= 0x104 else { throw Failure.protocolError }
+            value = offset == 0x100 ? 3 : 0
+          } else {
+            guard width == 4, offset % 4 == 0 else { throw Failure.protocolError }
+            if write {
+              let raw = UInt32(
+                truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
+              if try vsock.transport.write(offset, raw, memory: pointer) {
+                try vsock.notify(raw, memory: pointer, payloadMemory: dataPointer)
+              }
+              value = 0
+            } else {
+              value = UInt64(vsock.transport.read(offset))
+            }
+          }
+          try check(hv_gic_set_spi(38, vsock.transport.interruptStatus != 0), "vsock-irq")
+          if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+          try set(HV_REG_PC, register(HV_REG_PC) + 4)
+          continue
+        }
+        if address >= 0x0a00_2000, address < 0x0a00_3000, let rootDisk {
+          let write = syndrome & 64 != 0
+          let value = try blockMMIO(
+            address - 0x0a00_2000, width: width,
+            write: write
+              ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
+              : nil,
+            target: rootDisk)
+          if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+          try set(HV_REG_PC, register(HV_REG_PC) + 4)
+          continue
+        }
         if address >= 0x0a00_1000, address < 0x0a00_2000, disk != nil {
           let write = syndrome & 64 != 0
           let value = try blockMMIO(
@@ -422,6 +502,7 @@ private final class LinuxMachine {
       self.cpu = nil
       exitInfo = nil
     }
+    do { try rootDisk?.close() } catch { errors.append("root-disk-close \(error)") }
     do { try disk?.close() } catch { errors.append("disk-close \(error)") }
     do { try dynamicMemory?.close() } catch {
       errors.append("memory-close \(error)")
@@ -443,8 +524,8 @@ private final class LinuxMachine {
   }
 }
 
-@main private struct Lab {
-  static func main() {
+public enum StandaloneLab {
+  public static func main() {
     do { try run() } catch {
       print("LINUX_LAB_FAIL \(error)")
       exit(1)

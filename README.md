@@ -14,6 +14,10 @@ with Swift host/guest control, actual PCI balloon counts and cancellation-safe t
 [Owned HVF RAM lab](Examples/HypervisorMemoryLab/README.md) distinguishes guest unmapping
 from actual owned backing deallocation using a real Embedded Swift EL1 guest.
 It does not change Apple Container or claim VZ backing-release authority.
+[Native LinuxContainer backend](Examples/LinuxMemoryLab/README.md) integrates the optional
+Swift HVF owned-backing VMM with the current Apple Containerization lifecycle,
+standard vminitd/vsock and bounded ClickHouse shrink/regrow controls. This is an
+isolated research adapter; the installed Apple container CLI/service is unchanged.
 Full split-ring wire-index wrap and post-wrap fault controls are described in
 [Split-ring progress](Documentation/SplitRingProgress.md).
 

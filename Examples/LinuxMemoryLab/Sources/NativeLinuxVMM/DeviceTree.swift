@@ -54,7 +54,7 @@ struct DeviceTree {
 
   static func linux(
     memoryBytes: UInt64, initrd: Range<UInt64>, command: String, memoryDevice: Bool = false,
-    blockDevice: Bool = false
+    blockDevice: Bool = false, container: Bool = false
   ) -> Data {
     var tree = Self()
     tree.begin("")
@@ -126,6 +126,16 @@ struct DeviceTree {
       tree.property("reg", range(0x0a00_1000, 0x1000))
       tree.property("interrupts", cells(0, 4, 4))
       tree.end()
+    }
+    if container {
+      for (offset, irq) in [(0x2000, 5), (0x3000, 6)] {
+        tree.begin("virtio_mmio@\(String(0x0a00_0000 + offset, radix: 16))")
+        tree.property("compatible", string("virtio,mmio"))
+        tree.property("dma-coherent", Data())
+        tree.property("reg", range(UInt64(0x0a00_0000 + offset), 0x1000))
+        tree.property("interrupts", cells(0, UInt32(irq), 4))
+        tree.end()
+      }
     }
     tree.begin("chosen")
     tree.property("stdout-path", string("/pl011@9000000"))

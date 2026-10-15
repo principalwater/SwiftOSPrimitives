@@ -45,7 +45,7 @@ struct SplitQueue {
 
   mutating func drain(
     memory: (UInt64, Int) throws -> UnsafeMutableRawPointer,
-    process: ([GuestBuffer]) throws -> UInt32
+    process: ([GuestBuffer]) throws -> UInt32?
   ) throws -> Bool {
     guard ready else { throw DeviceFailure.negotiation }
     try validate(memory)
@@ -93,7 +93,7 @@ struct SplitQueue {
         index = next
       }
       guard buffers.count <= 128 else { throw DeviceFailure.descriptor("chain-limit") }
-      let written = try process(buffers)
+      guard let written = try process(buffers) else { break }
       let offset = 4 + Int(completed % UInt16(size)) * 8
       usedRing.storeBytes(of: UInt32(head).littleEndian, toByteOffset: offset, as: UInt32.self)
       usedRing.storeBytes(of: written.littleEndian, toByteOffset: offset + 4, as: UInt32.self)
@@ -112,7 +112,11 @@ final class VirtioMMIO {
   let features: UInt64
   let interrupt: UInt32
   let requiredFeatures: UInt64
-  var queue = SplitQueue()
+  var queues: [SplitQueue]
+  var queue: SplitQueue {
+    get { queues[Int(selection)] }
+    set { queues[Int(selection)] = newValue }
+  }
   var deviceFeaturePage: UInt32 = 0
   var driverFeaturePage: UInt32 = 0
   var driverFeatures: UInt64 = 0
@@ -123,8 +127,9 @@ final class VirtioMMIO {
 
   init(
     identity: UInt32, features: UInt64, interrupt: UInt32,
-    requiredFeatures: UInt64 = 1 << 32
+    requiredFeatures: UInt64 = 1 << 32, queueCount: Int = 1
   ) {
+    queues = (0..<queueCount).map { _ in SplitQueue() }
     self.identity = identity
     self.features = features | (1 << 32)
     self.interrupt = interrupt
@@ -142,8 +147,8 @@ final class VirtioMMIO {
         ? UInt32(
           truncatingIfNeeded:
             features >> (deviceFeaturePage * 32)) : 0
-    case 0x34: return selection == 0 ? 128 : 0
-    case 0x44: return selection == 0 && queue.ready ? 1 : 0
+    case 0x34: return Int(selection) < queues.count ? 128 : 0
+    case 0x44: return Int(selection) < queues.count && queue.ready ? 1 : 0
     case 0x60: return interruptStatus
     case 0x70: return status
     case 0xfc: return generation
@@ -171,7 +176,7 @@ final class VirtioMMIO {
     case 0x64: interruptStatus &= ~value
     case 0x70:
       if value == 0 {
-        queue = SplitQueue()
+        queues = queues.map { _ in SplitQueue() }
         driverFeatures = 0
         deviceFeaturePage = 0
         driverFeaturePage = 0
@@ -188,7 +193,7 @@ final class VirtioMMIO {
         }
       }
     case 0x38, 0x44, 0x80, 0x84, 0x90, 0x94, 0xa0, 0xa4:
-      guard selection == 0, status & 8 != 0 else { throw DeviceFailure.negotiation }
+      guard Int(selection) < queues.count, status & 8 != 0 else { throw DeviceFailure.negotiation }
       if offset == 0x44 {
         guard value == 1, !queue.ready else { throw DeviceFailure.negotiation }
         try queue.validate(memory)
@@ -204,7 +209,9 @@ final class VirtioMMIO {
         }
       }
     case 0x50:
-      guard value == 0, status & 12 == 12, queue.ready else { throw DeviceFailure.negotiation }
+      guard Int(value) < queues.count, status & 12 == 12, queues[Int(value)].ready else {
+        throw DeviceFailure.negotiation
+      }
       return true
     default: break
     }
