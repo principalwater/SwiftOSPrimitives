@@ -9,11 +9,11 @@ enum Failure: Error {
   case unexpectedExit(UInt32, UInt64, UInt64)
   case native(String, Int32)
 }
-private func check(_ code: Int32, _ operation: String) throws {
+func check(_ code: Int32, _ operation: String) throws {
   guard code == 0 else { throw Failure.native(operation, code) }
 }
 
-// Only the synchronous creating pthread can execute a CPU or mutate its mappings.
+// The coordinator owns mappings/devices; each vCPU has its own affine worker.
 final class LinuxMachine {
   let thread = pthread_self()
   var created = false
@@ -22,8 +22,10 @@ final class LinuxMachine {
   var capacity = 512 << 20
   let base: UInt64 = 0x4000_0000
   var mapped = false
-  var cpu: hv_vcpu_t?
-  var exitInfo: UnsafeMutablePointer<hv_vcpu_exit_t>?
+  var cpuCount = 1
+  var cpus: CPUGroup?
+  var activeCPU = 0
+  var activeRegisters = CPURegisters()
   var running = false
   var console = Data()
   var line = Data()
@@ -31,11 +33,16 @@ final class LinuxMachine {
   var exits = 0
   var consoleSink: FileHandle?
   var lastPC: UInt64 = 0
-  var osLock = false
+  var osLocks = InlineArray<4, Bool>(repeating: false)
+  var osLock: Bool {
+    get { osLocks[activeCPU] }
+    set { osLocks[activeCPU] = newValue }
+  }
   var dynamicMemory: MemoryDevice?
   var disk: BlockDevice?
   var rootDisk: BlockDevice?
   var vsock: VsockDevice?
+  var networks: [NetworkDevice] = []
   var control: NativeControl?
   var guestEvents: [String] = []
   var input = Data()
@@ -188,7 +195,14 @@ final class LinuxMachine {
               buffers[1].writable, buffers[1].size == 10
             else { throw Failure.protocolError }
             let request = Data(bytes: try self.pointer(buffers[0].address, 24), count: 24)
+            try self.requireStopped()
+            let before = device.observations.count
             let response = try device.request(request)
+            for index in before..<device.observations.count {
+              device.observations[index]["allVCPUsParked"] = self.cpus?.isQuiescent ?? true
+              device.observations[index]["quiescentEpoch"] = self.cpus?.epoch ?? 0
+              device.observations[index]["vcpuCount"] = self.cpuCount
+            }
             let destination = try self.pointer(buffers[1].address, 10)
             response.withUnsafeBytes {
               destination.copyMemory(from: $0.baseAddress!, byteCount: 10)
@@ -206,7 +220,9 @@ final class LinuxMachine {
   }
 
   func requireStopped() throws {
-    guard pthread_equal(thread, pthread_self()) != 0, !running else { throw Failure.boundary }
+    guard pthread_equal(thread, pthread_self()) != 0, !running,
+      cpus?.isQuiescent ?? true
+    else { throw Failure.boundary }
   }
   func pointer(_ address: UInt64, _ count: Int) throws -> UnsafeMutableRawPointer {
     try requireStopped()
@@ -221,12 +237,12 @@ final class LinuxMachine {
     sys_icache_invalidate(destination, data.count)
   }
   func register(_ reg: hv_reg_t) throws -> UInt64 {
-    var value: UInt64 = 0
-    try check(hv_vcpu_get_reg(cpu!, reg, &value), "get-reg")
-    return value
+    let index = try CPURegisters.index(reg)
+    guard activeRegisters.available & (1 << index) != 0 else { throw Failure.boundary }
+    return activeRegisters.values[index]
   }
   func set(_ reg: hv_reg_t, _ value: UInt64) throws {
-    try check(hv_vcpu_set_reg(cpu!, reg, value), "set-reg")
+    try activeRegisters.set(reg, value)
   }
   func boot(kernel: Data, initrd: Data) throws {
     try requireStopped()
@@ -242,6 +258,10 @@ final class LinuxMachine {
     try check(hv_gic_create(gic), "gic-create")
     try check(hv_vm_allocate(&memory, capacity, 0), "allocate")
     try check(
+      mach_vm_inherit(
+        mach_task_self_, UInt64(UInt(bitPattern: memory!)), UInt64(capacity), VM_INHERIT_NONE),
+      "boot-memory-inherit-none")
+    try check(
       hv_vm_map(
         memory!, base, capacity,
         UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)), "map")
@@ -253,11 +273,14 @@ final class LinuxMachine {
     if control != nil {
       command = command.replacingOccurrences(
         of: "rdinit=/init", with: "root=/dev/vda rootfstype=ext4 ro init=/sbin/vminitd")
+      // Serial INFO output traps once per byte and forces SMP quiescence for every character.
+      command += " -- agent --log-level warning"
     }
     let tree = DeviceTree.linux(
       memoryBytes: UInt64(capacity),
       initrd: initrdAddress..<(initrdAddress + UInt64(initrd.count)), command: command,
-      memoryDevice: dynamicMemory != nil, blockDevice: disk != nil, container: control != nil)
+      memoryDevice: dynamicMemory != nil, blockDevice: disk != nil, container: control != nil,
+      cpuCount: cpuCount, networkCount: networks.count)
     guard kernel.count < 100 << 20, initrd.count < 64 << 20 else { throw Failure.arguments }
     let textOffset = kernel[8..<16].enumerated().reduce(UInt64(0)) {
       $0 | (UInt64($1.element) << ($1.offset * 8))
@@ -266,41 +289,31 @@ final class LinuxMachine {
     try load(kernel, at: base + textOffset)
     if !initrd.isEmpty { try load(initrd, at: initrdAddress) }
     try load(tree, at: dtbAddress)
-    var handle: hv_vcpu_t = 0
-    try check(hv_vcpu_create(&handle, &exitInfo, nil), "cpu-create")
-    cpu = handle
-    try set(HV_REG_PC, base + textOffset)
-    try set(HV_REG_X0, dtbAddress)
-    try set(HV_REG_X1, 0)
-    try set(HV_REG_X2, 0)
-    try set(HV_REG_X3, 0)
-    try set(HV_REG_CPSR, 0x3c5)
-    try check(hv_vcpu_set_sys_reg(handle, HV_SYS_REG_SCTLR_EL1, 0x00c5_0838), "sctlr")
-    try check(hv_vcpu_set_sys_reg(handle, HV_SYS_REG_MPIDR_EL1, 0), "mpidr")
-    try check(hv_vcpu_set_vtimer_mask(handle, true), "mask-unused-virtual-timer")
-    let exitTarget = Mutex<(cpu: hv_vcpu_t?, error: Int32)>((handle, 0))
-    let timerQueue = DispatchQueue(label: "LinuxMemoryLab.deadline")
-    let timer = DispatchSource.makeTimerSource(queue: timerQueue)
-    timer.setEventHandler {
-      exitTarget.withLock { target in
-        if var cpu = target.cpu {
-          let result = hv_vcpus_exit(&cpu, 1)
-          if result != 0, target.error == 0 { target.error = result }
-        }
-      }
-    }
-    let tick = DispatchTimeInterval.milliseconds(control == nil ? 500 : 2)
-    timer.schedule(deadline: .now() + tick, repeating: tick)
-    timer.resume()
-    defer {
-      exitTarget.withLock { $0.cpu = nil }
-      timer.cancel()
-      timerQueue.sync {}
-    }
+    let pool = CPUGroup()
+    cpus = pool
+    try pool.create(count: cpuCount)
+    _ = try pool.activate(0, pc: base + textOffset, context: dtbAddress)
     let deadline = ContinuousClock.now.advanced(by: .seconds(disk == nil ? 45 : 120))
     control?.state.withLock { $0.running = true }
     while control != nil || (dynamicMemory == nil ? !ready : !memoryComplete) {
       if let control, let vsock {
+        let releaseAlias = control.state.withLock {
+          let requested = $0.releaseAlias
+          $0.releaseAlias = false
+          return requested
+        }
+        if releaseAlias, let device = dynamicMemory {
+          try device.releaseAlias()
+          // Linux BUSY retry starts at50s; changed availability needs an explicit config event.
+          try requestMemory(device.requested)
+        }
+        control.state.withLock { $0.refusals = dynamicMemory?.refusals.count ?? 0 }
+        for network in networks {
+          try network.poll(memory: pointer, payloadMemory: dataPointer)
+          try check(
+            hv_gic_set_spi(network.transport.interrupt, network.transport.interruptStatus != 0),
+            "net-irq")
+        }
         let update = control.state.withLock { state in
           state.plugged = dynamicMemory?.plugged ?? 0
           return (state.stop, state.requested)
@@ -325,182 +338,246 @@ final class LinuxMachine {
       } else {
         try memoryProgress()
       }
-      try check(exitTarget.withLock { $0.error }, "watchdog-exit")
       guard ContinuousClock.now < deadline, exits < 3_000_000 else { throw Failure.deadline }
       running = true
-      let result = hv_vcpu_run(handle)
+      let events: [(Int, CPUExit)]
+      do { events = try pool.runEpoch() } catch {
+        running = false
+        throw error
+      }
       running = false
-      try check(result, "run")
-      exits += 1
-      lastPC = try register(HV_REG_PC)
-      let event = exitInfo!.pointee
-      if event.reason == HV_EXIT_REASON_CANCELED { continue }
-      guard event.reason == HV_EXIT_REASON_EXCEPTION else {
-        throw Failure.unexpectedExit(event.reason.rawValue, event.exception.syndrome, 0)
+      for (index, event) in events {
+        activeCPU = index
+        activeRegisters = event.registers
+        try handleExit(event)
+        try pool.update(index, registers: activeRegisters)
       }
-      let syndrome = event.exception.syndrome
-      switch syndrome >> 26 {
-      case 0x16:  // HVF resumes after HVC; advancing again skips Linux's next instruction.
-        let call = try register(HV_REG_X0)
-        switch call {
-        case 0x8400_0000: try set(HV_REG_X0, 2)
-        case 0x8400_0006: try set(HV_REG_X0, 2)
-        case 0x8400_000a: try set(HV_REG_X0, UInt64.max)
-        default: try set(HV_REG_X0, UInt64.max)
+    }
+  }
+  private func handleExit(_ event: CPUExit) throws {
+    exits += 1
+    lastPC = try register(HV_REG_PC)
+    if event.reason == HV_EXIT_REASON_CANCELED.rawValue { return }
+    guard event.reason == HV_EXIT_REASON_EXCEPTION.rawValue else {
+      throw Failure.unexpectedExit(event.reason, event.syndrome, 0)
+    }
+    let syndrome = event.syndrome
+    switch syndrome >> 26 {
+    case 0x16:  // HVF resumes after HVC; advancing again skips Linux's next instruction.
+      let call = try register(HV_REG_X0)
+      switch call {
+      case 0x8400_0000: try set(HV_REG_X0, 2)
+      case 0xc400_0003, 0x8400_0003:
+        let target = try register(HV_REG_X1)
+        let entry = try register(HV_REG_X2)
+        let context = try register(HV_REG_X3)
+        guard let cpus else { throw Failure.boundary }
+        if target < UInt64(cpuCount), entry >= base, entry < base + UInt64(capacity),
+          entry % 4 == 0
+        {
+          let started = try cpus.activate(Int(target), pc: entry, context: context)
+          try set(HV_REG_X0, started ? 0 : UInt64(bitPattern: -4))
+        } else {
+          try set(HV_REG_X0, UInt64(bitPattern: -2))
         }
-      case 0x18:
-        let op0 = (syndrome >> 20) & 3
-        let op1 = (syndrome >> 14) & 7
-        let crn = (syndrome >> 10) & 15
-        let crm = (syndrome >> 1) & 15
-        let op2 = (syndrome >> 17) & 7
-        let rt = UInt32((syndrome >> 5) & 31)
-        let read = syndrome & 1 != 0
-        guard op0 == 2, op1 == 0, crn == 1, op2 == 4 else {
-          throw Failure.unexpectedExit(event.reason.rawValue, syndrome, 0)
-        }
-        switch crm {
-        case 0 where !read:  // OSLAR: virtual OS lock state, no host debug access.
-          osLock = try rt != 31 && register(hv_reg_t(rawValue: rt)) & 1 != 0
-        case 1 where read:  // OSLSR: architectural OS lock model, bit1 is OSLK.
-          if rt != 31 { try set(hv_reg_t(rawValue: rt), 8 | (osLock ? 2 : 0)) }
-        case 3:  // OSDLR is RAZ/WI on the virtual debug interface.
-          if read, rt != 31 { try set(hv_reg_t(rawValue: rt), 0) }
-        default: throw Failure.unexpectedExit(event.reason.rawValue, syndrome, 0)
-        }
-        try set(HV_REG_PC, register(HV_REG_PC) + 4)
-      case 0x24:
-        guard syndrome & (1 << 24) != 0 else {
-          throw Failure.unexpectedExit(
-            event.reason.rawValue, syndrome, event.exception.physical_address)
-        }
-        let address = event.exception.physical_address
-        let rt = UInt32((syndrome >> 16) & 31)
-        let width = 1 << Int((syndrome >> 22) & 3)
-        if address >= 0x0a00_3000, address < 0x0a00_4000, let vsock {
-          let write = syndrome & 64 != 0
-          let offset = address - 0x0a00_3000
-          let value: UInt64
-          if offset >= 0x100 {
-            guard !write, width <= 4, offset <= 0x104 else { throw Failure.protocolError }
-            value = offset == 0x100 ? 3 : 0
-          } else {
-            guard width == 4, offset % 4 == 0 else { throw Failure.protocolError }
-            if write {
-              let raw = UInt32(
-                truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
-              if try vsock.transport.write(offset, raw, memory: pointer) {
-                try vsock.notify(raw, memory: pointer, payloadMemory: dataPointer)
-              }
-              value = 0
-            } else {
-              value = UInt64(vsock.transport.read(offset))
-            }
-          }
-          try check(hv_gic_set_spi(38, vsock.transport.interruptStatus != 0), "vsock-irq")
-          if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
-          try set(HV_REG_PC, register(HV_REG_PC) + 4)
-          continue
-        }
-        if address >= 0x0a00_2000, address < 0x0a00_3000, let rootDisk {
-          let write = syndrome & 64 != 0
-          let value = try blockMMIO(
-            address - 0x0a00_2000, width: width,
-            write: write
-              ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
-              : nil,
-            target: rootDisk)
-          if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
-          try set(HV_REG_PC, register(HV_REG_PC) + 4)
-          continue
-        }
-        if address >= 0x0a00_1000, address < 0x0a00_2000, disk != nil {
-          let write = syndrome & 64 != 0
-          let value = try blockMMIO(
-            address - 0x0a00_1000, width: width,
-            write: write
-              ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
-              : nil)
-          if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
-          try set(HV_REG_PC, register(HV_REG_PC) + 4)
-          continue
-        }
-        if address >= 0x0a00_0000, address < 0x0a00_1000, dynamicMemory != nil {
-          let write = syndrome & 64 != 0
-          let value = try memoryMMIO(
-            address - 0x0a00_0000, width: width,
-            write: write
-              ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
-              : nil)
-          if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
-          try set(HV_REG_PC, register(HV_REG_PC) + 4)
-          continue
-        }
-        guard address >= 0x0900_0000, address < 0x0900_1000, width <= 4 else {
-          throw Failure.unexpectedExit(event.reason.rawValue, syndrome, address)
-        }
-        let offset = address - 0x0900_0000
-        let reg = hv_reg_t(rawValue: rt)
-        if syndrome & 64 != 0 {
-          let value = rt == 31 ? 0 : try register(reg)
-          if offset == 0 {
-            guard console.count < 2 << 20, line.count < 8192 else { throw Failure.boundary }
-            let byte = UInt8(truncatingIfNeeded: value)
-            console.append(byte)
-            line.append(byte)
-            if byte == 10 {
-              try consoleSink?.write(contentsOf: line)
-              try consoleLine(String(decoding: line, as: UTF8.self))
-              line.removeAll(keepingCapacity: true)
-            }
-          } else if offset == 0x38 {
-            uartMask = value
-            try uartIRQ()
-          } else if offset == 0x44 {
-            try uartIRQ()
-          }
-        } else if rt != 31 {
-          let value: UInt64
-          switch offset {
-          case 0:
-            if inputOffset < input.count {
-              value = UInt64(input[inputOffset])
-              inputOffset += 1
-              try uartIRQ()
-            } else {
-              value = 0
-            }
-          case 0x18: value = inputOffset < input.count ? 0x81 : 0x91
-          case 0x38: value = uartMask
-          case 0x3c: value = inputOffset < input.count ? 16 : 0
-          case 0x40: value = inputOffset < input.count ? uartMask & 16 : 0
-          case 0xfe0: value = 0x11
-          case 0xfe4: value = 0x10
-          case 0xfe8: value = 0x14
-          case 0xfec: value = 0
-          case 0xff0: value = 0x0d
-          case 0xff4: value = 0xf0
-          case 0xff8: value = 0x05
-          case 0xffc: value = 0xb1
-          default: value = 0
-          }
-          try set(reg, value)
-        }
-        try set(HV_REG_PC, register(HV_REG_PC) + 4)
-      default:
+      case 0xc400_0004, 0x8400_0004:
+        let target = try register(HV_REG_X1)
+        try set(
+          HV_REG_X0,
+          target < UInt64(cpuCount) ? (cpus!.powered(Int(target)) ? 0 : 1) : UInt64(bitPattern: -2))
+      case 0x8400_0006: try set(HV_REG_X0, 2)
+      case 0x8400_000a: try set(HV_REG_X0, UInt64.max)
+      default: try set(HV_REG_X0, UInt64.max)
+      }
+    case 0x18:
+      let op0 = (syndrome >> 20) & 3
+      let op1 = (syndrome >> 14) & 7
+      let crn = (syndrome >> 10) & 15
+      let crm = (syndrome >> 1) & 15
+      let op2 = (syndrome >> 17) & 7
+      let rt = UInt32((syndrome >> 5) & 31)
+      let read = syndrome & 1 != 0
+      guard op0 == 2, op1 == 0, crn == 1, op2 == 4 else {
+        throw Failure.unexpectedExit(event.reason, syndrome, 0)
+      }
+      switch crm {
+      case 0 where !read:  // OSLAR: virtual OS lock state, no host debug access.
+        osLock = try rt != 31 && register(hv_reg_t(rawValue: rt)) & 1 != 0
+      case 1 where read:  // OSLSR: architectural OS lock model, bit1 is OSLK.
+        if rt != 31 { try set(hv_reg_t(rawValue: rt), 8 | (osLock ? 2 : 0)) }
+      case 3:  // OSDLR is RAZ/WI on the virtual debug interface.
+        if read, rt != 31 { try set(hv_reg_t(rawValue: rt), 0) }
+      default: throw Failure.unexpectedExit(event.reason, syndrome, 0)
+      }
+      try set(HV_REG_PC, register(HV_REG_PC) + 4)
+    case 0x24:
+      guard syndrome & (1 << 24) != 0 else {
         throw Failure.unexpectedExit(
-          event.reason.rawValue, syndrome, event.exception.physical_address)
+          event.reason, syndrome, event.physicalAddress)
       }
+      let address = event.physicalAddress
+      let rt = UInt32((syndrome >> 16) & 31)
+      let width = 1 << Int((syndrome >> 22) & 3)
+      if address >= 0x0a00_4000, address < 0x0a00_6000 {
+        let index = Int((address - 0x0a00_4000) / 0x1000)
+        guard networks.indices.contains(index) else { throw Failure.boundary }
+        let network = networks[index]
+        let offset = (address - 0x0a00_4000) % 0x1000
+        let write = syndrome & 64 != 0
+        let value: UInt64
+        if offset >= 0x100 {
+          let config = network.config()
+          guard !write, width <= 4, offset - 0x100 + UInt64(width) <= config.count else {
+            throw Failure.boundary
+          }
+          value = (0..<width).reduce(0) {
+            $0 | UInt64(config[Int(offset - 0x100) + $1]) << ($1 * 8)
+          }
+        } else {
+          guard width == 4, offset % 4 == 0 else { throw Failure.boundary }
+          if write {
+            _ = try network.transport.write(
+              offset,
+              UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt))),
+              memory: pointer)
+            try network.poll(memory: pointer, payloadMemory: dataPointer)
+            value = 0
+          } else {
+            value = UInt64(network.transport.read(offset))
+          }
+        }
+        try check(
+          hv_gic_set_spi(network.transport.interrupt, network.transport.interruptStatus != 0),
+          "net-irq")
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
+      if address >= 0x0a00_3000, address < 0x0a00_4000, let vsock {
+        let write = syndrome & 64 != 0
+        let offset = address - 0x0a00_3000
+        let value: UInt64
+        if offset >= 0x100 {
+          guard !write, width <= 4, offset <= 0x104 else { throw Failure.protocolError }
+          value = offset == 0x100 ? 3 : 0
+        } else {
+          guard width == 4, offset % 4 == 0 else { throw Failure.protocolError }
+          if write {
+            let raw = UInt32(
+              truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
+            if try vsock.transport.write(offset, raw, memory: pointer) {
+              try vsock.notify(raw, memory: pointer, payloadMemory: dataPointer)
+            }
+            value = 0
+          } else {
+            value = UInt64(vsock.transport.read(offset))
+          }
+        }
+        try check(hv_gic_set_spi(38, vsock.transport.interruptStatus != 0), "vsock-irq")
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
+      if address >= 0x0a00_2000, address < 0x0a00_3000, let rootDisk {
+        let write = syndrome & 64 != 0
+        let value = try blockMMIO(
+          address - 0x0a00_2000, width: width,
+          write: write
+            ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
+            : nil,
+          target: rootDisk)
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
+      if address >= 0x0a00_1000, address < 0x0a00_2000, disk != nil {
+        let write = syndrome & 64 != 0
+        let value = try blockMMIO(
+          address - 0x0a00_1000, width: width,
+          write: write
+            ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
+            : nil)
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
+      if address >= 0x0a00_0000, address < 0x0a00_1000, dynamicMemory != nil {
+        let write = syndrome & 64 != 0
+        let value = try memoryMMIO(
+          address - 0x0a00_0000, width: width,
+          write: write
+            ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
+            : nil)
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
+      guard address >= 0x0900_0000, address < 0x0900_1000, width <= 4 else {
+        throw Failure.unexpectedExit(event.reason, syndrome, address)
+      }
+      let offset = address - 0x0900_0000
+      let reg = hv_reg_t(rawValue: rt)
+      if syndrome & 64 != 0 {
+        let value = rt == 31 ? 0 : try register(reg)
+        if offset == 0 {
+          guard console.count < 2 << 20, line.count < 8192 else { throw Failure.boundary }
+          let byte = UInt8(truncatingIfNeeded: value)
+          console.append(byte)
+          line.append(byte)
+          if byte == 10 {
+            try consoleSink?.write(contentsOf: line)
+            try consoleLine(String(decoding: line, as: UTF8.self))
+            line.removeAll(keepingCapacity: true)
+          }
+        } else if offset == 0x38 {
+          uartMask = value
+          try uartIRQ()
+        } else if offset == 0x44 {
+          try uartIRQ()
+        }
+      } else if rt != 31 {
+        let value: UInt64
+        switch offset {
+        case 0:
+          if inputOffset < input.count {
+            value = UInt64(input[inputOffset])
+            inputOffset += 1
+            try uartIRQ()
+          } else {
+            value = 0
+          }
+        case 0x18: value = inputOffset < input.count ? 0x81 : 0x91
+        case 0x38: value = uartMask
+        case 0x3c: value = inputOffset < input.count ? 16 : 0
+        case 0x40: value = inputOffset < input.count ? uartMask & 16 : 0
+        case 0xfe0: value = 0x11
+        case 0xfe4: value = 0x10
+        case 0xfe8: value = 0x14
+        case 0xfec: value = 0
+        case 0xff0: value = 0x0d
+        case 0xff4: value = 0xf0
+        case 0xff8: value = 0x05
+        case 0xffc: value = 0xb1
+        default: value = 0
+        }
+        try set(reg, value)
+      }
+      try set(HV_REG_PC, register(HV_REG_PC) + 4)
+    default:
+      throw Failure.unexpectedExit(
+        event.reason, syndrome, event.physicalAddress)
     }
   }
   func close() -> [String] {
     var errors: [String] = []
+    guard pthread_equal(thread, pthread_self()) != 0 else { return ["coordinator-thread"] }
+    if let cpus {
+      let failures = cpus.close()
+      guard failures.isEmpty else { return failures }
+    }
     do { try requireStopped() } catch { return [String(describing: error)] }
-    if let cpu {
-      let result = hv_vcpu_destroy(cpu)
-      guard result == 0 else { return ["cpu-destroy \(result)"] }
-      self.cpu = nil
-      exitInfo = nil
+    for network in networks {
+      do { try network.close() } catch { errors.append("net-close \(error)") }
     }
     do { try rootDisk?.close() } catch { errors.append("root-disk-close \(error)") }
     do { try disk?.close() } catch { errors.append("disk-close \(error)") }

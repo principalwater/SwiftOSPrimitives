@@ -30,6 +30,8 @@ final class NativeControl: Sendable {
     var joinComplete = false
     var joinError: Int32 = 0
     var pendingDials: Set<UInt32> = []
+    var releaseAlias = false
+    var refusals = 0
     var requested = UInt64(MemoryDevice.capacity)
     var plugged: UInt64 = 0
     var error = ""
@@ -46,19 +48,27 @@ final class NativeControl: Sendable {
   let console: URL
   let held: Bool
   let alias: Bool
+  let cpus: Int
+  let networks: [IsolatedNetwork]
 
-  init(kernel: URL, initfs: URL, rootfs: URL, console: URL, held: Bool, alias: Bool) {
+  init(
+    kernel: URL, initfs: URL, rootfs: URL, console: URL, held: Bool, alias: Bool, cpus: Int = 1,
+    networks: [IsolatedNetwork] = []
+  ) {
     self.kernel = kernel
     self.initfs = initfs
     self.rootfs = rootfs
     self.console = console
     self.held = held
     self.alias = alias
+    self.cpus = cpus
+    self.networks = networks
   }
   func run() {
     let machine = LinuxMachine()
     machine.control = self
     machine.capacity = 1024 << 20
+    machine.cpuCount = cpus
     machine.dynamicMemory = MemoryDevice(held: held, aliasControl: alias)
     let lease = NativeProcessLease.claimed.withLock { claimed -> Bool in
       guard !claimed else { return false }
@@ -71,6 +81,7 @@ final class NativeControl: Sendable {
       machine.disk = try BlockDevice(path: initfs.path, readOnly: true)
       machine.rootDisk = try BlockDevice(path: rootfs.path, interrupt: 37)
       machine.vsock = VsockDevice(control: self)
+      for network in networks { machine.networks.append(try NetworkDevice(network: network)) }
       let consoleDescriptor = open(
         console.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
       guard consoleDescriptor >= 0 else {
@@ -104,6 +115,13 @@ final class NativeControl: Sendable {
       "primaryError": primary, "cleanupErrors": cleanup,
       "vmCreated": machine.wasCreated, "vmDestroyed": machine.wasCreated && !machine.created,
       "memoryObservations": machine.dynamicMemory?.observations ?? [],
+      "memoryRefusals": machine.dynamicMemory?.refusals ?? [],
+      "networks": machine.networks.map {
+        ["index": $0.index, "txPackets": $0.txPackets, "rxPackets": $0.rxPackets]
+      },
+      "cpus": machine.cpus?.statistics ?? [],
+      "quiescentEpochs": machine.cpus?.epoch ?? 0,
+      "maximumScheduledVCPUs": machine.cpus?.maximumScheduled ?? 0,
       "exits": machine.exits, "lastPC": String(machine.lastPC, radix: 16),
       "physicalReleasedBytes": NSNull(), "backend": "Swift HVF / Containerization0.47.0",
     ]
@@ -119,7 +137,7 @@ final class NativeControl: Sendable {
 
 }
 
-/// Finite, NIC-free research backend for the current Apple Containerization API.
+/// Finite, private-NIC research backend for the current Apple Containerization API.
 public final class NativeVirtualMachineManager: VirtualMachineManager {
   public let kernel: URL
   public let initfs: URL
@@ -143,12 +161,18 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public var instance: NativeVirtualMachine? { owner.withLock { $0 } }
   public func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
     let config = config.configuration
-    guard config.cpus == 1, config.memoryInBytes == 1152 << 20,
-      config.interfaces.isEmpty, !config.nestedVirtualization, config.extensions.isEmpty,
+    guard (1...4).contains(config.cpus), config.memoryInBytes == 1152 << 20,
+      config.interfaces.count <= 2, !config.nestedVirtualization, config.extensions.isEmpty,
       config.mountsByID.count == 1, let entry = config.mountsByID.first,
       let mount = entry.value.first, mount.type == "ext4", mount.destination == "/",
       case .virtioblk(let blockOptions) = mount.runtimeOptions, blockOptions.isEmpty
     else { throw NativeFailure.unsupported }
+    let networks = try config.interfaces.enumerated().map { index, interface in
+      guard let network = interface as? IsolatedNetwork, network.index == index else {
+        throw NativeFailure.unsupported
+      }
+      return network
+    }
     var attachments = [
       AttachedFilesystem(
         type: mount.type, source: "/dev/vdb", destination: mount.destination, options: mount.options
@@ -166,7 +190,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     }
     let control = NativeControl(
       kernel: kernel, initfs: initfs, rootfs: URL(filePath: mount.source),
-      console: console, held: held, alias: aliasControl)
+      console: console, held: held, alias: aliasControl, cpus: config.cpus, networks: networks)
     let machine = NativeVirtualMachine(
       control: control, group: group, id: entry.key,
       attachments: attachments)
@@ -203,6 +227,17 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
     return
       (try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]))
       ?? Data()
+  }
+  public var processorCount: Int { control.cpus }
+  public var networkCount: Int { control.networks.count }
+  public var aliasDiagnosticEnabled: Bool { control.alias }
+  public var refusalCount: Int { control.state.withLock { $0.refusals } }
+  /// Releases only the deliberately retained diagnostic alias, on the coordinator.
+  public func releaseDiagnosticAlias() throws {
+    try control.state.withLock {
+      guard control.alias, $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
+      $0.releaseAlias = true
+    }
   }
   public var pluggedBytes: UInt64 { control.state.withLock { $0.plugged } }
   public func requestMemory(bytes: UInt64) throws {

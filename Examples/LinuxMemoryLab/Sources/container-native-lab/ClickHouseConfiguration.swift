@@ -2,7 +2,7 @@ enum ClickHouseConfiguration {
   static let configuration = """
     <clickhouse><logger><level>warning</level><log>/data/server.log</log><errorlog>/data/server.err.log</errorlog><size>1M</size><count>1</count></logger>
     <path>/data/store/</path><tmp_path>/data/tmp/</tmp_path><user_files_path>/data/user_files/</user_files_path><users_config>/lab/users.xml</users_config>
-    <listen_host>127.0.0.1</listen_host><tcp_port>9000</tcp_port><max_server_memory_usage>671088640</max_server_memory_usage>
+    <listen_host>127.0.0.1</listen_host><tcp_port>9000</tcp_port><http_port>8123</http_port><max_server_memory_usage>671088640</max_server_memory_usage>
     <max_thread_pool_size>64</max_thread_pool_size><background_pool_size>2</background_pool_size><background_schedule_pool_size>2</background_schedule_pool_size>
     <background_streaming_schedule_pool_size>1</background_streaming_schedule_pool_size><background_move_pool_size>1</background_move_pool_size><background_fetches_pool_size>1</background_fetches_pool_size><background_common_pool_size>1</background_common_pool_size>
     <background_message_broker_schedule_pool_size>1</background_message_broker_schedule_pool_size><background_distributed_schedule_pool_size>1</background_distributed_schedule_pool_size><background_buffer_flush_schedule_pool_size>1</background_buffer_flush_schedule_pool_size>

@@ -10,7 +10,13 @@ import NativeLinuxVMM
     case check(String)
   }
   static func main() async {
-    do { try await run() } catch {
+    var lease: SupervisionLease?
+    do {
+      lease = try SupervisionLease.install()
+      try await run()
+      try await lease?.close()
+    } catch {
+      do { try await lease?.close() } catch { print("SUPERVISOR_LEASE_CLOSE_FAIL \(error)") }
       print("CONTAINER_NATIVE_FAIL \(error)")
       exit(1)
     }
@@ -20,7 +26,7 @@ import NativeLinuxVMM
     guard args.count >= 5 else { throw Failure.arguments }
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
-        || args.count == 6 && ["memory", "held", "alias"].contains(args[4])
+        || args.count == 6 && ["memory", "held", "alias", "crash", "recover"].contains(args[4])
     else { throw Failure.arguments }
     let output = URL(filePath: args[3])
     guard !FileManager.default.fileExists(atPath: output.path) else { throw Failure.arguments }
@@ -31,21 +37,27 @@ import NativeLinuxVMM
       try await LifecycleCheck.run(args: args, output: output)
       return
     }
+    guard let cpus = Int(ProcessInfo.processInfo.environment["SWIFTOS_LAB_CPUS"] ?? "2"),
+      (1...4).contains(cpus)
+    else { throw Failure.arguments }
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     let manager = NativeVirtualMachineManager(
       kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
       console: output.appending(path: "console.log"), held: args[4] == "held",
       aliasControl: args[4] == "alias", group: group)
+    let links = try (0..<2).map { try IsolatedNetwork(index: $0) }
+    let peers = links.map { EthernetPeer(link: $0) }
+    let peerTasks = peers.map { peer in Task { try await peer.run() } }
     let serverOutput = BoundedOutput()
     let smoke = args[4] == "smoke"
     let container = try LinuxContainer(
       "swiftos-native",
       rootfs: .block(format: "ext4", source: args[2], destination: "/"),
-      vmm: manager, vm: .init(cpus: 1, memoryInBytes: 1152 << 20)
+      vmm: manager, vm: .init(cpus: cpus, memoryInBytes: 1152 << 20)
     ) { config in
-      config.cpus = 1
+      config.cpus = cpus
       config.memoryInBytes = 896 << 20
-      config.interfaces = []
+      config.interfaces = links
       config.process.arguments =
         smoke
         ? ["/usr/bin/clickhouse", "--version"]
@@ -65,6 +77,14 @@ import NativeLinuxVMM
       if !smoke {
         let agent = try await vm.dialAgent()
         do {
+          // The measured two-NIC control plane exceeds stock80MiB memory.high.
+          // Preserve throttling and add a hard ceiling instead of removing resource limits.
+          try await agent.writeFile(
+            path: "/sys/fs/cgroup/vminitd/memory.max", data: Data("134217728".utf8),
+            flags: .init(create: false), mode: 0)
+          try await agent.writeFile(
+            path: "/sys/fs/cgroup/vminitd/memory.high", data: Data("100663296".utf8),
+            flags: .init(create: false), mode: 0)
           let base = "/run/container/swiftos-native/rootfs"
           try await agent.mkdir(path: base + "/lab", all: true, perms: 0o700)
           try await agent.mkdir(path: base + "/data", all: true, perms: 0o700)
@@ -82,6 +102,7 @@ import NativeLinuxVMM
       }
       try await container.start()
       print("CONTAINER_STARTED")
+      fflush(nil)
       if smoke {
         let status = try await container.wait(timeoutInSeconds: 10)
         guard status.exitCode == 0, serverOutput.text.contains("ClickHouse") else {
@@ -90,12 +111,17 @@ import NativeLinuxVMM
         checked = true
       } else {
         checked = try await workload(
-          container: container, vm: vm, output: output, probe: URL(filePath: args[5]))
+          container: container, vm: vm, output: output, probe: URL(filePath: args[5]), mode: args[4]
+        )
         try await container.kill(.term)
         let status = try await container.wait(timeoutInSeconds: 10)
         guard status.exitCode == 0 else { throw Failure.check("server-exit") }
       }
     } catch { primary = String(describing: error) }
+    for peer in peers { peer.stop() }
+    for task in peerTasks {
+      do { try await task.value } catch { cleanup.append("peer-stop \(error)") }
+    }
     let stopping = Task { @concurrent in
       var failures: [String] = []
       do { try await container.stop() } catch { failures.append("container-stop \(error)") }
@@ -105,11 +131,15 @@ import NativeLinuxVMM
       do { try await group.shutdownGracefully() } catch { failures.append("group-stop \(error)") }
       return failures
     }
-    cleanup = await stopping.value
+    cleanup += await stopping.value
+    for link in links {
+      do { try link.close() } catch { cleanup.append("link-close \(error)") }
+    }
     let native = manager.instance?.result ?? Data()
     try native.write(to: output.appending(path: "native.json"), options: .withoutOverwriting)
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
+      "networkEchoes": peers.map(\.echoed),
       "checked": checked, "serverOutput": serverOutput.text,
       "serverOutputOverflow": serverOutput.overflowed, "physicalReleasedBytes": NSNull(),
     ]

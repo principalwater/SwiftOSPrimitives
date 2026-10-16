@@ -18,6 +18,8 @@ final class MemoryDevice {
   let held: Bool
   let aliasControl: Bool
   var aliasAddress: UInt64?
+  var aliasReleased = false
+  var refusals: [[String: Any]] = []
   let transport = VirtioMMIO(
     identity: 24, features: 1 << 1, interrupt: 35,
     requiredFeatures: (1 << 32) | 2)
@@ -60,7 +62,9 @@ final class MemoryDevice {
     var state: UInt16 = 0
     if kind == 2 {
       // Startup/reset only: the standard driver guarantees no active users here.
-      for index in extents.indices { try retire(index) }
+      if try !retire(Array(extents.indices.filter { extents[$0].plugged || extents[$0].mapped })) {
+        response = 2
+      }
     } else if kind <= 3 {
       guard blocks > 0, address >= Self.base,
         (address - Self.base) % UInt64(Self.block) == 0,
@@ -82,7 +86,7 @@ final class MemoryDevice {
         if indices.contains(where: { !extents[$0].plugged }) {
           response = 3
         } else {
-          for index in indices { try retire(index) }
+          if try !retire(Array(indices)) { response = 2 }
         }
       case 3:
         let count = indices.filter { extents[$0].plugged }.count
@@ -108,6 +112,9 @@ final class MemoryDevice {
     extent.freshAllocation = extent.pointer == nil
     if extent.freshAllocation { try native(hv_vm_allocate(&extent.pointer, Self.block, 0)) }
     guard let pointer = extent.pointer else { throw DeviceFailure.request }
+    try native(
+      mach_vm_inherit(
+        mach_task_self_, UInt64(UInt(bitPattern: pointer)), UInt64(Self.block), VM_INHERIT_NONE))
     // Held pages also regain zero semantics, never expose an old guest's data.
     memset(pointer, 0, Self.block)
     // Ordinary Linux RAM: guest stage1 enforces code permissions; host alias stays RW/NX.
@@ -117,7 +124,7 @@ final class MemoryDevice {
         UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
     extent.mapped = true
     extent.plugged = true
-    if aliasControl, index == 0, aliasAddress == nil {
+    if aliasControl, !aliasReleased, index == 32, aliasAddress == nil {
       var target: UInt64 = 0
       var current: vm_prot_t = 0
       var maximum: vm_prot_t = 0
@@ -129,17 +136,26 @@ final class MemoryDevice {
       aliasAddress = target
     }
   }
-  private func retire(_ index: Int) throws {
-    let extent = extents[index]
-    guard extent.plugged || extent.mapped else { return }
-    guard observations.count < 1024 else { throw DeviceFailure.request }
-    if extent.mapped {
-      try native(hv_vm_unmap(Self.base + UInt64(index * Self.block), Self.block))
-      extent.mapped = false
+  private struct OwnershipRefusal: Error {
+    let detail: String
+    init(_ detail: String) { self.detail = detail }
+  }
+  private struct Retirement {
+    let index: Int
+    let pointer: UnsafeMutableRawPointer
+    let info: vm_region_submap_info_data_64_t
+    let size: UInt64
+  }
+  func releaseAlias() throws {
+    try confined()
+    if let address = aliasAddress {
+      try native(mach_vm_deallocate(mach_task_self_, address, UInt64(Self.block)))
+      aliasAddress = nil
     }
-    extent.plugged = false
-    guard let pointer = extent.pointer else { return }
-    let before = try ProcessMemorySnapshot.capture()
+    aliasReleased = true
+  }
+  private func inspect(_ index: Int) throws -> Retirement {
+    guard let pointer = extents[index].pointer else { throw DeviceFailure.request }
     var address = UInt64(UInt(bitPattern: pointer))
     let original = address
     var size: UInt64 = 0
@@ -158,32 +174,81 @@ final class MemoryDevice {
       info.ref_count == 1, info.pages_wired == 0,
       info.user_wired_count == 0
     else {
-      throw DeviceFailure.observation(
+      throw OwnershipRefusal(
         "index=\(index) start=\(address) original=\(original) size=\(size) offset=\(info.offset) count=\(count) submap=\(info.is_submap) external=\(info.external_pager) shadow=\(info.shadow_depth) object=\(info.object_id_full) refs=\(info.ref_count) swapped=\(info.pages_swapped_out) wired=\(info.pages_wired) userWired=\(info.user_wired_count)"
       )
     }
-    // Paged-out pages are still owned; deallocate them without counting them as resident RAM.
-    if !held {
-      try native(hv_vm_deallocate(pointer, Self.block))
-      extent.pointer = nil
-      try requireAbsent(original)
+    return Retirement(index: index, pointer: pointer, info: info, size: size)
+  }
+  private func restore(_ indices: [Int]) throws {
+    for index in indices {
+      let extent = extents[index]
+      guard let pointer = extent.pointer, extent.plugged, !extent.mapped else {
+        throw DeviceFailure.request
+      }
+      try native(
+        hv_vm_map(
+          pointer, Self.base + UInt64(index * Self.block), Self.block,
+          UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
+      extent.mapped = true
     }
-    let after = try ProcessMemorySnapshot.capture()
-    observations.append([
-      "index": index, "held": held,
-      "nativeEntryBytes": size, "nativeObjectOffset": info.offset,
-      "freshAllocation": extent.freshAllocation, "hostInitializedBytes": Self.block,
-      "residentObservationIncludesHostZeroing": true, "oldVirtualRangeAbsent": !held,
-      "objectID": info.object_id_full,
-      "residentPagesBefore": info.pages_resident,
-      "pagedOutPagesBefore": info.pages_swapped_out,
-      "residentBytesObservedBefore": UInt64(info.pages_resident)
-        * UInt64(sysconf(Int32(_SC_PAGESIZE))),
-      "ownerVirtualBytesDeallocated": held ? 0 : Self.block, "referenceCount": info.ref_count,
-      "footprintBefore": before.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
-      "footprintAfter": after.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
-      "physicalReleasedBytes": NSNull(),
-    ])
+  }
+  private func retire(_ indices: [Int]) throws -> Bool {
+    guard observations.count + indices.count <= 1024,
+      indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
+      )
+    else { throw DeviceFailure.request }
+    var unmapped: [Int] = []
+    for index in indices {
+      let extent = extents[index]
+      guard extent.plugged else { throw DeviceFailure.request }
+      if extent.mapped {
+        try native(hv_vm_unmap(Self.base + UInt64(index * Self.block), Self.block))
+        extent.mapped = false
+        unmapped.append(index)
+      }
+    }
+    let plans: [Retirement]
+    do { plans = try indices.map(inspect) } catch let refusal as OwnershipRefusal {
+      // BUSY is legal only before any object has been freed and after full remapping.
+      try restore(unmapped)
+      guard refusals.count < 128 else { throw DeviceFailure.request }
+      refusals.append([
+        "reason": refusal.detail, "unmappedThenRestored": unmapped.count,
+        "ownedBytesDeallocated": 0, "reply": "BUSY",
+      ])
+      return false
+    }
+    // Native errors after this point are fatal; released guest data cannot be rolled back.
+    for plan in plans {
+      let index = plan.index
+      let extent = extents[index]
+      let before = try ProcessMemorySnapshot.capture()
+      if !held {
+        try native(hv_vm_deallocate(plan.pointer, Self.block))
+        extent.pointer = nil
+        try requireAbsent(UInt64(UInt(bitPattern: plan.pointer)))
+      }
+      extent.plugged = false
+      let after = try ProcessMemorySnapshot.capture()
+      observations.append([
+        "index": index, "held": held,
+        "nativeEntryBytes": plan.size, "nativeObjectOffset": plan.info.offset,
+        "freshAllocation": extent.freshAllocation, "hostInitializedBytes": Self.block,
+        "residentObservationIncludesHostZeroing": true, "oldVirtualRangeAbsent": !held,
+        "objectID": plan.info.object_id_full,
+        "residentPagesBefore": plan.info.pages_resident,
+        "pagedOutPagesBefore": plan.info.pages_swapped_out,
+        "residentBytesObservedBefore": UInt64(plan.info.pages_resident)
+          * UInt64(sysconf(Int32(_SC_PAGESIZE))),
+        "ownerVirtualBytesDeallocated": held ? 0 : Self.block,
+        "referenceCount": plan.info.ref_count,
+        "footprintBefore": before.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
+        "footprintAfter": after.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
+        "physicalReleasedBytes": NSNull(),
+      ])
+    }
+    return true
   }
   private func requireAbsent(_ original: UInt64) throws {
     var start = original

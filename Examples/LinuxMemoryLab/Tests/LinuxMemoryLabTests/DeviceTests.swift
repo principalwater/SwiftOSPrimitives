@@ -124,7 +124,7 @@ func requiresVersionAndOfferedFeatures(_ missingMemoryFeature: Bool) throws {
   }
   try JSONSerialization.data(withJSONObject: [
     "root": root.path, "uid": Int(getuid()),
-    "purpose": "isolated-container-native-G18",
+    "purpose": "isolated-container-smp-G19",
   ])
   .write(to: marker, options: .withoutOverwriting)
   let descriptor = open(disk.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)

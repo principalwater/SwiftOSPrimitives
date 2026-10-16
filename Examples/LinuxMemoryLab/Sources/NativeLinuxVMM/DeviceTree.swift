@@ -1,6 +1,6 @@
 import Foundation
 
-// FDT v17 binary encoding, scoped to the isolated one-CPU ARM64 machine.
+// FDT v17 binary encoding, scoped to the isolated ARM64 machine.
 struct DeviceTree {
   private var structure = Data()
   private var strings = Data()
@@ -54,7 +54,7 @@ struct DeviceTree {
 
   static func linux(
     memoryBytes: UInt64, initrd: Range<UInt64>, command: String, memoryDevice: Bool = false,
-    blockDevice: Bool = false, container: Bool = false
+    blockDevice: Bool = false, container: Bool = false, cpuCount: Int = 1, networkCount: Int = 0
   ) -> Data {
     var tree = Self()
     tree.begin("")
@@ -70,12 +70,14 @@ struct DeviceTree {
     tree.begin("cpus")
     tree.property("#address-cells", cells(1))
     tree.property("#size-cells", cells(0))
-    tree.begin("cpu@0")
-    tree.property("device_type", string("cpu"))
-    tree.property("compatible", string("arm,arm-v8"))
-    tree.property("reg", cells(0))
-    tree.property("enable-method", string("psci"))
-    tree.end()
+    for index in 0..<cpuCount {
+      tree.begin("cpu@\(index)")
+      tree.property("device_type", string("cpu"))
+      tree.property("compatible", string("arm,arm-v8"))
+      tree.property("reg", cells(UInt32(index)))
+      tree.property("enable-method", string("psci"))
+      tree.end()
+    }
     tree.end()
     tree.begin("psci")
     tree.property("compatible", string("arm,psci-0.2"))
@@ -136,6 +138,15 @@ struct DeviceTree {
         tree.property("interrupts", cells(0, UInt32(irq), 4))
         tree.end()
       }
+    }
+    for index in 0..<networkCount {
+      let address = UInt64(0x0a00_4000 + index * 0x1000)
+      tree.begin("virtio_mmio@\(String(address, radix: 16))")
+      tree.property("compatible", string("virtio,mmio"))
+      tree.property("dma-coherent", Data())
+      tree.property("reg", range(address, 0x1000))
+      tree.property("interrupts", cells(0, UInt32(7 + index), 4))
+      tree.end()
     }
     tree.begin("chosen")
     tree.property("stdout-path", string("/pl011@9000000"))

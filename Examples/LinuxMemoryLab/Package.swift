@@ -22,13 +22,19 @@ let package = Package(
       dependencies: [
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
         .product(name: "Containerization", package: "containerization"),
+        .product(name: "ContainerizationExtras", package: "containerization"),
         .product(name: "NIOPosix", package: "swift-nio"),
       ]),
     .executableTarget(name: "linux-memory-lab", dependencies: ["NativeLinuxVMM"]),
+    .executableTarget(name: "container-recovery-lab"),
+    .executableTarget(name: "container-journal-lab", dependencies: [
+      .product(name: "ContainerizationEXT4", package: "containerization")
+    ]),
     .executableTarget(name: "container-native-lab", dependencies: ["NativeLinuxVMM"]),
     .executableTarget(
       name: "container-memory-probe",
       dependencies: [
+        "NativeLinux",
         .product(name: "PageMemory", package: "SwiftOSPrimitives")
       ]),
     .systemLibrary(name: "NativeLinux"),
@@ -38,5 +44,5 @@ let package = Package(
         "NativeLinux",
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
       ]),
-    .testTarget(name: "LinuxMemoryLabTests", dependencies: ["NativeLinuxVMM"]),
+    .testTarget(name: "LinuxMemoryLabTests", dependencies: ["NativeLinuxVMM", "container-native-lab"]),
   ], swiftLanguageModes: [.v6])

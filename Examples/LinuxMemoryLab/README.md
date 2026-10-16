@@ -1,9 +1,12 @@
 # Native Linux backing-memory lab
 
-Finite, NIC-free Swift HVF backend for Apple Containerization, plus the earlier
+Finite, SMP/private-NIC Swift HVF backend for Apple Containerization, plus the earlier
 standalone Linux experiment. Requires an Apple-silicon Mac, macOS27 deployment
 target/SDK and Swift6.4.1. This is optional research code; the root package's
 PageMemory/BoundedMemory products have no Containerization dependency.
+
+See [G19 measured qualification](QUALIFICATION.md) for the completed SMP/NIC,
+RAM-return controls and real process-crash recovery results and limitations.
 
 ## Current Apple container integration
 
@@ -31,24 +34,33 @@ verify with `codesign --verify --strict`. Never replace an installed container C
 or start its global service for these tests. This integrates the library backend
 used by the current release, not a complete fork of its installed CLI/service.
 
-The adapter deliberately admits one1vCPU VM with1GiB boot RAM plus128MiB
+The adapter admits one VM with1...4vCPUs, up to two private NICs,1GiB boot RAM plus128MiB
 virtio-mem RAM. It preserves standard OCI guest-only mounts and their options,
 masked/readonly paths, no-new-privileges and normal upstream setup. Extra block
-devices, virtiofs/host shares, shared-pod volumes, network interfaces, nested
+devices, virtiofs/host shares, shared-pod volumes, arbitrary host network interfaces, nested
 virtualization and VM extensions fail admission. The readonly init disk is vda;
 the disposable writable ClickHouse disk is vdb. The trusted hash-retained kernel
 is Linux6.18.35 with virtio-mem, hotplug/hotremove, GICv3, PL011, ext4, virtio-MMIO,
-block and vsock built in; this is not a stock Apple default-kernel claim.
+block, vsock and virtio-net built in; this is not a stock Apple default-kernel claim.
 
 Guest API transport is standard virtio-vsock over bounded native AF_UNIX
-socketpairs. There are no host listening ports or NICs. One synchronous pthread
-owns CPU execution, registers, RAM mappings, device state and native teardown.
+socketpairs. There are no host listening ports or NICs. One affine pthread per vCPU owns its native create/run/register/destroy calls.
+The coordinator receives exit/register values and can resolve RAM or emulate
+any device only after every scheduled vCPU is parked. Native exit cancellation
+is sent only to unparked workers; wake priority rotates to avoid starving a
+peer that has not entered the guest yet. Register snapshots include only values
+consumed by the actual exit. Cancellation and native execution-time counters
+make scheduling costs visible. PSCI CPU_ON and per-CPU FDT/MPIDR boot real SMP.
+The coordinator owns RAM mappings, device state and native teardown.
 The Swift concurrency bridge transfers only bounded commands/FD ownership through
 Mutex; it never lends guest RAM across an await. Start failure joins its worker
 before returning an error. Concurrent stop waits for the one actual pthread_join.
 Console files are created exclusively with O_EXCL/O_NOFOLLOW and0600; failed
 start cannot truncate an existing log. A process-wide lease refuses a second
-native VM and is released only after clean native destruction. The2ms watchdog may only request CPU exit; its serial queue
+native VM and is released only after clean native destruction. The upstream vminitd warning log level avoids one stop-all epoch per character
+of routine serial INFO output. Warning/error and kernel panic diagnostics plus
+structured CPU/NIC/memory/process evidence remain enabled. No query deadline or
+integrity check is removed. The2ms watchdog may only request CPU exit; its serial queue
 is drained before CPU destruction.
 
 ## Owned backing and revocation
@@ -57,11 +69,13 @@ The dynamic GPA region0x100000000 is not boot RAM. Sixty-four independently owne
 2MiB HVF allocations back standard virtio-mem. PLUG zeroes and maps before ACK.
 The guest must negotiate VERSION_1 and UNPLUGGED_INACCESSIBLE. Only the kernel's
 UNPLUG request authorizes revocation; API calls request policy, not physical free.
-The sole CPU is stopped throughout request execution.
+Every vCPU is stopped throughout request execution.
 
-UNPLUG removes stage2 mappings, checks exact native anonymous entry size/offset,
-exclusive reference count, no shadows/external pager/wiring, then deallocates the
-owned object before ACK. The old virtual range must be absent afterwards.
+UNPLUG first removes every stage2 mapping in the request and preflights every
+exact native anonymous entry size/offset, exclusive reference count and absence
+of shadows/external pager/wiring. Ownership refusal restores all original
+mappings before BUSY; no object has been freed. Once irreversible retirement
+starts, native failure is fatal. Success deallocates every owned object before ACK. The old virtual range must be absent afterwards.
 Unplugged GPA access fails the run, including instruction aborts and ISV=0. RAM
 payload pointers are resolved anew and split at allocation boundaries; queue
 metadata stays in boot RAM. Disk writes are bounded and F_NOCACHE avoids host
@@ -93,12 +107,25 @@ symbols when stripping a separate guest artifact.
 Disk admission requires a fresh COW copy named `artifacts/clickhouse-run-*.ext4`,
 8GiB logical capacity, single link, current uid, exclusive lock and an enclosing
 private root OWNER.json containing its canonical root, uid and research purpose
-`isolated-container-native-G18`. The marker is experiment-scoped, not a public
+`isolated-container-smp-G19`. The marker is experiment-scoped, not a public
 provisioning format. Never reuse a modified image or write to accepted ancestors.
 
 The ClickHouse workload is26.9.19.9, loopback-only inside the guest,896MiB cgroup
 limit,640MiB server bound,192MiB/8s/one-thread query limits and bounded scans/output.
+The two-NIC guest control plane uses memory.high96MiB and a hard memory.max128MiB
+(the upstream80MiB high threshold measurably throttled RPCs). No installed image
+is modified; only the isolated guest cgroup is configured through native RPC.
 Four100K-row batches have independent fixed count/id-sum/payload-hash/byte oracles.
+The current sustained-load query uses a bounded100K-row/100K-build hash join
+with two-key String storage retained during probing, a4s intentional dwell and
+an independent expected SUM(number)=4999950000. Full-table fixed integrity
+oracles still cover all400K rows before and after every cycle. This replaces the
+transient group-by peak, which does not guarantee a live allocation throughout
+revocation. Earlier query/window/native failures remain retained and unwaived.
+The existing Swift guest canary observes only the fixed load query IDs through
+bounded HTTP/1.0 on guest loopback8123. It checks status, framing and numeric
+results, uses finite socket deadlines and never exposes a host listener. This
+avoids starting a heavy clickhouse-client process inside the critical window.
 Two shrink/regrow cycles require a real identified query with at least16MiB live
 memory before and after UNPLUG, unchanged SQL aggregates and the intact canary.
 Guest capacity must decrease128MiB and return. Cgroup usage/limit, anon/cache,
@@ -107,12 +134,55 @@ at memory.max is an observation, not an OOM: the first strict-zero-max diagnosti
 failed and is retained separately. Hard limit and zero-OOM checks remain enabled.
 
 Held mode performs the same guest UNPLUG but retains host objects and reuses them
-on PLUG. Alias mode deliberately adds a second native mapping; reference count2
-must refuse backing retirement and fail the run, followed by explicit teardown.
-A process exit alone does not qualify either control; inspect native error, object
+on PLUG. Alias mode deliberately adds a second native mapping at extent32. Reference
+count2 must produce pre-commit BUSY and full remapping, with unchanged canary
+and SQL integrity. That complete refusal-integrity scan precedes the timed load;
+explicit diagnostic-alias retirement during the load allows the standard
+Linux driver's retry to finish; the VM then completes normal shrink/regrow.
+A process exit alone does not qualify either control; inspect native status, object
 observations, pthread join and VM destruction. All trials have original finite
 deadlines, one VM maximum, resource admission and nice19. No working-network
 configuration or primary Macray task is involved.
+
+
+## Private Ethernet and crash recovery
+
+`IsolatedNetwork(index:0...1)` owns a nonblocking bounded AF_UNIX datagram pair,
+not vmnet, a host interface, default route, NAT or PF rules. Only these attachments
+are admitted. Each standard virtio-net device has independent RX/TX rings, MAC
+and IRQ; checksums/GSO are not offered. Payloads are copied from freshly resolved
+bounded guest spans while all CPUs are parked. No asynchronous NIC retains a
+GPA pointer. Backpressure preserves the descriptor for retry. A partial factory
+failure closes every previously claimed device endpoint before error return.
+
+The finite host peer implements only checked ARP and UDP echo for RFC5737
+192.0.2.0/30 and198.51.100.0/30. It has no IP socket or external forwarding.
+The static Swift/Musl canary pins one native worker to each actual online Linux
+CPU, checks a256KiB private mapping per worker and retains the main64MiB canary.
+The final worker verifies sequence/payload echoes through both real guest NICs.
+Every shrink/regrow sample requires increasing per-CPU and packet counters.
+
+Crash recovery refuses a root filesystem without an internal ext4 journal.
+`container-journal-lab` uses upstream native Swift EXT4Reader/archive/Formatter
+APIs to create a fresh8GiB image with a64MiB ordered JBD2 journal. It never repairs
+or reformats a source image or any production storage. The unjournalled default
+image remains usable for graceful-only trials, but an actual crash corrupted its
+inode metadata despite ClickHouse fsync; that failed image is retained.
+
+`container-recovery-lab` uses native posix_spawn/waitpid for at most two owned
+child generations, not a shell. It waits for an fsynced, atomically published
+point after acknowledged durable400K-row inserts and an observed active query,
+then sends SIGKILL to its exact unreaped child's process group. It waits for
+actual leader death and group disappearance before
+starting a fresh VM on the same disposable ext4 disk. The replacement validates
+fixed persisted SQL oracles and repeats SMP/NIC/shrink/regrow checks. Table
+fsync settings are verified against the actual engine; virtio-blk FLUSH uses
+F_FULLFSYNC. This is process-crash recovery, not a power-loss/snapshot guarantee.
+No in-flight query or volatile RAM is promised to survive. A private inherited pipe ties VM authority to the supervisor: parent death,
+including SIGKILL, closes the only writer and causes the native owner to exit.
+Paths are canonical, marker reads use O_NOFOLLOW/fstat, and inherited environment
+is explicitly bounded. Native memory pressure is checked before each generation; all native outcomes and cleanup failures
+are retained. The installed Apple container service is never used or restarted.
 
 ## Wire and lifecycle verification
 
@@ -129,9 +199,11 @@ to invent test counts or rerun completed tests.
 ## Limits
 
 This is a finite research backend, not production adoption or App Store API.
-Recoverable multi-object rollback/BUSY, multiple vCPUs, DMA/LPI, arbitrary disks,
-network adapters, migration/suspend and full stock CLI/service selection remain
-pending. Native Mach region reference observations are empirical on the tested
+Hardware DMA/LPI, arbitrary disks/host-network attachment, migration/suspend,
+PSCI CPU offlining and full stock CLI/service selection remain unsupported.
+The stop-all design prioritizes explicit revocation safety; it is not a qualified
+production throughput or idle-CPU design. Native run/watchdog deadlines and
+ClickHouse query limits are never raised to turn a failed trial into success. Native Mach region reference observations are empirical on the tested
 OS; they are not a general HVF ownership contract for arbitrary foreign memory.
 
 The earlier `linux-memory-lab`/`linux-memory-guest` standalone PID1 scenarios remain

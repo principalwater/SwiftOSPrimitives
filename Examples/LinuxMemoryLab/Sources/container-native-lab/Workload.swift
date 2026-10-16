@@ -1,4 +1,5 @@
 import Containerization
+import Darwin
 import Foundation
 import NativeLinuxVMM
 
@@ -50,7 +51,7 @@ extension Lab {
   }
   static func workload(
     container: LinuxContainer, vm: NativeVirtualMachine, output: URL,
-    probe: URL
+    probe: URL, mode: String
   ) async throws -> Bool {
     var commands: [[String: String]] = []
     var observations: [[String: Any]] = []
@@ -62,6 +63,8 @@ extension Lab {
     var activeLoad: Task<String, Error>?
     var primary = ""
     var cleanup: [String] = []
+    // writeFile(create:) does not truncate; a recovered filesystem can contain an older probe.
+    let guestProbe = "/lab/canary-" + UUID().uuidString.lowercased()
     do {
       let agent = try await vm.dialAgent()
       do {
@@ -71,11 +74,20 @@ extension Lab {
         while let bytes = try handle.read(upToCount: 65536), !bytes.isEmpty {
           guard bytes.count <= (8 << 20) - written else { throw Failure.check("probe size") }
           try await agent.writeFile(
-            path: "/run/container/swiftos-native/rootfs/lab/canary", data: bytes,
+            path: "/run/container/swiftos-native/rootfs" + guestProbe, data: bytes,
             flags: .init(create: written == 0, append: written != 0), mode: 0o700)
           written += bytes.count
         }
         guard written > 0 else { throw Failure.check("probe empty") }
+        let metadata = try await agent.stat(
+          root: "/run/container/swiftos-native/rootfs", path: guestProbe)
+        commands.append([
+          "probePath": guestProbe, "probeWrittenBytes": String(written),
+          "probeGuestBytes": String(metadata.size),
+        ])
+        guard metadata.size == written, metadata.uid == 0, metadata.nlink == 1,
+          metadata.mode & 0o170000 == 0o100000
+        else { throw Failure.check("probe guest geometry") }
         try await agent.close()
       } catch {
         try? await agent.close()
@@ -90,16 +102,19 @@ extension Lab {
         try await Task.sleep(for: .milliseconds(100))
       }
       guard ready else { throw Failure.check("server readiness") }
-      _ = try await sql(
-        container,
-        query:
-          "CREATE TABLE default.ram_lab (id UInt64, payload String) ENGINE=MergeTree ORDER BY id")
-      for batch in 0..<4 {
+      if mode != "recover" {
         _ = try await sql(
           container,
           query:
-            "INSERT INTO default.ram_lab SELECT number + \(batch * 100000), repeat(hex(cityHash64(number + \(batch * 100000))), 8) FROM numbers(100000)"
+            "CREATE TABLE default.ram_lab (id UInt64, payload String) ENGINE=MergeTree ORDER BY id SETTINGS fsync_after_insert=1, fsync_part_directory=1"
         )
+        for batch in 0..<4 {
+          _ = try await sql(
+            container,
+            query:
+              "INSERT INTO default.ram_lab SELECT number + \(batch * 100000), repeat(hex(cityHash64(number + \(batch * 100000))), 8) FROM numbers(100000)"
+          )
+        }
       }
       let integrity =
         "SELECT count(), sum(id), sum(cityHash64(payload)), sum(length(payload)) FROM default.ram_lab WHERE id < 400000 LIMIT 1"
@@ -107,7 +122,7 @@ extension Lab {
       let baseline = try await sql(container, query: integrity)
       guard baseline == expected else { throw Failure.check("initial integrity " + baseline) }
       canary = try await container.exec("canary") { config in
-        config.arguments = ["/lab/canary"]
+        config.arguments = [guestProbe, String(vm.processorCount), String(vm.networkCount)]
         config.stdin = input
         config.stdout = canaryOutput
         config.stderr = canaryOutput
@@ -125,9 +140,39 @@ extension Lab {
       let first = try await line()
       transcript.append(first)
       let initialFields = first.split(separator: " ")
-      guard initialFields.count == 3, initialFields[0] == "CANARY_READY",
+      guard initialFields.count == 5 + vm.processorCount, initialFields[0] == "CANARY_READY",
         let initialMemory = UInt64(initialFields[1])
       else { throw Failure.check(first) }
+      var previousWork = [UInt64](repeating: 0, count: vm.processorCount)
+      var previousPackets: UInt64 = 0
+      func checkWork(_ fields: ArraySlice<Substring>) throws {
+        var counters: [String: UInt64] = [:]
+        for field in fields {
+          let pair = field.split(separator: "=")
+          guard pair.count == 2, let number = UInt64(pair[1]), counters[String(pair[0])] == nil
+          else { throw Failure.check("probe fields") }
+          counters[String(pair[0])] = number
+        }
+        guard counters["cpus"] == UInt64(vm.processorCount),
+          let packets = counters["packets"], packets > previousPackets
+        else { throw Failure.check("NIC progress") }
+        for core in 0..<vm.processorCount {
+          guard let work = counters["cpu\(core)"], work > previousWork[core] else {
+            throw Failure.check("CPU progress")
+          }
+          previousWork[core] = work
+        }
+        previousPackets = packets
+      }
+      try checkWork(initialFields.dropFirst(3))
+      let engine = try await sql(
+        container,
+        query:
+          "SELECT engine_full FROM system.tables WHERE database='default' AND name='ram_lab' LIMIT 1"
+      )
+      guard engine.contains("fsync_after_insert = 1"), engine.contains("fsync_part_directory = 1")
+      else { throw Failure.check("durability settings") }
+      commands.append(["effectiveEngine": engine])
       var sequence = 0
       func verify(quit: Bool = false) async throws -> UInt64 {
         sequence += 1
@@ -135,10 +180,23 @@ extension Lab {
         let text = try await line()
         transcript.append(text)
         let fields = text.split(separator: " ")
-        guard fields.count == 4, fields[0] == "CANARY_OK", Int(fields[1]) == sequence,
+        guard fields.count == 6 + vm.processorCount, fields[0] == "CANARY_OK",
+          Int(fields[1]) == sequence,
           let total = UInt64(fields[2])
         else { throw Failure.check(text) }
+        try checkWork(fields.dropFirst(4))
         return total
+      }
+      func loadState(cycle: Int) async throws -> (Int, UInt64) {
+        sequence += 1
+        try input.send(Data("STATE \(sequence) \(cycle)\n".utf8))
+        let text = try await line()
+        transcript.append(text)
+        let fields = text.split(separator: " ")
+        guard fields.count == 4, fields[0] == "LOAD_STATE", Int(fields[1]) == sequence,
+          let count = Int(fields[2]), (0...1).contains(count), let memory = UInt64(fields[3])
+        else { throw Failure.check(text) }
+        return (count, memory)
       }
       func resourceSnapshot(_ phase: String) async throws {
         let agent = try await vm.dialAgent()
@@ -168,46 +226,79 @@ extension Lab {
       }
       try await waitMemory(vm, bytes: 128 << 20)
       try await resourceSnapshot("baseline")
+      if vm.aliasDiagnosticEnabled {
+        try vm.requestMemory(bytes: 0)
+        let refusalDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while vm.refusalCount == 0 {
+          guard ContinuousClock.now < refusalDeadline else {
+            throw Failure.check("BUSY not observed")
+          }
+          try await Task.sleep(for: .milliseconds(5))
+        }
+        _ = try await verify()
+        guard try await sql(container, query: integrity) == expected else {
+          throw Failure.check("BUSY data")
+        }
+        // Validate the refusal separately so its full integrity scan cannot consume the load window.
+        try vm.requestMemory(bytes: 128 << 20)
+      }
       for cycle in 1...2 {
         let queryID = "swiftos-load-\(cycle)"
         let query =
-          "SELECT sum(length(payload) + sleepEachRow(0.000005)) FROM (SELECT id, any(payload) AS payload FROM default.ram_lab WHERE id < 400000 GROUP BY id) LIMIT 1"
+          "SELECT sum(n.number + sleepEachRow(0.00004)) FROM numbers(100000) AS n INNER JOIN (SELECT id, payload FROM default.ram_lab WHERE id < 100000) AS r ON n.number = r.id AND repeat(hex(cityHash64(n.number)), 8) = r.payload LIMIT 1 SETTINGS join_algorithm='hash'"
         activeLoad = Task { try await sql(container, query: query, queryID: queryID) }
         var observed: UInt64 = 0
         for _ in 0..<24 {
-          let state = try await sql(
-            container,
-            query:
-              "SELECT count(), sum(memory_usage) FROM system.processes WHERE query_id = '\(queryID)' LIMIT 1"
-          ).split(separator: "\t")
-          guard state.count == 2, let memory = UInt64(state[1]) else {
-            throw Failure.check("load observation")
-          }
-          if state[0] == "1", memory >= 16 << 20 {
-            observed = memory
+          let state = try await loadState(cycle: cycle)
+          if state.0 == 1, state.1 >= 16 << 20 {
+            observed = state.1
             break
           }
           try await Task.sleep(for: .milliseconds(25))
         }
         guard observed >= 16 << 20 else { throw Failure.check("active query not observed") }
         try vm.requestMemory(bytes: 0)
+        if mode == "crash" {
+          let path = output.appending(path: "CRASH_READY.pending")
+          try JSONSerialization.data(withJSONObject: [
+            "pid": getpid(), "rows": 400000,
+            "activeQuery": true, "activeQueryMemoryBytes": observed, "durableInserts": true,
+            "cpus": vm.processorCount, "nics": vm.networkCount,
+          ]).write(to: path, options: .withoutOverwriting)
+          let journal = try FileHandle(forWritingTo: path)
+          try journal.synchronize()
+          try journal.close()
+          let published = output.appending(path: "CRASH_READY.json")
+          guard renamex_np(path.path, published.path, UInt32(RENAME_EXCL)) == 0 else {
+            throw Failure.check("publish crash point")
+          }
+          let directory = open(output.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+          guard directory >= 0 else { throw Failure.check("crash directory") }
+          let sync = fsync(directory)
+          let closed = close(directory)
+          guard sync == 0, closed == 0 else { throw Failure.check("sync crash directory") }
+          try await Task.sleep(for: .seconds(3))
+          throw Failure.check("owner was not killed by its supervisor")
+        }
+        if cycle == 1, vm.aliasDiagnosticEnabled {
+          try vm.releaseDiagnosticAlias()
+        }
         try await waitMemory(vm, bytes: 0)
+        let stillRunning = try await loadState(cycle: cycle)
+        commands.append(["afterUnplugQueryState": "\(stillRunning.0)\t\(stillRunning.1)"])
+        let memoryAfterUnplug = stillRunning.1
+        guard stillRunning.0 == 1, memoryAfterUnplug >= 16 << 20
+        else { throw Failure.check("load not live after unplug: \(stillRunning)") }
         let shrunk = try await verify()
-        let stillRunning = try await sql(
-          container,
-          query:
-            "SELECT count(), sum(memory_usage) FROM system.processes WHERE query_id = '\(queryID)' LIMIT 1"
-        ).split(separator: "\t")
-        guard stillRunning.count == 2, stillRunning[0] == "1",
-          let memoryAfterUnplug = UInt64(stillRunning[1]), memoryAfterUnplug >= 16 << 20
-        else { throw Failure.check("query ended before unplug completed") }
         try await resourceSnapshot("shrunk-\(cycle)")
         guard initialMemory >= shrunk, initialMemory - shrunk == 128 << 20 else {
           throw Failure.check("guest capacity not reduced")
         }
         let loadResult = try await activeLoad!.value
         activeLoad = nil
-        guard loadResult == "51176128" else { throw Failure.check("load aggregate " + loadResult) }
+        guard loadResult == "4999950000" else {
+          throw Failure.check("load aggregate " + loadResult)
+        }
         guard try await sql(container, query: integrity) == expected else {
           throw Failure.check("post shrink data")
         }
@@ -243,7 +334,10 @@ extension Lab {
     }
     if let activeLoad {
       // SQL's own finite wait/kill/delete must retire before VM stop.
-      _ = await activeLoad.result
+      switch await activeLoad.result {
+      case .success(let result): commands.append(["retiredLoadResult": result])
+      case .failure(let error): commands.append(["retiredLoadFailure": String(describing: error)])
+      }
     }
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
