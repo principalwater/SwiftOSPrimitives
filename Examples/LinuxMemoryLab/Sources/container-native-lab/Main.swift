@@ -26,7 +26,7 @@ import NativeLinuxVMM
     guard args.count >= 5 else { throw Failure.arguments }
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
-        || args.count == 6 && ["memory", "held", "alias", "crash", "recover"].contains(args[4])
+        || args.count == 6 && ["memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy"].contains(args[4])
     else { throw Failure.arguments }
     let output = URL(filePath: args[3])
     guard !FileManager.default.fileExists(atPath: output.path) else { throw Failure.arguments }
@@ -44,7 +44,7 @@ import NativeLinuxVMM
     let manager = NativeVirtualMachineManager(
       kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
       console: output.appending(path: "console.log"), held: args[4] == "held",
-      aliasControl: args[4] == "alias", group: group)
+      aliasControl: ["alias", "adaptive-busy"].contains(args[4]), group: group)
     let links = try (0..<2).map { try IsolatedNetwork(index: $0) }
     let peers = links.map { EthernetPeer(link: $0) }
     let peerTasks = peers.map { peer in Task { try await peer.run() } }

@@ -1,3 +1,4 @@
+import BoundedMemory
 import Containerization
 import Darwin
 import Foundation
@@ -57,6 +58,23 @@ extension Lab {
     var observations: [[String: Any]] = []
     var transcript: [String] = []
     var resources: [[String: Any]] = []
+    var policySamples: [[String: Any]] = []
+    var policyRequests: [[String: UInt64]] = []
+    let adaptive = ["adaptive", "adaptive-busy"].contains(mode)
+    let began = ContinuousClock.now
+    func now() -> UInt64 {
+      let elapsed = began.duration(to: .now).components
+      return UInt64(elapsed.seconds) * 1_000_000_000 + UInt64(elapsed.attoseconds / 1_000_000_000)
+    }
+    guard let budget = BalloonBudget(
+      installedBytes: 1152 << 20, minimumResidentBytes: 1024 << 20,
+      granuleBytes: 2 << 20, maximumStepBytes: 128 << 20),
+      var governor = BalloonController(
+        budget: budget, epoch: 1, guestReserveBytes: 512 << 20, hysteresisBytes: 32 << 20,
+        maximumObservationAgeNanoseconds: 3_000_000_000, cooldownNanoseconds: 300_000_000,
+        completionTimeoutNanoseconds: 8_000_000_000)
+    else { throw Failure.check("policy geometry") }
+    defer { governor.retire() }
     let input = CommandInput()
     let canaryOutput = ProbeOutput()
     var canary: LinuxProcess?
@@ -174,18 +192,70 @@ extension Lab {
       else { throw Failure.check("durability settings") }
       commands.append(["effectiveEngine": engine])
       var sequence = 0
-      func verify(quit: Bool = false) async throws -> UInt64 {
+      var available: UInt64 = 0
+      var capturedAt: UInt64 = 0
+      func verify(_ command: String = "VERIFY", quit: Bool = false) async throws -> UInt64 {
         sequence += 1
-        try input.send(Data("\(quit ? "QUIT" : "VERIFY") \(sequence)\n".utf8))
+        capturedAt = now()
+        try input.send(Data("\(quit ? "QUIT" : command) \(sequence)\n".utf8))
         let text = try await line()
         transcript.append(text)
         let fields = text.split(separator: " ")
         guard fields.count == 6 + vm.processorCount, fields[0] == "CANARY_OK",
           Int(fields[1]) == sequence,
-          let total = UInt64(fields[2])
+          let total = UInt64(fields[2]), let observedAvailable = UInt64(fields[3]),
+          observedAvailable <= total
         else { throw Failure.check(text) }
+        available = observedAvailable
         try checkWork(fields.dropFirst(4))
         return total
+      }
+      func control() throws {
+        try Task.checkCancellation()
+        let returnedAt = now()
+        try governor.checkDeadline(nowNanoseconds: returnedAt)
+        var pressure: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nil, 0) == 0,
+          size == MemoryLayout<Int32>.size, [1, 2].contains(pressure)
+        else { throw Failure.check("host memory pressure or unavailable native observation") }
+        let state = vm.memoryState
+        let sample = BalloonController.Observation(
+          epoch: 1, sequence: UInt64(sequence), capturedAtNanoseconds: capturedAt,
+          actualResidentBytes: (1024 << 20) + state.pluggedBytes,
+          requestedResidentBytes: (1024 << 20) + state.requestedBytes,
+          guestAvailableBytes: available, hostResidentLimitBytes: 1152 << 20,
+          hostUnderPressure: pressure != 1, guestUnderPressure: false)
+        let request = try governor.observe(sample, nowNanoseconds: returnedAt)
+        if let request {
+          try vm.requestMemory(bytes: request.targetResidentBytes - (1024 << 20))
+          let deliveredAt = now()
+          try governor.didApply(
+            request, afterObservationSequence: UInt64(sequence), atNanoseconds: deliveredAt)
+          policyRequests.append([
+            "initialBytes": request.initialResidentBytes, "targetBytes": request.targetResidentBytes,
+            "sequence": request.sequence, "issuedAt": request.issuedAtNanoseconds,
+            "deliveredAt": deliveredAt,
+          ])
+        }
+        policySamples.append([
+          "sequence": sequence, "capturedAt": capturedAt, "returnedAt": returnedAt,
+          "guestAvailableBytes": available, "pluggedBytes": state.pluggedBytes,
+          "requestedBytes": state.requestedBytes, "hostPressure": pressure,
+          "pending": governor.pendingRequest != nil,
+        ])
+        guard policySamples.count <= 48 else { throw Failure.check("policy sample bound") }
+      }
+      func settle(_ bytes: UInt64) async throws -> UInt64 {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        repeat {
+          try governor.checkDeadline(nowNanoseconds: now())
+          guard ContinuousClock.now < deadline else { throw Failure.check("policy convergence") }
+          let total = try await verify()
+          try control()
+          if vm.pluggedBytes == bytes, governor.pendingRequest == nil { return total }
+          try await Task.sleep(for: .milliseconds(200))
+        } while true
       }
       func loadState(cycle: Int) async throws -> (Int, UInt64) {
         sequence += 1
@@ -226,7 +296,7 @@ extension Lab {
       }
       try await waitMemory(vm, bytes: 128 << 20)
       try await resourceSnapshot("baseline")
-      if vm.aliasDiagnosticEnabled {
+      if vm.aliasDiagnosticEnabled, !adaptive {
         try vm.requestMemory(bytes: 0)
         let refusalDeadline = ContinuousClock.now.advanced(by: .seconds(5))
         while vm.refusalCount == 0 {
@@ -257,7 +327,17 @@ extension Lab {
           try await Task.sleep(for: .milliseconds(25))
         }
         guard observed >= 16 << 20 else { throw Failure.check("active query not observed") }
-        try vm.requestMemory(bytes: 0)
+        let cycleInitial = try await verify()
+        let cyclePlugged = vm.pluggedBytes
+        if adaptive {
+          let issued = policyRequests.count
+          try control()
+          guard policyRequests.count == issued + 1,
+            policyRequests.last?["targetBytes"] == 1024 << 20
+          else {
+            throw Failure.check("real idle headroom did not authorize reclaim")
+          }
+        } else { try vm.requestMemory(bytes: 0) }
         if mode == "crash" {
           let path = output.appending(path: "CRASH_READY.pending")
           try JSONSerialization.data(withJSONObject: [
@@ -280,10 +360,11 @@ extension Lab {
           try await Task.sleep(for: .seconds(3))
           throw Failure.check("owner was not killed by its supervisor")
         }
-        if cycle == 1, vm.aliasDiagnosticEnabled {
+        if cycle == 1, vm.aliasDiagnosticEnabled, !adaptive {
           try vm.releaseDiagnosticAlias()
         }
-        try await waitMemory(vm, bytes: 0)
+        if adaptive { _ = try await settle(0) }
+        else { try await waitMemory(vm, bytes: 0) }
         let stillRunning = try await loadState(cycle: cycle)
         commands.append(["afterUnplugQueryState": "\(stillRunning.0)\t\(stillRunning.1)"])
         let memoryAfterUnplug = stillRunning.1
@@ -291,7 +372,9 @@ extension Lab {
         else { throw Failure.check("load not live after unplug: \(stillRunning)") }
         let shrunk = try await verify()
         try await resourceSnapshot("shrunk-\(cycle)")
-        guard initialMemory >= shrunk, initialMemory - shrunk == 128 << 20 else {
+        guard initialMemory >= shrunk, cycleInitial >= shrunk,
+          cycleInitial - shrunk == cyclePlugged, cyclePlugged > 0, initialMemory - shrunk == 128 << 20
+        else {
           throw Failure.check("guest capacity not reduced")
         }
         let loadResult = try await activeLoad!.value
@@ -302,15 +385,42 @@ extension Lab {
         guard try await sql(container, query: integrity) == expected else {
           throw Failure.check("post shrink data")
         }
-        try vm.requestMemory(bytes: 128 << 20)
-        try await waitMemory(vm, bytes: 128 << 20)
-        let regrown = try await verify()
-        guard regrown == initialMemory else { throw Failure.check("guest capacity not restored") }
+        let regrown: UInt64
+        if adaptive {
+          _ = try await verify("HOLD")
+          let pressureAvailable = available
+          let issued = policyRequests.count
+          try control()
+          guard policyRequests.count == issued + 1,
+            let growth = governor.pendingRequest,
+            growth.targetResidentBytes > 1024 << 20,
+            growth.targetResidentBytes <= 1152 << 20,
+            pressureAvailable < 512 << 20
+          else { throw Failure.check("real guest pressure did not authorize growth") }
+          try await resourceSnapshot("pressure-\(cycle)")
+          regrown = try await settle(growth.targetResidentBytes - (1024 << 20))
+          // The checked private allocation is released only after actual growth has completed.
+          _ = try await verify("DROP")
+          commands.append([
+            "pressureAvailableBytes": String(pressureAvailable),
+            "releasedAvailableBytes": String(available), "pressureAllocationBytes": String(320 << 20),
+          ])
+          try await Task.sleep(for: .milliseconds(350))
+        } else {
+          try vm.requestMemory(bytes: 128 << 20)
+          try await waitMemory(vm, bytes: 128 << 20)
+          regrown = try await verify()
+        }
+        let restored = vm.pluggedBytes
+        guard restored > 0, restored <= 128 << 20,
+          regrown == shrunk + restored
+        else { throw Failure.check("guest capacity not restored to the policy target") }
         try await resourceSnapshot("regrown-\(cycle)")
         observations.append([
           "cycle": cycle, "activeQueryMemoryBytes": observed,
           "activeAfterUnplugMemoryBytes": memoryAfterUnplug,
-          "initialGuestBytes": initialMemory, "shrunkGuestBytes": shrunk,
+          "initialGuestBytes": cycleInitial, "shrunkGuestBytes": shrunk,
+          "retiredBackingBytes": cyclePlugged, "restoredBackingBytes": restored,
           "regrownGuestBytes": regrown, "integrity": expected, "loadResult": loadResult,
         ])
       }
@@ -343,6 +453,7 @@ extension Lab {
       "primaryError": primary, "cleanupErrors": cleanup,
       "cycles": observations, "canaryTranscript": transcript, "commands": commands,
       "canaryBytes": 64 << 20, "rows": 400000, "resources": resources,
+      "adaptive": adaptive, "policyRequests": policyRequests, "policySamples": policySamples,
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: output.appending(path: "workload.json"), options: .withoutOverwriting)

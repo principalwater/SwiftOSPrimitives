@@ -240,6 +240,10 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
     }
   }
   public var pluggedBytes: UInt64 { control.state.withLock { $0.plugged } }
+  /// One logical device observation; neither number is RSS or physical RAM.
+  public var memoryState: (pluggedBytes: UInt64, requestedBytes: UInt64) {
+    control.state.withLock { ($0.plugged, $0.requested) }
+  }
   public func requestMemory(bytes: UInt64) throws {
     guard bytes <= MemoryDevice.capacity, bytes % UInt64(MemoryDevice.block) == 0 else {
       throw NativeFailure.unsupported

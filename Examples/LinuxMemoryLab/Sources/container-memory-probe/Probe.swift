@@ -287,6 +287,18 @@
         try region.withMutableBytes { bytes in
           for index in bytes.indices { bytes[index] = UInt8(truncatingIfNeeded: index &* 17 &+ 91) }
         }
+        var pressure = try PageRegion.allocate(byteCount: 320 << 20, maximumMappedBytes: 320 << 20)
+        var holding = false
+        func checkPressure() throws {
+          guard holding else { return }
+          try pressure.withReadAccess { bytes in
+            for index in bytes.indices {
+              guard bytes[index] == UInt8(truncatingIfNeeded: index &* 31 &+ 47) else {
+                throw ProbeFailure.integrity
+              }
+            }
+          }
+        }
         try emit("CANARY_READY \(try memory()) \(try summary())\n")
         for sequence in 1...64 {
           let text = try command()
@@ -297,9 +309,26 @@
             try emit("LOAD_STATE \(sequence) \(try loadState(cycle: cycle))\n")
             continue
           }
-          guard text == "VERIFY \(sequence)" || text == "QUIT \(sequence)" else {
-            throw ProbeFailure.framing
+          if text == "HOLD \(sequence)" {
+            guard !holding else { throw ProbeFailure.framing }
+            try pressure.withMutableBytes { bytes in
+              for index in bytes.indices {
+                bytes[index] = UInt8(truncatingIfNeeded: index &* 31 &+ 47)
+              }
+            }
+            holding = true
+          } else if text == "DROP \(sequence)" {
+            guard holding else { throw ProbeFailure.framing }
+            try checkPressure()
+            try pressure.release()
+            pressure = try PageRegion.allocate(byteCount: 320 << 20, maximumMappedBytes: 320 << 20)
+            holding = false
+          } else {
+            guard text == "VERIFY \(sequence)" || text == "QUIT \(sequence)" else {
+              throw ProbeFailure.framing
+            }
           }
+          try checkPressure()
           try region.withReadAccess { bytes in
             for index in bytes.indices {
               guard bytes[index] == UInt8(truncatingIfNeeded: index &* 17 &+ 91) else {
@@ -310,6 +339,7 @@
           try emit("CANARY_OK \(sequence) \(try memory()) \(try summary())\n")
           if text.hasPrefix("QUIT") {
             try region.release()
+            try pressure.release()
             try stop()
             return
           }

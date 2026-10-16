@@ -30,7 +30,9 @@ let package = Package(
     .executableTarget(name: "container-journal-lab", dependencies: [
       .product(name: "ContainerizationEXT4", package: "containerization")
     ]),
-    .executableTarget(name: "container-native-lab", dependencies: ["NativeLinuxVMM"]),
+    .executableTarget(name: "container-native-lab", dependencies: [
+      "NativeLinuxVMM", .product(name: "BoundedMemory", package: "SwiftOSPrimitives")
+    ]),
     .executableTarget(
       name: "container-memory-probe",
       dependencies: [

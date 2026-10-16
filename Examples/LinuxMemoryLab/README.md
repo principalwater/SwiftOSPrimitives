@@ -107,7 +107,7 @@ symbols when stripping a separate guest artifact.
 Disk admission requires a fresh COW copy named `artifacts/clickhouse-run-*.ext4`,
 8GiB logical capacity, single link, current uid, exclusive lock and an enclosing
 private root OWNER.json containing its canonical root, uid and research purpose
-`isolated-container-smp-G19`. The marker is experiment-scoped, not a public
+`isolated-container-adaptive-G20`. The marker is experiment-scoped, not a public
 provisioning format. Never reuse a modified image or write to accepted ancestors.
 
 The ClickHouse workload is26.9.19.9, loopback-only inside the guest,896MiB cgroup
@@ -219,3 +219,37 @@ separate. They cannot substitute for actual LinuxContainer/Vminitd qualification
 - [Cgroup memory events](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files)
 - [Hypervisor](https://developer.apple.com/documentation/hypervisor)
 - [XNU VM ownership](https://github.com/apple-oss-distributions/xnu/tree/main/osfmk/vm)
+
+## Adaptive native backing RAM
+
+`container-native-lab <kernel> <initfs> <private-ext4> <fresh-output> adaptive <probe>`
+uses the existing portable `BoundedMemory.BalloonController` with this native HVF
+backend. It does not start the stock container service or any host-network listener.
+Only this finite trusted workload is admitted, with 1GiB boot RAM, 128MiB dynamic
+capacity, a 512MiB guest reserve and 32MiB hysteresis. No second policy is introduced.
+
+Every sample combines a single mutex observation of requested/plugged device bytes
+with a fresh, sequenced guest MemAvailable reply. Captures use ContinuousClock;
+setter delivery is fenced separately from later device convergence. The owner
+quarantines late/invalid operations and the workload stops on critical/unknown host
+pressure, stale samples, guest silence or failed convergence. Native sysctl pressure
+levels restrict growth; admission still belongs to the external one-VM test harness.
+The policy is driven at workload observation points, not an always-running service.
+
+Two cycles check reclaim during an actual live ClickHouse query, followed by a real
+320MiB guest allocation with an independent byte pattern. Low guest headroom must
+cause bounded growth; the exact amount may be less than the dynamic capacity. The
+allocation remains intact until growth completes, then Linux munmap releases it.
+Both vCPU canaries, both private NICs, cgroup limits and the independent persisted
+400K-row data oracle remain required. Each cycle validates its own capacity delta;
+partial regrowth must not be mistaken for a failed full restore.
+
+Logical capacity, anonymous mapping deallocation, observed resident/compressed pages
+and the macOS task footprint ledger are different measurements. Global physical
+free-list causality is unmeasured and remains null. This example has not qualified
+production idle CPU/SLOs, arbitrary untrusted guests, multiple concurrent VMs,
+cross-version configuration migration or host power-loss recovery.
+
+`adaptive-busy` retains the diagnostic alias instead of releasing it. The expected
+negative outcome is `completionTimedOut`, zero successful UNPLUG frees and clean
+vCPU/coordinator join and VM destruction. It is not a successful workload run.
