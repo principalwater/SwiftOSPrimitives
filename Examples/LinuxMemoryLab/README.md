@@ -1,6 +1,6 @@
 # Native Linux backing-memory lab
 
-Finite, SMP/private-NIC Swift HVF backend for Apple Containerization, plus the earlier
+SMP/private-NIC Swift HVF backend for Apple Containerization, plus the earlier
 standalone Linux experiment. Requires an Apple-silicon Mac, macOS27 deployment
 target/SDK and Swift6.4.1. This is optional research code; the root package's
 PageMemory/BoundedMemory products have no Containerization dependency.
@@ -15,11 +15,15 @@ guest-online completion fence and measured native Swift optimization.
 See [G22 persistent-governance qualification](PERSISTENT-QUALIFICATION.md) for
 bounded lifetime-independent telemetry, real pending-stop/lifetime controls,
 history wrap under ClickHouse and a new process-crash recovery qualification.
-This optional lab currently expects the separate local `ContainerWorkspace`
-package next to the SwiftOSPrimitives checkout; it supplies the shared native
-telemetry component. Neither root package product depends on that application.
-The qualified companion commit is `8859360429a1dc2909602b782da23f4b5f4d5e46`;
-both repositories are local research checkouts, without a remote release.
+Shared bounded telemetry now lives in the dependency-free root BoundedMemory
+product. The optional backend no longer depends on the unpublished UI package,
+so a native application can depend on this backend without a package cycle.
+
+G23 adds explicit sustained execution and validated larger memory layouts.
+The default qualification profile remains finite; additional hardware acceptance
+is recorded separately and does not imply product adoption.
+See [G23 managed qualification](MANAGED-QUALIFICATION.md) for the final fourteen
+profiles, independent telemetry, disk-reserve test and real SIGKILL recovery.
 
 ## Current Apple container integration
 
@@ -120,7 +124,7 @@ symbols when stripping a separate guest artifact.
 Disk admission requires a fresh COW copy named `artifacts/clickhouse-run-*.ext4`,
 8GiB logical capacity, single link, current uid, exclusive lock and an enclosing
 private root OWNER.json containing its canonical root, uid and research purpose
-`isolated-container-product-G22`. The marker is experiment-scoped, not a public
+`isolated-container-managed-G23`. The marker is experiment-scoped, not a public
 provisioning format. Never reuse a modified image or write to accepted ancestors.
 
 The ClickHouse workload is26.9.19.9, loopback-only inside the guest,896MiB cgroup

@@ -101,8 +101,9 @@
       guard elapsed >= 0, elapsed < 3_000_000_000 else { throw ProbeFailure.framing }
       let micros = min(1_000_000, (3_000_000_000 - elapsed + 999) / 1000)
       var remaining = timeval(tv_sec: micros / 1_000_000, tv_usec: micros % 1_000_000)
-      guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining, socklen_t(MemoryLayout<timeval>.size))
-        == 0
+      guard
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining, socklen_t(MemoryLayout<timeval>.size))
+          == 0
       else { throw ProbeFailure.system(errno) }
       let count = recv(fd, &chunk, min(chunk.count, 4096 - response.count), 0)
       // A socket timeout is transient until this transaction's original3second deadline.
@@ -236,6 +237,20 @@
     }
     static func run() throws {
       let args = Array(CommandLine.arguments.dropFirst())
+      if args == ["--memory-monitor"] {
+        try emit("MEMORY_READY \(try memory())\n")
+        var sequence: UInt64 = 0
+        while sequence < UInt64.max {
+          sequence += 1
+          let text = try command()
+          guard text == "OBS \(sequence)" || text == "QUIT \(sequence)" else {
+            throw ProbeFailure.framing
+          }
+          try emit("MEMORY_OK \(sequence) \(try memory())\n")
+          if text.hasPrefix("QUIT ") { return }
+        }
+        throw ProbeFailure.framing
+      }
       let cpus = Int(sysconf(Int32(_SC_NPROCESSORS_ONLN)))
       guard args.count == 2, Int(args[0]) == cpus, (1...4).contains(cpus),
         ["0", "1", "2"].contains(args[1])
@@ -302,8 +317,9 @@
             guard values.error.isEmpty, values.work.prefix(cpus).allSatisfy({ $0 > 0 }) else {
               throw ProbeFailure.integrity
             }
-            if !progress || (0..<cpus).allSatisfy({ values.work[$0] > checkedWork[$0] })
-              && (args[1] == "0" || values.packets > checkedPackets)
+            if !progress
+              || (0..<cpus).allSatisfy({ values.work[$0] > checkedWork[$0] })
+                && (args[1] == "0" || values.packets > checkedPackets)
             {
               if progress {
                 checkedWork = Array(values.work.prefix(cpus))
@@ -353,8 +369,9 @@
             pressure = try PageRegion.allocate(byteCount: 320 << 20, maximumMappedBytes: 320 << 20)
             holding = false
           } else {
-            guard text == "VERIFY \(sequence)" || text == "OBS \(sequence)"
-              || text == "QUIT \(sequence)"
+            guard
+              text == "VERIFY \(sequence)" || text == "OBS \(sequence)"
+                || text == "QUIT \(sequence)"
             else {
               throw ProbeFailure.framing
             }
@@ -365,7 +382,9 @@
               try MemoryCanary.check(bytes, multiplier: 17, seed: 91)
             }
           }
-          try emit("CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !text.hasPrefix("OBS ")))\n")
+          try emit(
+            "CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !text.hasPrefix("OBS ")))\n"
+          )
           if text.hasPrefix("QUIT") {
             try region.release()
             try pressure.release()

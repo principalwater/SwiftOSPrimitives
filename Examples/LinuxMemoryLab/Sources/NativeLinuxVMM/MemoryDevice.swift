@@ -1,4 +1,4 @@
-import ContainerWorkspaceCore
+import BoundedMemory
 import Darwin
 import Foundation
 import Hypervisor
@@ -8,7 +8,7 @@ import PageMemory
 final class MemoryDevice {
   static let base: UInt64 = 0x1_0000_0000
   static let block = 2 << 20
-  static let capacity = 128 << 20
+  let capacity: Int
   final class Extent {
     var pointer: UnsafeMutableRawPointer?
     var mapped = false
@@ -26,15 +26,20 @@ final class MemoryDevice {
   let transport = VirtioMMIO(
     identity: 24, features: 1 << 1, interrupt: 35,
     requiredFeatures: (1 << 32) | 2)
-  var extents = (0..<64).map { _ in Extent() }
-  var requested = UInt64(capacity)
+  var extents: [Extent]
+  var requested: UInt64
   private var observationHistory = RecentHistory<[String: Any]>(capacity: 1024)
   var observations: [[String: Any]] { observationHistory.elements }
   var observationsTotal: UInt64 { observationHistory.totalCount }
   private(set) var cumulativeBackingRetiredBytes: UInt64 = 0
   var plugged: UInt64 { UInt64(extents.filter(\.plugged).count * Self.block) }
 
-  init(held: Bool, aliasControl: Bool = false) {
+  init(
+    held: Bool, aliasControl: Bool = false, geometry: NativeMemoryGeometry = .qualification
+  ) {
+    capacity = Int(geometry.dynamicBytes)
+    requested = geometry.dynamicBytes
+    extents = (0..<(Int(geometry.dynamicBytes) / Self.block)).map { _ in Extent() }
     self.held = held
     self.aliasControl = aliasControl
   }
@@ -47,8 +52,8 @@ final class MemoryDevice {
   }
   func config() -> Data {
     let words: [UInt64] = [
-      UInt64(Self.block), 0, Self.base, UInt64(Self.capacity),
-      UInt64(Self.capacity), plugged, requested,
+      UInt64(Self.block), 0, Self.base, UInt64(capacity),
+      UInt64(capacity), plugged, requested,
     ]
     return words.reduce(into: Data()) { bytes, word in
       var value = word.littleEndian
@@ -74,14 +79,15 @@ final class MemoryDevice {
       // Startup/reset only: the standard driver guarantees no active users here.
       if try !retire(
         Array(extents.indices.filter { extents[$0].plugged || extents[$0].mapped }),
-        quiescence: quiescence) {
+        quiescence: quiescence)
+      {
         response = 2
       }
     } else if kind <= 3 {
       guard blocks > 0, address >= Self.base,
         (address - Self.base) % UInt64(Self.block) == 0,
-        address - Self.base < UInt64(Self.capacity),
-        UInt64(blocks) <= (UInt64(Self.capacity) - (address - Self.base)) / UInt64(Self.block)
+        address - Self.base < UInt64(capacity),
+        UInt64(blocks) <= (UInt64(capacity) - (address - Self.base)) / UInt64(Self.block)
       else { return Self.reply(type: 3, state: 0) }
       let first = Int((address - Self.base) / UInt64(Self.block))
       let indices = first..<(first + blocks)

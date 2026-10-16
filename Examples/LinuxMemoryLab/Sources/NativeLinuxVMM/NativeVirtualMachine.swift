@@ -32,7 +32,7 @@ final class NativeControl: Sendable {
     var pendingDials: Set<UInt32> = []
     var releaseAlias = false
     var refusals = 0
-    var requested = UInt64(MemoryDevice.capacity)
+    var requested: UInt64 = 0
     var plugged: UInt64 = 0
     var error = ""
     var result = Data()
@@ -41,7 +41,7 @@ final class NativeControl: Sendable {
     var connected: [UInt32: Bool] = [:]
     var nextPort: UInt32 = 0x2000_0000
   }
-  let state = Mutex(State())
+  let state: Mutex<State>
   let kernel: URL
   let initfs: URL
   let rootfs: URL
@@ -49,12 +49,18 @@ final class NativeControl: Sendable {
   let held: Bool
   let alias: Bool
   let cpus: Int
+  let geometry: NativeMemoryGeometry
+  let executionPolicy: NativeExecutionPolicy
   let networks: [IsolatedNetwork]
 
   init(
     kernel: URL, initfs: URL, rootfs: URL, console: URL, held: Bool, alias: Bool, cpus: Int = 1,
-    networks: [IsolatedNetwork] = []
+    networks: [IsolatedNetwork] = [], geometry: NativeMemoryGeometry = .qualification,
+    executionPolicy: NativeExecutionPolicy = .qualification
   ) {
+    state = Mutex(State(requested: geometry.dynamicBytes))
+    self.geometry = geometry
+    self.executionPolicy = executionPolicy
     self.kernel = kernel
     self.initfs = initfs
     self.rootfs = rootfs
@@ -67,9 +73,10 @@ final class NativeControl: Sendable {
   func run() {
     let machine = LinuxMachine()
     machine.control = self
-    machine.capacity = 1024 << 20
+    machine.capacity = Int(geometry.bootBytes)
+    machine.executionPolicy = executionPolicy
     machine.cpuCount = cpus
-    machine.dynamicMemory = MemoryDevice(held: held, aliasControl: alias)
+    machine.dynamicMemory = MemoryDevice(held: held, aliasControl: alias, geometry: geometry)
     let lease = NativeProcessLease.claimed.withLock { claimed -> Bool in
       guard !claimed else { return false }
       claimed = true
@@ -79,7 +86,8 @@ final class NativeControl: Sendable {
     do {
       guard lease else { throw NativeFailure.processBusy }
       machine.disk = try BlockDevice(path: initfs.path, readOnly: true)
-      machine.rootDisk = try BlockDevice(path: rootfs.path, interrupt: 37)
+      machine.rootDisk = try BlockDevice(
+        path: rootfs.path, interrupt: 37, executionPolicy: executionPolicy)
       machine.vsock = VsockDevice(control: self)
       for network in networks { machine.networks.append(try NetworkDevice(network: network)) }
       let consoleDescriptor = open(
@@ -125,6 +133,10 @@ final class NativeControl: Sendable {
       "cpus": machine.cpus?.statistics ?? [],
       "quiescentEpochs": machine.cpus?.epoch ?? 0,
       "maximumScheduledVCPUs": machine.cpus?.maximumScheduled ?? 0,
+      "executionPolicy": executionPolicy.rawValue,
+      "bootBytes": geometry.bootBytes, "dynamicCapacityBytes": geometry.dynamicBytes,
+      "diskAdmittedWriteBytes": machine.rootDisk?.written ?? 0,
+      "consoleRetainedBytes": machine.console.count,
       "exits": machine.exits, "lastPC": String(machine.lastPC, radix: 16),
       "physicalReleasedBytes": NSNull(), "backend": "Swift HVF / Containerization0.47.0",
     ]
@@ -140,7 +152,7 @@ final class NativeControl: Sendable {
 
 }
 
-/// Finite, private-NIC research backend for the current Apple Containerization API.
+/// Private-NIC research backend for the current Apple Containerization API.
 public final class NativeVirtualMachineManager: VirtualMachineManager {
   public let kernel: URL
   public let initfs: URL
@@ -148,12 +160,18 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public let held: Bool
   public let aliasControl: Bool
   public let group: MultiThreadedEventLoopGroup
+  public let memoryGeometry: NativeMemoryGeometry
+  public let executionPolicy: NativeExecutionPolicy
   private let owner = Mutex<NativeVirtualMachine?>(nil)
 
   public init(
     kernel: URL, initfs: URL, console: URL, held: Bool = false,
-    aliasControl: Bool = false, group: MultiThreadedEventLoopGroup
+    aliasControl: Bool = false, group: MultiThreadedEventLoopGroup,
+    memoryGeometry: NativeMemoryGeometry = .qualification,
+    executionPolicy: NativeExecutionPolicy = .qualification
   ) {
+    self.memoryGeometry = memoryGeometry
+    self.executionPolicy = executionPolicy
     self.kernel = kernel
     self.initfs = initfs
     self.console = console
@@ -164,7 +182,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public var instance: NativeVirtualMachine? { owner.withLock { $0 } }
   public func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
     let config = config.configuration
-    guard (1...4).contains(config.cpus), config.memoryInBytes == 1152 << 20,
+    guard (1...4).contains(config.cpus), config.memoryInBytes == memoryGeometry.maximumBytes,
       config.interfaces.count <= 2, !config.nestedVirtualization, config.extensions.isEmpty,
       config.mountsByID.count == 1, let entry = config.mountsByID.first,
       let mount = entry.value.first, mount.type == "ext4", mount.destination == "/",
@@ -193,7 +211,8 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     }
     let control = NativeControl(
       kernel: kernel, initfs: initfs, rootfs: URL(filePath: mount.source),
-      console: console, held: held, alias: aliasControl, cpus: config.cpus, networks: networks)
+      console: console, held: held, alias: aliasControl, cpus: config.cpus, networks: networks,
+      geometry: memoryGeometry, executionPolicy: executionPolicy)
     let machine = NativeVirtualMachine(
       control: control, group: group, id: entry.key,
       attachments: attachments)
@@ -231,6 +250,7 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       (try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]))
       ?? Data()
   }
+  public var memoryGeometry: NativeMemoryGeometry { control.geometry }
   public var processorCount: Int { control.cpus }
   public var networkCount: Int { control.networks.count }
   public var aliasDiagnosticEnabled: Bool { control.alias }
@@ -248,7 +268,7 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
     control.state.withLock { ($0.plugged, $0.requested) }
   }
   public func requestMemory(bytes: UInt64) throws {
-    guard bytes <= MemoryDevice.capacity, bytes % UInt64(MemoryDevice.block) == 0 else {
+    guard bytes <= control.geometry.dynamicBytes, bytes % UInt64(MemoryDevice.block) == 0 else {
       throw NativeFailure.unsupported
     }
     try control.state.withLock {

@@ -9,7 +9,14 @@ final class BlockDevice {
   private var descriptor: Int32
   let bytes: UInt64
   var written: UInt64 = 0
-  init(path: String, readOnly: Bool = false, interrupt: UInt32 = 36) throws {
+  let executionPolicy: NativeExecutionPolicy
+  private var spaceCheckedAt: ContinuousClock.Instant?
+  private var spaceAllowance: UInt64 = 0
+  init(
+    path: String, readOnly: Bool = false, interrupt: UInt32 = 36,
+    executionPolicy: NativeExecutionPolicy = .qualification
+  ) throws {
+    self.executionPolicy = executionPolicy
     self.readOnly = readOnly
     transport = VirtioMMIO(
       identity: 2, features: (1 << 9) | (1 << 1) | (1 << 2) | (readOnly ? 1 << 5 : 0),
@@ -26,17 +33,18 @@ final class BlockDevice {
     else { throw DeviceFailure.geometry }
     let owner = try JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any]
     guard owner?["root"] as? String == root.path,
-      owner?["purpose"] as? String == "isolated-container-product-G22",
+      owner?["purpose"] as? String == "isolated-container-managed-G23",
       owner?["uid"] as? Int == Int(getuid())
     else { throw DeviceFailure.geometry }
     descriptor = open(path, (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC | O_NOFOLLOW)
     guard descriptor >= 0 else { throw DeviceFailure.native(errno) }
     var metadata = stat()
-    guard fstat(descriptor, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0,
+      fstat(descriptor, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
       metadata.st_nlink == 1,
       readOnly
         ? metadata.st_size > 0 && metadata.st_size <= 512 << 20 : metadata.st_size == 8 << 30,
-      metadata.st_uid == getuid(), flock(descriptor, LOCK_EX | LOCK_NB) == 0,
+      metadata.st_uid == getuid(),
       fcntl(descriptor, F_NOCACHE, 1) == 0
     else {
       _ = Darwin.close(descriptor)
@@ -100,7 +108,28 @@ final class BlockDevice {
       guard total > 0 else { throw DeviceFailure.request }
       if kind == 1 {
         guard !readOnly else { throw DeviceFailure.request }
-        guard UInt64(total) <= (512 << 20) - written else { throw DeviceFailure.request }
+        if executionPolicy == .qualification {
+          guard UInt64(total) <= (512 << 20) - written else { throw DeviceFailure.request }
+        } else {
+          let now = ContinuousClock.now
+          if spaceCheckedAt.map({ $0.duration(to: now) >= .seconds(1) }) ?? true
+            || UInt64(total) > spaceAllowance
+          {
+            var space = statfs()
+            guard fstatfs(descriptor, &space) == 0, space.f_bsize > 0 else {
+              throw DeviceFailure.request
+            }
+            let available = space.f_bavail.multipliedReportingOverflow(by: UInt64(space.f_bsize))
+            guard !available.overflow, available.partialValue >= (1 << 30) + UInt64(total) else {
+              throw DeviceFailure.request
+            }
+            spaceAllowance = available.partialValue - (1 << 30)
+            spaceCheckedAt = now
+          }
+          guard UInt64(total) <= UInt64.max - written else { throw DeviceFailure.request }
+          // Charge every admitted byte conservatively, even an overwrite, until fresh free-space data.
+          spaceAllowance -= UInt64(total)
+        }
         written += UInt64(total)
       }
       var offset = sector * 512
@@ -113,7 +142,7 @@ final class BlockDevice {
               ? pread(descriptor, piece.baseAddress! + done, piece.count - done, off_t(offset))
               : pwrite(descriptor, piece.baseAddress! + done, piece.count - done, off_t(offset))
             if count < 0, errno == EINTR { continue }
-            guard count > 0 else { throw DeviceFailure.native(errno) }
+            guard count > 0 else { throw DeviceFailure.native(count == 0 ? EIO : errno) }
             done += count
             offset += UInt64(count)
           }

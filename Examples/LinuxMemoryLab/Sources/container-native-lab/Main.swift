@@ -26,11 +26,14 @@ import NativeLinuxVMM
     guard args.count >= 5 else { throw Failure.arguments }
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
-        || args.count == 6 && [
-          "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
-          "continuous", "continuous-cancel", "continuous-soak", "continuous-stop", "continuous-churn",
-          "continuous-expire",
-        ].contains(args[4])
+        || args.count == 6
+          && [
+            "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
+            "continuous", "continuous-cancel", "continuous-soak", "continuous-stop",
+            "continuous-churn",
+            "continuous-expire", "continuous-sustained", "continuous-uart", "memory-wide",
+            "memory-boot-wide",
+          ].contains(args[4])
     else { throw Failure.arguments }
     let output = URL(filePath: args[3])
     guard !FileManager.default.fileExists(atPath: output.path) else { throw Failure.arguments }
@@ -44,12 +47,22 @@ import NativeLinuxVMM
     guard let cpus = Int(ProcessInfo.processInfo.environment["SWIFTOS_LAB_CPUS"] ?? "2"),
       (1...4).contains(cpus)
     else { throw Failure.arguments }
+    let geometry: NativeMemoryGeometry
+    switch args[4] {
+    case "memory-wide":
+      geometry = try .init(bootBytes: 1024 << 20, dynamicBytes: 2 << 30)
+    case "memory-boot-wide":
+      geometry = try .init(bootBytes: 2 << 30, dynamicBytes: 256 << 20)
+    default: geometry = .qualification
+    }
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     let manager = NativeVirtualMachineManager(
       kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
       console: output.appending(path: "console.log"), held: args[4] == "held",
-      aliasControl: ["alias", "adaptive-busy", "continuous-cancel", "continuous-stop"].contains(args[4]),
-      group: group)
+      aliasControl: ["alias", "adaptive-busy", "continuous-cancel", "continuous-stop"].contains(
+        args[4]),
+      group: group, memoryGeometry: geometry,
+      executionPolicy: args[4] == "continuous-sustained" ? .sustained : .qualification)
     let links = try (0..<2).map { try IsolatedNetwork(index: $0) }
     let peers = links.map { EthernetPeer(link: $0) }
     let peerTasks = peers.map { peer in Task { try await peer.run() } }
@@ -58,7 +71,7 @@ import NativeLinuxVMM
     let container = try LinuxContainer(
       "swiftos-native",
       rootfs: .block(format: "ext4", source: args[2], destination: "/"),
-      vmm: manager, vm: .init(cpus: cpus, memoryInBytes: 1152 << 20)
+      vmm: manager, vm: .init(cpus: cpus, memoryInBytes: geometry.maximumBytes)
     ) { config in
       config.cpus = cpus
       config.memoryInBytes = 896 << 20
@@ -146,6 +159,7 @@ import NativeLinuxVMM
       "primaryError": primary, "cleanupErrors": cleanup,
       "networkEchoes": peers.map(\.echoed),
       "checked": checked, "serverOutput": serverOutput.text,
+      "bootBytes": geometry.bootBytes, "dynamicCapacityBytes": geometry.dynamicBytes,
       "controlPlaneHighBytes": 112 << 20, "controlPlaneMaximumBytes": 128 << 20,
       "serverOutputOverflow": serverOutput.overflowed, "physicalReleasedBytes": NSNull(),
     ]

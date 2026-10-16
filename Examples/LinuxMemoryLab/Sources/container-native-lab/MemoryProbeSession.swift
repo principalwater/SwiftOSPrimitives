@@ -1,14 +1,9 @@
-import ContainerWorkspaceCore
+import BoundedMemory
 import Foundation
 
 /// The wire has no multiplexing: one lease covers send through validated reply.
 actor MemoryProbeSession {
-  struct Observation: Sendable {
-    let sequence: UInt64
-    let capturedAt: UInt64
-    let total: UInt64
-    let available: UInt64
-  }
+  typealias Observation = GuestMemoryObservation
   struct Load: Sendable {
     let sequence: UInt64
     let count: Int

@@ -20,6 +20,8 @@ final class LinuxMachine {
   var wasCreated = false
   var memory: UnsafeMutableRawPointer?
   var capacity = 512 << 20
+  var executionPolicy = NativeExecutionPolicy.qualification
+  private var journal = ConsoleJournal(policy: .qualification)
   let base: UInt64 = 0x4000_0000
   var mapped = false
   var cpuCount = 1
@@ -27,8 +29,7 @@ final class LinuxMachine {
   var activeCPU = 0
   var activeRegisters = CPURegisters()
   var running = false
-  var console = Data()
-  var line = Data()
+  var console: Data { journal.retained }
   var ready = false
   var exits = 0
   var consoleSink: FileHandle?
@@ -62,13 +63,13 @@ final class LinuxMachine {
   }
   func memoryProgress() throws {
     guard let device = dynamicMemory else { return }
-    if disk != nil, phase == 5, device.plugged == UInt64(MemoryDevice.capacity) {
+    if disk != nil, phase == 5, device.plugged == UInt64(device.capacity) {
       phase = 6
       try feed("G 2\n")
     } else if disk != nil, phase == 7, device.plugged == 0 {
       phase = 8
       try feed("V 2\n")
-    } else if phase == 1, device.plugged == UInt64(MemoryDevice.capacity) {
+    } else if phase == 1, device.plugged == UInt64(device.capacity) {
       phase = 2
       try feed(disk == nil ? "S 1\n" : "L 1\n")
     } else if phase == 3, device.plugged == 0 {
@@ -93,7 +94,7 @@ final class LinuxMachine {
         phase = 3
       } else if text.hasPrefix("CH_SHRUNK 1 "), phase == 4 {
         guard device.plugged == 0 else { throw Failure.protocolError }
-        try requestMemory(UInt64(MemoryDevice.capacity))
+        try requestMemory(UInt64(device.capacity))
         phase = 5
       } else if text.hasPrefix("CH_LOAD_RUNNING 2"), phase == 6 {
         try requestMemory(0)
@@ -122,7 +123,7 @@ final class LinuxMachine {
     }
   }
   func requestMemory(_ size: UInt64) throws {
-    guard let device = dynamicMemory, size <= UInt64(MemoryDevice.capacity) else {
+    guard let device = dynamicMemory, size <= UInt64(device.capacity) else {
       throw Failure.protocolError
     }
     device.requested = size
@@ -163,7 +164,7 @@ final class LinuxMachine {
     try requireStopped()
     if address >= MemoryDevice.base, let device = dynamicMemory, count > 0 {
       let offset = address - MemoryDevice.base
-      guard offset < UInt64(MemoryDevice.capacity),
+      guard offset < UInt64(device.capacity),
         UInt64(count) <= UInt64(MemoryDevice.block) - offset % UInt64(MemoryDevice.block)
       else { throw Failure.boundary }
       let extent = device.extents[Int(offset / UInt64(MemoryDevice.block))]
@@ -197,7 +198,8 @@ final class LinuxMachine {
             let request = Data(bytes: try self.pointer(buffers[0].address, 24), count: 24)
             try self.requireStopped()
             let response = try device.request(
-              request, quiescence: (self.cpus?.isQuiescent ?? true, self.cpus?.epoch ?? 0, self.cpuCount))
+              request,
+              quiescence: (self.cpus?.isQuiescent ?? true, self.cpus?.epoch ?? 0, self.cpuCount))
             let destination = try self.pointer(buffers[1].address, 10)
             response.withUnsafeBytes {
               destination.copyMemory(from: $0.baseAddress!, byteCount: 10)
@@ -241,6 +243,7 @@ final class LinuxMachine {
   }
   func boot(kernel: Data, initrd: Data) throws {
     try requireStopped()
+    journal = ConsoleJournal(policy: executionPolicy)
     guard !initrd.isEmpty || control != nil, kernel.count >= 64,
       kernel[56..<60].elementsEqual([0x41, 0x52, 0x4d, 0x64])
     else { throw Failure.arguments }
@@ -288,7 +291,8 @@ final class LinuxMachine {
     cpus = pool
     try pool.create(count: cpuCount)
     _ = try pool.activate(0, pc: base + textOffset, context: dtbAddress)
-    let deadline = ContinuousClock.now.advanced(by: .seconds(disk == nil ? 45 : 120))
+    var executionFence = ExecutionFence(
+      policy: executionPolicy, hasDisk: disk != nil, now: .now)
     control?.state.withLock { $0.running = true }
     while control != nil || (dynamicMemory == nil ? !ready : !memoryComplete) {
       if let control, let vsock {
@@ -333,7 +337,7 @@ final class LinuxMachine {
       } else {
         try memoryProgress()
       }
-      guard ContinuousClock.now < deadline, exits < 3_000_000 else { throw Failure.deadline }
+      try executionFence.check(now: .now, exits: exits)
       running = true
       let events: [(Int, CPUExit)]
       do { events = try pool.runEpoch() } catch {
@@ -350,6 +354,7 @@ final class LinuxMachine {
     }
   }
   private func handleExit(_ event: CPUExit) throws {
+    guard exits < Int.max else { throw Failure.boundary }
     exits += 1
     lastPC = try register(HV_REG_PC)
     if event.reason == HV_EXIT_REASON_CANCELED.rawValue { return }
@@ -515,14 +520,9 @@ final class LinuxMachine {
       if syndrome & 64 != 0 {
         let value = rt == 31 ? 0 : try register(reg)
         if offset == 0 {
-          guard console.count < 2 << 20, line.count < 8192 else { throw Failure.boundary }
-          let byte = UInt8(truncatingIfNeeded: value)
-          console.append(byte)
-          line.append(byte)
-          if byte == 10 {
-            try consoleSink?.write(contentsOf: line)
-            try consoleLine(String(decoding: line, as: UTF8.self))
-            line.removeAll(keepingCapacity: true)
+          if let completed = try journal.append(UInt8(truncatingIfNeeded: value), sink: consoleSink)
+          {
+            try consoleLine(completed)
           }
         } else if offset == 0x38 {
           uartMask = value

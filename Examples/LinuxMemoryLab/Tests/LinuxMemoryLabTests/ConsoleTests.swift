@@ -23,7 +23,7 @@ func failedStartPreservesConsoleAndRetiresPartialAttachments(_ closedNIC: Bool) 
     _ = rmdir(root.path)
   }
   try JSONSerialization.data(withJSONObject: [
-    "root": root.path, "uid": Int(getuid()), "purpose": "isolated-container-product-G22",
+    "root": root.path, "uid": Int(getuid()), "purpose": "isolated-container-managed-G23",
   ]).write(to: marker, options: .withoutOverwriting)
   for (file, size) in [(disk, Int64(8 << 30)), (initfs, Int64(4096))] {
     let descriptor = open(file.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)

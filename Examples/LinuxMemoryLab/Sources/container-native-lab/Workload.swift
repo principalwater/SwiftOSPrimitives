@@ -3,12 +3,50 @@ import Containerization
 import Darwin
 import Foundation
 import NativeLinuxVMM
+import PageMemory
 
 extension Lab {
+  struct RunningSQL: Sendable {
+    let process: LinuxProcess
+    let output: BoundedOutput
+
+    func discard() async -> [String] {
+      await Task { @concurrent in
+        var errors: [String] = []
+        do { try await process.kill(.kill) } catch { errors.append("kill \(error)") }
+        do { try await process.delete() } catch { errors.append("delete \(error)") }
+        return errors
+      }.value
+    }
+
+    func finish() async throws -> String {
+      let status: Int32
+      do {
+        status = try await process.wait(timeoutInSeconds: 12).exitCode
+      } catch {
+        let failures = await discard()
+        throw Failure.check("\(error) cleanup=\(failures)")
+      }
+      try await process.delete()
+      guard status == 0, !output.overflowed else {
+        throw Failure.check("SQL " + output.text)
+      }
+      return output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+  }
+
   static func sql(
     _ container: LinuxContainer, id: String = UUID().uuidString,
     query: String, queryID: String? = nil
   ) async throws -> String {
+    let execution = try await startSQL(container, id: id, query: query, queryID: queryID)
+    return try await execution.finish()
+  }
+
+  static func startSQL(
+    _ container: LinuxContainer, id: String = UUID().uuidString,
+    query: String, queryID: String? = nil
+  ) async throws -> RunningSQL {
     let output = BoundedOutput()
     let process = try await container.exec(id) { config in
       config.arguments = [
@@ -24,24 +62,15 @@ extension Lab {
       config.stderr = output
       config.noNewPrivileges = true
     }
-    let status: Int32
+    let execution = RunningSQL(process: process, output: output)
     do {
       try await process.start()
-      status = try await process.wait(timeoutInSeconds: 12).exitCode
+      guard process.pid > 0 else { throw Failure.check("SQL process did not start") }
     } catch {
-      let failures = await Task { @concurrent in
-        var errors: [String] = []
-        do { try await process.kill(.kill) } catch { errors.append("kill \(error)") }
-        do { try await process.delete() } catch { errors.append("delete \(error)") }
-        return errors
-      }.value
+      let failures = await execution.discard()
       throw Failure.check("\(error) cleanup=\(failures)")
     }
-    try await process.delete()
-    guard status == 0, !output.overflowed else {
-      throw Failure.check("SQL " + output.text)
-    }
-    return output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return execution
   }
   static func waitMemory(
     _ vm: NativeVirtualMachine, bytes: UInt64,
@@ -56,6 +85,7 @@ extension Lab {
     container: LinuxContainer, vm: NativeVirtualMachine, output: URL,
     probe: URL, mode: String
   ) async throws -> Bool {
+    let geometry = vm.memoryGeometry
     var commands: [[String: String]] = []
     var observations: [[String: Any]] = []
     var resources: [[String: Any]] = []
@@ -64,7 +94,7 @@ extension Lab {
     let adaptive = ["adaptive", "adaptive-busy"].contains(mode)
     let continuous = [
       "continuous", "continuous-cancel", "continuous-soak", "continuous-stop", "continuous-churn",
-      "continuous-expire",
+      "continuous-expire", "continuous-sustained", "continuous-uart",
     ].contains(mode)
     var churn: [[String: UInt64]] = []
     var expectedGracefulStop = false
@@ -77,9 +107,10 @@ extension Lab {
       let elapsed = began.duration(to: .now).components
       return UInt64(elapsed.seconds) * 1_000_000_000 + UInt64(elapsed.attoseconds / 1_000_000_000)
     }
-    guard let budget = BalloonBudget(
-      installedBytes: 1152 << 20, minimumResidentBytes: 1024 << 20,
-      granuleBytes: 2 << 20, maximumStepBytes: 128 << 20),
+    guard
+      let budget = BalloonBudget(
+        installedBytes: geometry.maximumBytes, minimumResidentBytes: geometry.bootBytes,
+        granuleBytes: 2 << 20, maximumStepBytes: min(128 << 20, geometry.dynamicBytes)),
       var governor = BalloonController(
         budget: budget, epoch: 1, guestReserveBytes: 512 << 20, hysteresisBytes: 32 << 20,
         maximumObservationAgeNanoseconds: 3_000_000_000, cooldownNanoseconds: 300_000_000,
@@ -91,6 +122,8 @@ extension Lab {
     let session = MemoryProbeSession(
       input: input, output: canaryOutput, cpus: vm.processorCount, began: began)
     var canary: LinuxProcess?
+    var memoryMonitor: LinuxProcess?
+    var memorySession: MemoryObservationSession?
     var activeLoad: Task<String, Error>?
     var primary = ""
     var cleanup: [String] = []
@@ -162,10 +195,10 @@ extension Lab {
       try await canary!.start()
       let initial = try await session.start()
       let initialMemory = initial.total
-      guard initialMemory >= 128 << 20, initialMemory <= 1152 << 20 else {
+      guard initialMemory >= geometry.dynamicBytes, initialMemory <= geometry.maximumBytes else {
         throw Failure.check("initial guest geometry")
       }
-      let bootGuestBytes = initialMemory - (128 << 20)
+      let bootGuestBytes = initialMemory - geometry.dynamicBytes
       let engine = try await sql(
         container,
         query:
@@ -219,18 +252,19 @@ extension Lab {
         }
         let sample = BalloonController.Observation(
           epoch: 1, sequence: UInt64(sequence), capturedAtNanoseconds: capturedAt,
-          actualResidentBytes: (1024 << 20) + state.pluggedBytes,
-          requestedResidentBytes: (1024 << 20) + state.requestedBytes,
-          guestAvailableBytes: available, hostResidentLimitBytes: 1152 << 20,
+          actualResidentBytes: geometry.bootBytes + state.pluggedBytes,
+          requestedResidentBytes: geometry.bootBytes + state.requestedBytes,
+          guestAvailableBytes: available, hostResidentLimitBytes: geometry.maximumBytes,
           hostUnderPressure: pressure != 1, guestUnderPressure: false)
         let request = try governor.observe(sample, nowNanoseconds: returnedAt)
         if let request {
-          try vm.requestMemory(bytes: request.targetResidentBytes - (1024 << 20))
+          try vm.requestMemory(bytes: request.targetResidentBytes - geometry.bootBytes)
           let deliveredAt = now()
           try governor.didApply(
             request, afterObservationSequence: UInt64(sequence), atNanoseconds: deliveredAt)
           policyRequests.append([
-            "initialBytes": request.initialResidentBytes, "targetBytes": request.targetResidentBytes,
+            "initialBytes": request.initialResidentBytes,
+            "targetBytes": request.targetResidentBytes,
             "sequence": request.sequence, "issuedAt": request.issuedAtNanoseconds,
             "deliveredAt": deliveredAt,
           ])
@@ -252,7 +286,9 @@ extension Lab {
           try control()
           if vm.pluggedBytes == bytes, governor.pendingRequest == nil,
             total == bootGuestBytes + bytes
-          { return total }
+          {
+            return total
+          }
           try await Task.sleep(for: .milliseconds(200))
         } while true
       }
@@ -280,7 +316,9 @@ extension Lab {
           guard status.failure.isEmpty else { throw Failure.check("observer " + status.failure) }
           if status.running, status.sampleCount > 0, !status.pending, status.capacityReady,
             bytes.map({ vm.pluggedBytes == $0 }) ?? (vm.pluggedBytes > 0)
-          { return }
+          {
+            return
+          }
           guard ContinuousClock.now < deadline else { throw Failure.check("observer convergence") }
           try await Task.sleep(for: .milliseconds(20))
         } while true
@@ -295,7 +333,15 @@ extension Lab {
           guard values.count == 1, let memory = values[0].memory,
             let events = values[0].memoryEvents
           else { throw Failure.check("cgroup statistics missing") }
+          let host = try ProcessMemorySnapshot.capture()
+          var usage = rusage()
+          guard getrusage(RUSAGE_SELF, &usage) == 0 else { throw Failure.check("host rusage") }
           resources.append([
+            "hostCapturedAtNanoseconds": now(), "hostResidentBytes": host.residentBytes,
+            "hostPhysicalFootprintBytes": host.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
+            "hostUserMicroseconds": usage.ru_utime.tv_sec * 1_000_000 + Int(usage.ru_utime.tv_usec),
+            "hostSystemMicroseconds": usage.ru_stime.tv_sec * 1_000_000
+              + Int(usage.ru_stime.tv_usec),
             "phase": phase, "usageBytes": memory.usageBytes,
             "limitBytes": memory.limitBytes, "swapBytes": memory.swapUsageBytes,
             "cacheBytes": memory.cacheBytes, "anonBytes": memory.anon,
@@ -311,13 +357,28 @@ extension Lab {
           throw error
         }
       }
-      try await waitMemory(vm, bytes: 128 << 20)
+      try await waitMemory(vm, bytes: geometry.dynamicBytes)
       try await resourceSnapshot("baseline")
       if continuous {
+        let monitorInput = CommandInput()
+        let monitorOutput = ProbeOutput()
+        let telemetry = MemoryObservationSession(
+          input: monitorInput, output: monitorOutput, began: began)
+        memorySession = telemetry
+        memoryMonitor = try await container.exec("memory-monitor") { config in
+          config.arguments = [guestProbe, "--memory-monitor"]
+          config.stdin = monitorInput
+          config.stdout = monitorOutput
+          config.stderr = monitorOutput
+          config.noNewPrivileges = true
+        }
+        try await memoryMonitor!.start()
+        try await telemetry.start()
         let driver = ContinuousMemoryGovernor(
-          probe: session, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
+          probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
           lifetimeDeadline: mode == "continuous-expire"
-            ? .now.advanced(by: .seconds(2)) : began.advanced(by: .seconds(180)),
+            ? .now.advanced(by: .seconds(2))
+            : mode == "continuous-sustained" ? nil : began.advanced(by: .seconds(180)),
           samplingInterval: mode == "continuous-soak" ? .milliseconds(100) : .milliseconds(200))
         observer = driver
         observerTask = Task { try await driver.run() }
@@ -356,20 +417,23 @@ extension Lab {
             expectedGracefulStop = true
             try await resourceSnapshot("gracefully-stopped-pending")
           } else {
-          observerTask!.cancel()
-          switch await observerTask!.result {
-          case .success: throw Failure.check("observer ignored cancellation")
-          case .failure(let error):
-            guard error is CancellationError else { throw error }
+            observerTask!.cancel()
+            switch await observerTask!.result {
+            case .success: throw Failure.check("observer ignored cancellation")
+            case .failure(let error):
+              guard error is CancellationError else { throw error }
+            }
+            observerTask = nil
+            expectedCancellation = true
+            guard !driver.status.running, try await sql(container, query: integrity) == expected
+            else {
+              throw Failure.check("cancel retirement/integrity")
+            }
+            try await resourceSnapshot("cancelled-pending")
           }
-          observerTask = nil
-          expectedCancellation = true
-          guard !driver.status.running, try await sql(container, query: integrity) == expected else {
-            throw Failure.check("cancel retirement/integrity")
-          }
-          try await resourceSnapshot("cancelled-pending")
-          }
-        } else { try await waitObserver(0) }
+        } else {
+          try await waitObserver(0)
+        }
       }
       if vm.aliasDiagnosticEnabled, !adaptive, !continuous {
         try vm.requestMemory(bytes: 0)
@@ -385,13 +449,43 @@ extension Lab {
           throw Failure.check("BUSY data")
         }
         // Validate the refusal separately so its full integrity scan cannot consume the load window.
-        try vm.requestMemory(bytes: 128 << 20)
+        try vm.requestMemory(bytes: geometry.dynamicBytes)
       }
-      for cycle in (expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry ? [] : [1, 2]) {
+      if mode == "continuous-uart" {
+        let agent = try await vm.dialAgent()
+        do {
+          for index in 0..<64 {
+            let text =
+              "<4>SWIFTOS_UART_BURST_\(index) " + String(repeating: "x", count: 384) + "\n"
+            let issuedAt = now()
+            try await agent.writeFile(
+              path: "/dev/kmsg", data: Data(text.utf8), flags: .init(create: false), mode: 0)
+            commands.append([
+              "uartBurst": String(index), "uartWriteNanoseconds": String(now() - issuedAt),
+            ])
+            guard observer?.status.failure.isEmpty == true else {
+              throw Failure.check("UART stalled observer")
+            }
+          }
+          try await agent.close()
+          try await waitObserver(0)
+        } catch {
+          try? await agent.close()
+          throw error
+        }
+      }
+      for cycle
+        in (expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry ? [] : [1, 2])
+      {
         let queryID = "swiftos-load-\(cycle)"
         let query =
           "SELECT sum(n.number + sleepEachRow(0.00004)) FROM numbers(100000) AS n INNER JOIN (SELECT id, payload FROM default.ram_lab WHERE id < 100000) AS r ON n.number = r.id AND repeat(hex(cityHash64(n.number)), 8) = r.payload LIMIT 1 SETTINGS join_algorithm='hash'"
-        activeLoad = Task { try await sql(container, query: query, queryID: queryID) }
+        let execution = try await startSQL(container, query: query, queryID: queryID)
+        commands.append([
+          "cycle": String(cycle), "loadProcessPID": String(execution.process.pid),
+          "loadStartReturnedAt": String(now()),
+        ])
+        activeLoad = Task { try await execution.finish() }
         var observed: UInt64 = 0
         for _ in 0..<24 {
           let state = try await loadState(cycle: cycle)
@@ -414,8 +508,8 @@ extension Lab {
             throw Failure.check("continuous load not live after unplug")
           }
           let shrunk = try await verify()
-          guard initialMemory >= shrunk, initialMemory - shrunk == 128 << 20,
-            grown > 0, grown <= 128 << 20, regrown == shrunk + grown
+          guard initialMemory >= shrunk, initialMemory - shrunk == geometry.dynamicBytes,
+            grown > 0, grown <= geometry.dynamicBytes, regrown == shrunk + grown
           else { throw Failure.check("continuous guest capacity") }
           try await resourceSnapshot("continuous-shrunk-\(cycle)")
           let aggregate = try await activeLoad!.value
@@ -438,11 +532,13 @@ extension Lab {
           let issued = policyRequests.count
           try control()
           guard policyRequests.count == issued + 1,
-            policyRequests.last?["targetBytes"] == 1024 << 20
+            policyRequests.last?["targetBytes"] == geometry.bootBytes
           else {
             throw Failure.check("real idle headroom did not authorize reclaim")
           }
-        } else { try vm.requestMemory(bytes: 0) }
+        } else {
+          try vm.requestMemory(bytes: 0)
+        }
         if mode == "crash" {
           let path = output.appending(path: "CRASH_READY.pending")
           try JSONSerialization.data(withJSONObject: [
@@ -468,8 +564,11 @@ extension Lab {
         if cycle == 1, vm.aliasDiagnosticEnabled, !adaptive {
           try vm.releaseDiagnosticAlias()
         }
-        if adaptive { _ = try await settle(0) }
-        else { try await waitMemory(vm, bytes: 0, deadline: unplugDeadline) }
+        if adaptive {
+          _ = try await settle(0)
+        } else {
+          try await waitMemory(vm, bytes: 0, deadline: unplugDeadline)
+        }
         let stillRunning = try await loadState(cycle: cycle)
         commands.append(["afterUnplugQueryState": "\(stillRunning.0)\t\(stillRunning.1)"])
         let memoryAfterUnplug = stillRunning.1
@@ -478,7 +577,8 @@ extension Lab {
         let shrunk = try await waitGuestMemory(bootGuestBytes, deadline: unplugDeadline)
         try await resourceSnapshot("shrunk-\(cycle)")
         guard initialMemory >= shrunk, cycleInitial >= shrunk,
-          cycleInitial - shrunk == cyclePlugged, cyclePlugged > 0, initialMemory - shrunk == 128 << 20
+          cycleInitial - shrunk == cyclePlugged, cyclePlugged > 0,
+          initialMemory - shrunk == geometry.dynamicBytes
         else {
           throw Failure.check("guest capacity not reduced")
         }
@@ -498,27 +598,28 @@ extension Lab {
           try control()
           guard policyRequests.count == issued + 1,
             let growth = governor.pendingRequest,
-            growth.targetResidentBytes > 1024 << 20,
-            growth.targetResidentBytes <= 1152 << 20,
+            growth.targetResidentBytes > geometry.bootBytes,
+            growth.targetResidentBytes <= geometry.maximumBytes,
             pressureAvailable < 512 << 20
           else { throw Failure.check("real guest pressure did not authorize growth") }
           try await resourceSnapshot("pressure-\(cycle)")
-          regrown = try await settle(growth.targetResidentBytes - (1024 << 20))
+          regrown = try await settle(growth.targetResidentBytes - geometry.bootBytes)
           // The checked private allocation is released only after actual growth has completed.
           _ = try await verify("DROP")
           commands.append([
             "pressureAvailableBytes": String(pressureAvailable),
-            "releasedAvailableBytes": String(available), "pressureAllocationBytes": String(320 << 20),
+            "releasedAvailableBytes": String(available),
+            "pressureAllocationBytes": String(320 << 20),
           ])
           try await Task.sleep(for: .milliseconds(350))
         } else {
           let deadline = ContinuousClock.now.advanced(by: .seconds(8))
-          try vm.requestMemory(bytes: 128 << 20)
-          try await waitMemory(vm, bytes: 128 << 20, deadline: deadline)
+          try vm.requestMemory(bytes: geometry.dynamicBytes)
+          try await waitMemory(vm, bytes: geometry.dynamicBytes, deadline: deadline)
           regrown = try await waitGuestMemory(initialMemory, deadline: deadline)
         }
         let restored = vm.pluggedBytes
-        guard restored > 0, restored <= 128 << 20,
+        guard restored > 0, restored <= geometry.dynamicBytes,
           regrown == shrunk + restored
         else { throw Failure.check("guest capacity not restored to the policy target") }
         try await resourceSnapshot("regrown-\(cycle)")
@@ -531,7 +632,8 @@ extension Lab {
         ])
       }
       if mode == "continuous-churn" {
-        for cycle in 3...20 {
+        var completedRetirements: UInt64 = 0
+        for cycle in 3...48 {
           _ = try await verify("HOLD")
           try await waitObserver(nil)
           let grown = vm.pluggedBytes
@@ -540,14 +642,22 @@ extension Lab {
           try await waitObserver(0)
           _ = try await verify()
           churn.append(["cycle": UInt64(cycle), "regrownBackingBytes": grown])
+          completedRetirements += grown
           if cycle % 4 == 0 {
             guard try await sql(container, query: integrity) == expected else {
               throw Failure.check("churn durable integrity")
             }
           }
+          if completedRetirements > 2 << 30,
+            observer!.snapshot.requestHistory.totalCount > 32
+          {
+            break
+          }
         }
-        guard let observer, observer.snapshot.requestHistory.totalCount > 32 else {
-          throw Failure.check("request history did not wrap")
+        guard let observer, observer.snapshot.requestHistory.totalCount > 32,
+          completedRetirements > 2 << 30
+        else {
+          throw Failure.check("request and native retirement histories did not wrap")
         }
         try await resourceSnapshot("request-history-wrapped")
       }
@@ -563,21 +673,55 @@ extension Lab {
         }
         try await resourceSnapshot("history-wrapped")
       }
+      if mode == "continuous-sustained", let observer {
+        var checkedAt = ContinuousClock.now
+        while began.duration(to: .now) < .seconds(125) {
+          guard observer.status.running, observer.status.failure.isEmpty else {
+            throw Failure.check("sustained governor ended")
+          }
+          if checkedAt.duration(to: .now) >= .seconds(10) {
+            guard try await sql(container, query: integrity) == expected else {
+              throw Failure.check("sustained integrity")
+            }
+            try await resourceSnapshot("sustained-checkpoint")
+            checkedAt = .now
+          }
+          try await Task.sleep(for: .milliseconds(200))
+        }
+        guard try await sql(container, query: integrity) == expected else {
+          throw Failure.check("sustained final integrity")
+        }
+        commands.append(["sustainedWorkloadNanoseconds": String(now())])
+        try await resourceSnapshot("sustained-past-original-vmm-deadline")
+      }
       if let observer, let task = observerTask {
         observer.requestStop()
         try await task.value
         observerTask = nil
         guard !observer.status.running else { throw Failure.check("observer still running") }
       }
-      if !expectedCancellation { _ = try await verify(quit: true) }
+      _ = try await verify(quit: true)
       input.finish()
-      if !expectedCancellation {
-        guard try await canary!.wait(timeoutInSeconds: 5).exitCode == 0 else {
-          throw Failure.check("canary exit")
-        }
-        try await canary!.delete()
-        canary = nil
+      guard try await canary!.wait(timeoutInSeconds: 5).exitCode == 0 else {
+        throw Failure.check("canary exit")
       }
+      try await canary!.delete()
+      canary = nil
+      if let memorySession {
+        if expectedCancellation {
+          await memorySession.close()
+        } else {
+          try await memorySession.quit()
+        }
+      }
+      if let memoryMonitor {
+        let status = try await memoryMonitor.wait(timeoutInSeconds: 5)
+        guard expectedCancellation || status.exitCode == 0 else {
+          throw Failure.check("memory monitor exit")
+        }
+        try await memoryMonitor.delete()
+      }
+      memoryMonitor = nil
     } catch { primary = String(describing: error) }
     if let task = observerTask {
       task.cancel()
@@ -588,19 +732,22 @@ extension Lab {
       }
     }
     await session.close()
+    await memorySession?.close()
     input.finish()
-    if let canary {
+    for (name, process) in [("canary", canary), ("memory monitor", memoryMonitor)] {
+      guard let process else { continue }
       let failures = await Task { @concurrent in
         var errors: [String] = []
         do {
           // Closed stdin can retire the guest before a kill request reaches vminitd.
-          _ = try await canary.wait(timeoutInSeconds: 1)
+          _ = try await process.wait(timeoutInSeconds: 1)
         } catch {
-          do { try await canary.kill(.kill) } catch { errors.append("canary kill \(error)") }
-          do { _ = try await canary.wait(timeoutInSeconds: 5) }
-          catch { errors.append("canary wait \(error)") }
+          do { try await process.kill(.kill) } catch { errors.append("\(name) kill \(error)") }
+          do { _ = try await process.wait(timeoutInSeconds: 5) } catch {
+            errors.append("\(name) wait \(error)")
+          }
         }
-        do { try await canary.delete() } catch { errors.append("canary delete \(error)") }
+        do { try await process.delete() } catch { errors.append("\(name) delete \(error)") }
         return errors
       }.value
       cleanup += failures
@@ -639,7 +786,9 @@ extension Lab {
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: output.appending(path: "workload.json"), options: .withoutOverwriting)
     guard primary.isEmpty, cleanup.isEmpty,
-      expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry || observations.count == 2 else {
+      expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry
+        || observations.count == 2
+    else {
       throw Failure.check(primary)
     }
     return true
