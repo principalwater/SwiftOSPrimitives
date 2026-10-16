@@ -27,6 +27,11 @@ reclamation and explicitly releases mappings. The package has no third-party
 dependencies; its package products are implemented entirely in Swift. An optional,
 standalone Rust benchmark reference is kept outside the products for comparisons.
 
+BoundedMemory also provides `RecentHistory<Element>` for bounded telemetry. It
+retains the newest records in order, counts discarded records monotonically and
+keeps previous snapshots stable. Its trusted capacity is 1...16,384 records;
+filling diagnostic history does not terminate the operation that owns it.
+
 ## Requirements
 
 Swift 6.4 or later; development and validation use Swift 6.4.1.
