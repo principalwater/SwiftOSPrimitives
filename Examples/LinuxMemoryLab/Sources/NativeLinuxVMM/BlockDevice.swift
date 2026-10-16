@@ -52,6 +52,27 @@ final class BlockDevice {
     }
     bytes = UInt64(metadata.st_size)
   }
+  init(
+    resources: NativeBootResources, readOnly: Bool, interrupt: UInt32 = 36,
+    executionPolicy: NativeExecutionPolicy
+  ) throws {
+    self.executionPolicy = executionPolicy
+    self.readOnly = readOnly
+    transport = VirtioMMIO(
+      identity: 2, features: (1 << 9) | (1 << 1) | (1 << 2) | (readOnly ? 1 << 5 : 0),
+      interrupt: interrupt)
+    descriptor = try resources.duplicateDisk(readOnly: readOnly)
+    var metadata = stat()
+    guard fstat(descriptor, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+      metadata.st_uid == getuid(), metadata.st_nlink == 1, metadata.st_mode & 0o077 == 0,
+      metadata.st_size > 0, metadata.st_size % 512 == 0,
+      UInt64(metadata.st_size) <= (readOnly ? 512 << 20 : 1 << 40)
+    else {
+      Darwin.close(descriptor)
+      throw DeviceFailure.geometry
+    }
+    bytes = UInt64(metadata.st_size)
+  }
   func config() -> Data {
     var sectors = (bytes / 512).littleEndian
     var bytes = Data(bytes: &sectors, count: 8)

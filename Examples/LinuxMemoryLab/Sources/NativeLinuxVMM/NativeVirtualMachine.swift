@@ -49,10 +49,11 @@ final class NativeControl: Sendable {
   }
   let state: Mutex<State>
   let memoryQuarantineRequested = Atomic(false)
-  let kernel: URL
-  let initfs: URL
+  let kernel: URL?
+  let initfs: URL?
   let rootfs: URL
-  let console: URL
+  let console: URL?
+  let resources: NativeBootResources?
   let held: Bool
   let alias: Bool
   let cpus: Int
@@ -61,9 +62,9 @@ final class NativeControl: Sendable {
   let networks: [IsolatedNetwork]
 
   init(
-    kernel: URL, initfs: URL, rootfs: URL, console: URL, held: Bool, alias: Bool, cpus: Int = 1,
+    kernel: URL?, initfs: URL?, rootfs: URL, console: URL?, held: Bool, alias: Bool, cpus: Int = 1,
     networks: [IsolatedNetwork] = [], geometry: NativeMemoryGeometry = .qualification,
-    executionPolicy: NativeExecutionPolicy = .qualification
+    executionPolicy: NativeExecutionPolicy = .qualification, resources: NativeBootResources? = nil
   ) {
     state = Mutex(State(requested: geometry.dynamicBytes))
     self.geometry = geometry
@@ -72,6 +73,7 @@ final class NativeControl: Sendable {
     self.initfs = initfs
     self.rootfs = rootfs
     self.console = console
+    self.resources = resources
     self.held = held
     self.alias = alias
     self.cpus = cpus
@@ -92,18 +94,35 @@ final class NativeControl: Sendable {
     var primary = ""
     do {
       guard lease else { throw NativeFailure.processBusy }
-      machine.disk = try BlockDevice(path: initfs.path, readOnly: true)
-      machine.rootDisk = try BlockDevice(
-        path: rootfs.path, interrupt: 37, executionPolicy: executionPolicy)
+      let kernelImage: Data
+      if let resources {
+        machine.disk = try BlockDevice(
+          resources: resources, readOnly: true, executionPolicy: executionPolicy)
+        machine.rootDisk = try BlockDevice(
+          resources: resources, readOnly: false, interrupt: 37, executionPolicy: executionPolicy)
+      } else {
+        guard let initfs else { throw NativeFailure.unsupported }
+        machine.disk = try BlockDevice(path: initfs.path, readOnly: true)
+        machine.rootDisk = try BlockDevice(
+          path: rootfs.path, interrupt: 37, executionPolicy: executionPolicy)
+      }
       machine.vsock = VsockDevice(control: self)
       for network in networks { machine.networks.append(try NetworkDevice(network: network)) }
-      let consoleDescriptor = open(
-        console.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
-      guard consoleDescriptor >= 0 else {
-        throw NativeFailure.stopped("console-open \(errno)")
+      if let resources {
+        machine.consoleSink = FileHandle(
+          fileDescriptor: try resources.duplicateConsole(), closeOnDealloc: true)
+        kernelImage = try resources.takeKernel()
+      } else {
+        guard let kernel, let console else { throw NativeFailure.unsupported }
+        let consoleDescriptor = open(
+          console.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        guard consoleDescriptor >= 0 else {
+          throw NativeFailure.stopped("console-open \(errno)")
+        }
+        machine.consoleSink = FileHandle(fileDescriptor: consoleDescriptor, closeOnDealloc: true)
+        kernelImage = try Data(contentsOf: kernel, options: .mappedIfSafe)
       }
-      machine.consoleSink = FileHandle(fileDescriptor: consoleDescriptor, closeOnDealloc: true)
-      try machine.boot(kernel: Data(contentsOf: kernel, options: .mappedIfSafe), initrd: Data())
+      try machine.boot(kernel: consume kernelImage, initrd: Data())
     } catch { primary = String(describing: error) }
     machine.vsock?.close()
     var cleanup = machine.close()
@@ -165,14 +184,16 @@ final class NativeControl: Sendable {
 
 /// Private-NIC research backend for the current Apple Containerization API.
 public final class NativeVirtualMachineManager: VirtualMachineManager {
-  public let kernel: URL
-  public let initfs: URL
-  public let console: URL
+  /// Legacy research path metadata; nil when resources were admitted by descriptor.
+  public let kernel: URL?
+  public let initfs: URL?
+  public let console: URL?
   public let held: Bool
   public let aliasControl: Bool
   public let group: MultiThreadedEventLoopGroup
   public let memoryGeometry: NativeMemoryGeometry
   public let executionPolicy: NativeExecutionPolicy
+  private let resources: NativeBootResources?
   private let owner = Mutex<NativeVirtualMachine?>(nil)
 
   public init(
@@ -189,6 +210,23 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     self.held = held
     self.aliasControl = aliasControl
     self.group = group
+    self.resources = nil
+  }
+  /// Uses only pinned resources. The root mount must use resources.mountSource verbatim.
+  public init(
+    resources: NativeBootResources, group: MultiThreadedEventLoopGroup,
+    memoryGeometry: NativeMemoryGeometry = .qualification,
+    executionPolicy: NativeExecutionPolicy = .sustained
+  ) {
+    self.resources = resources
+    kernel = nil
+    initfs = nil
+    console = nil
+    held = false
+    aliasControl = false
+    self.group = group
+    self.memoryGeometry = memoryGeometry
+    self.executionPolicy = executionPolicy
   }
   public var instance: NativeVirtualMachine? { owner.withLock { $0 } }
   public func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
@@ -199,6 +237,9 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
       let mount = entry.value.first, mount.type == "ext4", mount.destination == "/",
       case .virtioblk(let blockOptions) = mount.runtimeOptions, blockOptions.isEmpty
     else { throw NativeFailure.unsupported }
+    guard resources.map({ mount.source == $0.mountSource }) ?? true else {
+      throw NativeFailure.unsupported
+    }
     let networks = try config.interfaces.enumerated().map { index, interface in
       guard let network = interface as? IsolatedNetwork, network.index == index else {
         throw NativeFailure.unsupported
@@ -223,12 +264,13 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     let control = NativeControl(
       kernel: kernel, initfs: initfs, rootfs: URL(filePath: mount.source),
       console: console, held: held, alias: aliasControl, cpus: config.cpus, networks: networks,
-      geometry: memoryGeometry, executionPolicy: executionPolicy)
+      geometry: memoryGeometry, executionPolicy: executionPolicy, resources: resources)
     let machine = NativeVirtualMachine(
       control: control, group: group, id: entry.key,
       attachments: attachments)
     try owner.withLock {
       guard $0 == nil else { throw NativeFailure.state }
+      try resources?.claim()
       $0 = machine
     }
     return machine

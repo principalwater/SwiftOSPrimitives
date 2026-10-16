@@ -256,7 +256,7 @@ final class LinuxMachine {
   func set(_ reg: hv_reg_t, _ value: UInt64) throws {
     try activeRegisters.set(reg, value)
   }
-  func boot(kernel: Data, initrd: Data) throws {
+  func boot(kernel: consuming Data, initrd: Data) throws {
     try requireStopped()
     journal = ConsoleJournal(policy: executionPolicy)
     guard !initrd.isEmpty || control != nil, kernel.count >= 64,

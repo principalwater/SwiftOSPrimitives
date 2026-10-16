@@ -26,7 +26,7 @@ import NativeLinuxVMM
     guard args.count >= 5 else { throw Failure.arguments }
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
-        || args.count == 6
+        || [6, 8].contains(args.count)
           && [
             "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
             "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
@@ -38,6 +38,14 @@ import NativeLinuxVMM
             "memory-boot-wide",
           ].contains(args[4])
     else { throw Failure.arguments }
+    if args.count == 8 {
+      guard args[6] == "--boot-directory",
+        [
+          "memory", "adaptive", "continuous", "continuous-sustained", "memory-wide",
+          "memory-boot-wide",
+        ].contains(args[4])
+      else { throw Failure.arguments }
+    }
     let output = URL(filePath: args[3])
     guard !FileManager.default.fileExists(atPath: output.path) else { throw Failure.arguments }
     try FileManager.default.createDirectory(
@@ -58,17 +66,32 @@ import NativeLinuxVMM
       geometry = try .init(bootBytes: 2 << 30, dynamicBytes: 256 << 20)
     default: geometry = .qualification
     }
+    let resources: NativeBootResources?
+    if args.count == 8 {
+      let fd = open(args[7], O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+      guard fd >= 0 else { throw Failure.arguments }
+      defer { Darwin.close(fd) }
+      resources = try NativeBootResources(directoryDescriptor: fd)
+    } else {
+      resources = nil
+    }
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
-    let manager = NativeVirtualMachineManager(
-      kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
-      console: output.appending(path: "console.log"), held: args[4] == "held",
-      aliasControl: [
-        "alias", "adaptive-busy", "continuous-cancel", "continuous-cancel-release",
-        "continuous-unsettled", "continuous-stop",
-      ].contains(
-        args[4]),
-      group: group, memoryGeometry: geometry,
-      executionPolicy: args[4] == "continuous-sustained" ? .sustained : .qualification)
+    let manager: NativeVirtualMachineManager
+    let policy: NativeExecutionPolicy =
+      args[4] == "continuous-sustained" ? .sustained : .qualification
+    if let resources {
+      manager = NativeVirtualMachineManager(
+        resources: resources, group: group, memoryGeometry: geometry, executionPolicy: policy)
+    } else {
+      manager = NativeVirtualMachineManager(
+        kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
+        console: output.appending(path: "console.log"), held: args[4] == "held",
+        aliasControl: [
+          "alias", "adaptive-busy", "continuous-cancel", "continuous-cancel-release",
+          "continuous-unsettled", "continuous-stop",
+        ].contains(args[4]),
+        group: group, memoryGeometry: geometry, executionPolicy: policy)
+    }
     let links = try (0..<2).map { try IsolatedNetwork(index: $0) }
     let peers = links.map { EthernetPeer(link: $0) }
     let peerTasks = peers.map { peer in Task { try await peer.run() } }
@@ -76,7 +99,7 @@ import NativeLinuxVMM
     let smoke = args[4] == "smoke"
     let container = try LinuxContainer(
       "swiftos-native",
-      rootfs: .block(format: "ext4", source: args[2], destination: "/"),
+      rootfs: .block(format: "ext4", source: resources?.mountSource ?? args[2], destination: "/"),
       vmm: manager, vm: .init(cpus: cpus, memoryInBytes: geometry.maximumBytes)
     ) { config in
       config.cpus = cpus
@@ -163,6 +186,8 @@ import NativeLinuxVMM
     try native.write(to: output.appending(path: "native.json"), options: .withoutOverwriting)
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
+      "bootResourceMode": resources == nil ? "legacy-research-paths" : "descriptor-pinned",
+      "capabilityConsoleName": resources?.consoleName as Any? ?? NSNull(),
       "networkEchoes": peers.map(\.echoed),
       "checked": checked, "serverOutput": serverOutput.text,
       "bootBytes": geometry.bootBytes, "dynamicCapacityBytes": geometry.dynamicBytes,
