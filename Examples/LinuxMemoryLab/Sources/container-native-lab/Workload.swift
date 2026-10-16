@@ -43,8 +43,10 @@ extension Lab {
     }
     return output.text.trimmingCharacters(in: .whitespacesAndNewlines)
   }
-  static func waitMemory(_ vm: NativeVirtualMachine, bytes: UInt64) async throws {
-    let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+  static func waitMemory(
+    _ vm: NativeVirtualMachine, bytes: UInt64,
+    deadline: ContinuousClock.Instant = .now.advanced(by: .seconds(8))
+  ) async throws {
     while vm.pluggedBytes != bytes {
       guard ContinuousClock.now < deadline else { throw Failure.check("memory convergence") }
       try await Task.sleep(for: .milliseconds(10))
@@ -56,11 +58,14 @@ extension Lab {
   ) async throws -> Bool {
     var commands: [[String: String]] = []
     var observations: [[String: Any]] = []
-    var transcript: [String] = []
     var resources: [[String: Any]] = []
     var policySamples: [[String: Any]] = []
     var policyRequests: [[String: UInt64]] = []
     let adaptive = ["adaptive", "adaptive-busy"].contains(mode)
+    let continuous = ["continuous", "continuous-cancel"].contains(mode)
+    var observer: ContinuousMemoryGovernor?
+    var observerTask: Task<Void, Error>?
+    var expectedCancellation = false
     let began = ContinuousClock.now
     func now() -> UInt64 {
       let elapsed = began.duration(to: .now).components
@@ -77,6 +82,8 @@ extension Lab {
     defer { governor.retire() }
     let input = CommandInput()
     let canaryOutput = ProbeOutput()
+    let session = MemoryProbeSession(
+      input: input, output: canaryOutput, cpus: vm.processorCount, began: began)
     var canary: LinuxProcess?
     var activeLoad: Task<String, Error>?
     var primary = ""
@@ -147,42 +154,12 @@ extension Lab {
         config.noNewPrivileges = true
       }
       try await canary!.start()
-      func line() async throws -> String {
-        let end = ContinuousClock.now.advanced(by: .seconds(5))
-        while ContinuousClock.now < end {
-          if let text = try canaryOutput.takeLine() { return text }
-          try await Task.sleep(for: .milliseconds(5))
-        }
-        throw Failure.check("canary deadline")
+      let initial = try await session.start()
+      let initialMemory = initial.total
+      guard initialMemory >= 128 << 20, initialMemory <= 1152 << 20 else {
+        throw Failure.check("initial guest geometry")
       }
-      let first = try await line()
-      transcript.append(first)
-      let initialFields = first.split(separator: " ")
-      guard initialFields.count == 5 + vm.processorCount, initialFields[0] == "CANARY_READY",
-        let initialMemory = UInt64(initialFields[1])
-      else { throw Failure.check(first) }
-      var previousWork = [UInt64](repeating: 0, count: vm.processorCount)
-      var previousPackets: UInt64 = 0
-      func checkWork(_ fields: ArraySlice<Substring>) throws {
-        var counters: [String: UInt64] = [:]
-        for field in fields {
-          let pair = field.split(separator: "=")
-          guard pair.count == 2, let number = UInt64(pair[1]), counters[String(pair[0])] == nil
-          else { throw Failure.check("probe fields") }
-          counters[String(pair[0])] = number
-        }
-        guard counters["cpus"] == UInt64(vm.processorCount),
-          let packets = counters["packets"], packets > previousPackets
-        else { throw Failure.check("NIC progress") }
-        for core in 0..<vm.processorCount {
-          guard let work = counters["cpu\(core)"], work > previousWork[core] else {
-            throw Failure.check("CPU progress")
-          }
-          previousWork[core] = work
-        }
-        previousPackets = packets
-      }
-      try checkWork(initialFields.dropFirst(3))
+      let bootGuestBytes = initialMemory - (128 << 20)
       let engine = try await sql(
         container,
         query:
@@ -192,23 +169,29 @@ extension Lab {
       else { throw Failure.check("durability settings") }
       commands.append(["effectiveEngine": engine])
       var sequence = 0
+      var guestCapacity = initialMemory
       var available: UInt64 = 0
       var capturedAt: UInt64 = 0
-      func verify(_ command: String = "VERIFY", quit: Bool = false) async throws -> UInt64 {
-        sequence += 1
-        capturedAt = now()
-        try input.send(Data("\(quit ? "QUIT" : command) \(sequence)\n".utf8))
-        let text = try await line()
-        transcript.append(text)
-        let fields = text.split(separator: " ")
-        guard fields.count == 6 + vm.processorCount, fields[0] == "CANARY_OK",
-          Int(fields[1]) == sequence,
-          let total = UInt64(fields[2]), let observedAvailable = UInt64(fields[3]),
-          observedAvailable <= total
-        else { throw Failure.check(text) }
-        available = observedAvailable
-        try checkWork(fields.dropFirst(4))
-        return total
+      func verify(
+        _ command: String = "VERIFY", quit: Bool = false,
+        deadline: ContinuousClock.Instant = .now.advanced(by: .seconds(5))
+      ) async throws -> UInt64 {
+        let beganCommand = now()
+        defer {
+          commands.append([
+            "probeCommand": quit ? "QUIT" : command,
+            "elapsedNanoseconds": String(now() - beganCommand),
+          ])
+        }
+        let reply = try await session.observe(quit ? "QUIT" : command, deadline: deadline)
+        guard reply.total >= bootGuestBytes, reply.total <= initialMemory else {
+          throw Failure.check("guest geometry")
+        }
+        guestCapacity = reply.total
+        sequence = Int(reply.sequence)
+        capturedAt = reply.capturedAt
+        available = reply.available
+        return reply.total
       }
       func control() throws {
         try Task.checkCancellation()
@@ -220,6 +203,14 @@ extension Lab {
           size == MemoryLayout<Int32>.size, [1, 2].contains(pressure)
         else { throw Failure.check("host memory pressure or unavailable native observation") }
         let state = vm.memoryState
+        guard returnedAt >= capturedAt, returnedAt - capturedAt <= 3_000_000_000 else {
+          throw Failure.check("stale guest observation")
+        }
+        if guestCapacity != bootGuestBytes + state.pluggedBytes, governor.pendingRequest == nil,
+          available >= 512 << 20
+        {
+          return
+        }
         let sample = BalloonController.Observation(
           epoch: 1, sequence: UInt64(sequence), capturedAtNanoseconds: capturedAt,
           actualResidentBytes: (1024 << 20) + state.pluggedBytes,
@@ -251,22 +242,42 @@ extension Lab {
         repeat {
           try governor.checkDeadline(nowNanoseconds: now())
           guard ContinuousClock.now < deadline else { throw Failure.check("policy convergence") }
-          let total = try await verify()
+          let total = try await verify(deadline: min(deadline, .now.advanced(by: .seconds(5))))
           try control()
-          if vm.pluggedBytes == bytes, governor.pendingRequest == nil { return total }
+          if vm.pluggedBytes == bytes, governor.pendingRequest == nil,
+            total == bootGuestBytes + bytes
+          { return total }
           try await Task.sleep(for: .milliseconds(200))
         } while true
       }
+      func waitGuestMemory(
+        _ expected: UInt64, deadline: ContinuousClock.Instant
+      ) async throws -> UInt64 {
+        while ContinuousClock.now < deadline {
+          let total = try await verify(deadline: min(deadline, .now.advanced(by: .seconds(5))))
+          if total == expected { return total }
+          try await Task.sleep(for: .milliseconds(10))
+        }
+        throw Failure.check("guest memory-online convergence")
+      }
       func loadState(cycle: Int) async throws -> (Int, UInt64) {
-        sequence += 1
-        try input.send(Data("STATE \(sequence) \(cycle)\n".utf8))
-        let text = try await line()
-        transcript.append(text)
-        let fields = text.split(separator: " ")
-        guard fields.count == 4, fields[0] == "LOAD_STATE", Int(fields[1]) == sequence,
-          let count = Int(fields[2]), (0...1).contains(count), let memory = UInt64(fields[3])
-        else { throw Failure.check(text) }
-        return (count, memory)
+        let reply = try await session.load(cycle: cycle)
+        sequence = Int(reply.sequence)
+        return (reply.count, reply.bytes)
+      }
+      func waitObserver(_ bytes: UInt64?) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        guard let observer else { throw Failure.check("observer missing") }
+        repeat {
+          try Task.checkCancellation()
+          let status = observer.status
+          guard status.failure.isEmpty else { throw Failure.check("observer " + status.failure) }
+          if status.running, status.sampleCount > 0, !status.pending, status.capacityReady,
+            bytes.map({ vm.pluggedBytes == $0 }) ?? (vm.pluggedBytes > 0)
+          { return }
+          guard ContinuousClock.now < deadline else { throw Failure.check("observer convergence") }
+          try await Task.sleep(for: .milliseconds(20))
+        } while true
       }
       func resourceSnapshot(_ phase: String) async throws {
         let agent = try await vm.dialAgent()
@@ -296,7 +307,34 @@ extension Lab {
       }
       try await waitMemory(vm, bytes: 128 << 20)
       try await resourceSnapshot("baseline")
-      if vm.aliasDiagnosticEnabled, !adaptive {
+      if continuous {
+        let driver = ContinuousMemoryGovernor(
+          probe: session, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+        observer = driver
+        observerTask = Task { try await driver.run() }
+        if mode == "continuous-cancel" {
+          let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+          while vm.refusalCount == 0 || !driver.status.pending {
+            guard ContinuousClock.now < deadline, driver.status.failure.isEmpty else {
+              throw Failure.check("cancel point not reached")
+            }
+            try await Task.sleep(for: .milliseconds(10))
+          }
+          observerTask!.cancel()
+          switch await observerTask!.result {
+          case .success: throw Failure.check("observer ignored cancellation")
+          case .failure(let error):
+            guard error is CancellationError else { throw error }
+          }
+          observerTask = nil
+          expectedCancellation = true
+          guard !driver.status.running, try await sql(container, query: integrity) == expected else {
+            throw Failure.check("cancel retirement/integrity")
+          }
+          try await resourceSnapshot("cancelled-pending")
+        } else { try await waitObserver(0) }
+      }
+      if vm.aliasDiagnosticEnabled, !adaptive, !continuous {
         try vm.requestMemory(bytes: 0)
         let refusalDeadline = ContinuousClock.now.advanced(by: .seconds(5))
         while vm.refusalCount == 0 {
@@ -312,7 +350,7 @@ extension Lab {
         // Validate the refusal separately so its full integrity scan cannot consume the load window.
         try vm.requestMemory(bytes: 128 << 20)
       }
-      for cycle in 1...2 {
+      for cycle in (expectedCancellation ? [] : [1, 2]) {
         let queryID = "swiftos-load-\(cycle)"
         let query =
           "SELECT sum(n.number + sleepEachRow(0.00004)) FROM numbers(100000) AS n INNER JOIN (SELECT id, payload FROM default.ram_lab WHERE id < 100000) AS r ON n.number = r.id AND repeat(hex(cityHash64(n.number)), 8) = r.payload LIMIT 1 SETTINGS join_algorithm='hash'"
@@ -327,8 +365,38 @@ extension Lab {
           try await Task.sleep(for: .milliseconds(25))
         }
         guard observed >= 16 << 20 else { throw Failure.check("active query not observed") }
+        if continuous {
+          _ = try await verify("HOLD")
+          try await waitObserver(nil)
+          let grown = vm.pluggedBytes
+          let regrown = try await verify("OBS")
+          _ = try await verify("DROP")
+          try await waitObserver(0)
+          let stillRunning = try await loadState(cycle: cycle)
+          guard stillRunning.0 == 1, stillRunning.1 >= 16 << 20 else {
+            throw Failure.check("continuous load not live after unplug")
+          }
+          let shrunk = try await verify()
+          guard initialMemory >= shrunk, initialMemory - shrunk == 128 << 20,
+            grown > 0, grown <= 128 << 20, regrown == shrunk + grown
+          else { throw Failure.check("continuous guest capacity") }
+          try await resourceSnapshot("continuous-shrunk-\(cycle)")
+          let aggregate = try await activeLoad!.value
+          activeLoad = nil
+          guard aggregate == "4999950000",
+            try await sql(container, query: integrity) == expected
+          else { throw Failure.check("continuous aggregate/integrity") }
+          observations.append([
+            "cycle": cycle, "activeQueryMemoryBytes": observed,
+            "activeAfterUnplugMemoryBytes": stillRunning.1,
+            "restoredBackingBytes": grown, "shrunkGuestBytes": shrunk,
+            "regrownGuestBytes": regrown, "integrity": expected, "loadResult": aggregate,
+          ])
+          continue
+        }
         let cycleInitial = try await verify()
         let cyclePlugged = vm.pluggedBytes
+        let unplugDeadline = ContinuousClock.now.advanced(by: .seconds(8))
         if adaptive {
           let issued = policyRequests.count
           try control()
@@ -364,13 +432,13 @@ extension Lab {
           try vm.releaseDiagnosticAlias()
         }
         if adaptive { _ = try await settle(0) }
-        else { try await waitMemory(vm, bytes: 0) }
+        else { try await waitMemory(vm, bytes: 0, deadline: unplugDeadline) }
         let stillRunning = try await loadState(cycle: cycle)
         commands.append(["afterUnplugQueryState": "\(stillRunning.0)\t\(stillRunning.1)"])
         let memoryAfterUnplug = stillRunning.1
         guard stillRunning.0 == 1, memoryAfterUnplug >= 16 << 20
         else { throw Failure.check("load not live after unplug: \(stillRunning)") }
-        let shrunk = try await verify()
+        let shrunk = try await waitGuestMemory(bootGuestBytes, deadline: unplugDeadline)
         try await resourceSnapshot("shrunk-\(cycle)")
         guard initialMemory >= shrunk, cycleInitial >= shrunk,
           cycleInitial - shrunk == cyclePlugged, cyclePlugged > 0, initialMemory - shrunk == 128 << 20
@@ -407,9 +475,10 @@ extension Lab {
           ])
           try await Task.sleep(for: .milliseconds(350))
         } else {
+          let deadline = ContinuousClock.now.advanced(by: .seconds(8))
           try vm.requestMemory(bytes: 128 << 20)
-          try await waitMemory(vm, bytes: 128 << 20)
-          regrown = try await verify()
+          try await waitMemory(vm, bytes: 128 << 20, deadline: deadline)
+          regrown = try await waitGuestMemory(initialMemory, deadline: deadline)
         }
         let restored = vm.pluggedBytes
         guard restored > 0, restored <= 128 << 20,
@@ -424,19 +493,43 @@ extension Lab {
           "regrownGuestBytes": regrown, "integrity": expected, "loadResult": loadResult,
         ])
       }
-      _ = try await verify(quit: true)
-      input.finish()
-      guard try await canary!.wait(timeoutInSeconds: 5).exitCode == 0 else {
-        throw Failure.check("canary exit")
+      if let observer, let task = observerTask {
+        observer.requestStop()
+        try await task.value
+        observerTask = nil
+        guard !observer.status.running else { throw Failure.check("observer still running") }
       }
-      try await canary!.delete()
-      canary = nil
+      if !expectedCancellation { _ = try await verify(quit: true) }
+      input.finish()
+      if !expectedCancellation {
+        guard try await canary!.wait(timeoutInSeconds: 5).exitCode == 0 else {
+          throw Failure.check("canary exit")
+        }
+        try await canary!.delete()
+        canary = nil
+      }
     } catch { primary = String(describing: error) }
+    if let task = observerTask {
+      task.cancel()
+      switch await task.result {
+      case .success: break
+      case .failure(let error):
+        if !(error is CancellationError) { cleanup.append("observer-stop \(error)") }
+      }
+    }
+    await session.close()
     input.finish()
     if let canary {
       let failures = await Task { @concurrent in
         var errors: [String] = []
-        do { try await canary.kill(.kill) } catch { errors.append("canary kill \(error)") }
+        do {
+          // Closed stdin can retire the guest before a kill request reaches vminitd.
+          _ = try await canary.wait(timeoutInSeconds: 1)
+        } catch {
+          do { try await canary.kill(.kill) } catch { errors.append("canary kill \(error)") }
+          do { _ = try await canary.wait(timeoutInSeconds: 5) }
+          catch { errors.append("canary wait \(error)") }
+        }
         do { try await canary.delete() } catch { errors.append("canary delete \(error)") }
         return errors
       }.value
@@ -449,15 +542,21 @@ extension Lab {
       case .failure(let error): commands.append(["retiredLoadFailure": String(describing: error)])
       }
     }
+    let transcript = await session.transcript
+    let observerState = observer?.snapshot
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
       "cycles": observations, "canaryTranscript": transcript, "commands": commands,
       "canaryBytes": 64 << 20, "rows": 400000, "resources": resources,
       "adaptive": adaptive, "policyRequests": policyRequests, "policySamples": policySamples,
+      "continuous": continuous, "observerSamples": observerState?.samples ?? [],
+      "observerRequests": observerState?.requests ?? [],
+      "observerStopped": observerState?.running == false,
+      "observerFailure": observerState?.failure ?? "", "expectedCancellation": expectedCancellation,
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: output.appending(path: "workload.json"), options: .withoutOverwriting)
-    guard primary.isEmpty, cleanup.isEmpty, observations.count == 2 else {
+    guard primary.isEmpty, cleanup.isEmpty, expectedCancellation || observations.count == 2 else {
       throw Failure.check(primary)
     }
     return true

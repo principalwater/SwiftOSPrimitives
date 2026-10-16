@@ -1,4 +1,5 @@
 #if os(Linux)
+  import MemoryCanary
   import NativeLinux
   import PageMemory
   import Synchronization
@@ -93,10 +94,19 @@
     guard clock_gettime(CLOCK_MONOTONIC, &start) == 0 else { throw ProbeFailure.system(errno) }
     while response.count < 4096 {
       var now = timespec()
-      guard clock_gettime(CLOCK_MONOTONIC, &now) == 0, now.tv_sec - start.tv_sec < 3
+      guard clock_gettime(CLOCK_MONOTONIC, &now) == 0, now.tv_sec >= start.tv_sec,
+        now.tv_sec - start.tv_sec <= 3
       else { throw ProbeFailure.framing }
+      let elapsed = (now.tv_sec - start.tv_sec) * 1_000_000_000 + now.tv_nsec - start.tv_nsec
+      guard elapsed >= 0, elapsed < 3_000_000_000 else { throw ProbeFailure.framing }
+      let micros = min(1_000_000, (3_000_000_000 - elapsed + 999) / 1000)
+      var remaining = timeval(tv_sec: micros / 1_000_000, tv_usec: micros % 1_000_000)
+      guard setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining, socklen_t(MemoryLayout<timeval>.size))
+        == 0
+      else { throw ProbeFailure.system(errno) }
       let count = recv(fd, &chunk, min(chunk.count, 4096 - response.count), 0)
-      if count < 0, errno == EINTR { continue }
+      // A socket timeout is transient until this transaction's original3second deadline.
+      if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
       guard count >= 0 else { throw ProbeFailure.system(errno) }
       if count == 0 { break }
       response += chunk.prefix(count)
@@ -274,33 +284,52 @@
           }
           usleep(10000)
         }
-        func summary() throws -> String {
-          try state.values.withLock { values in
+        var checkedWork = [UInt64](repeating: 0, count: cpus)
+        var checkedPackets: UInt64 = 0
+        func summary(progress: Bool = true) throws -> String {
+          var began = timespec()
+          guard clock_gettime(CLOCK_MONOTONIC, &began) == 0 else {
+            throw ProbeFailure.system(errno)
+          }
+          while true {
+            var now = timespec()
+            guard clock_gettime(CLOCK_MONOTONIC, &now) == 0, now.tv_sec >= began.tv_sec,
+              now.tv_sec - began.tv_sec <= 1
+            else { throw ProbeFailure.integrity }
+            let elapsed = (now.tv_sec - began.tv_sec) * 1_000_000_000 + now.tv_nsec - began.tv_nsec
+            guard elapsed >= 0, elapsed < 1_000_000_000 else { throw ProbeFailure.integrity }
+            let values = state.values.withLock { $0 }
             guard values.error.isEmpty, values.work.prefix(cpus).allSatisfy({ $0 > 0 }) else {
               throw ProbeFailure.integrity
             }
-            return "cpus=\(cpus) packets=\(values.packets) "
-              + (0..<cpus).map { "cpu\($0)=\(values.work[$0])" }.joined(separator: " ")
+            if !progress || (0..<cpus).allSatisfy({ values.work[$0] > checkedWork[$0] })
+              && (args[1] == "0" || values.packets > checkedPackets)
+            {
+              if progress {
+                checkedWork = Array(values.work.prefix(cpus))
+                checkedPackets = values.packets
+              }
+              return "cpus=\(cpus) packets=\(values.packets) "
+                + (0..<cpus).map { "cpu\($0)=\(values.work[$0])" }.joined(separator: " ")
+            }
+            // Fast memory checks can finish before a real10ms worker beacon.
+            usleep(1000)
           }
         }
         var region = try PageRegion.allocate(byteCount: 64 << 20)
         try region.withMutableBytes { bytes in
-          for index in bytes.indices { bytes[index] = UInt8(truncatingIfNeeded: index &* 17 &+ 91) }
+          MemoryCanary.fill(&bytes, multiplier: 17, seed: 91)
         }
         var pressure = try PageRegion.allocate(byteCount: 320 << 20, maximumMappedBytes: 320 << 20)
         var holding = false
         func checkPressure() throws {
           guard holding else { return }
           try pressure.withReadAccess { bytes in
-            for index in bytes.indices {
-              guard bytes[index] == UInt8(truncatingIfNeeded: index &* 31 &+ 47) else {
-                throw ProbeFailure.integrity
-              }
-            }
+            try MemoryCanary.check(bytes, multiplier: 31, seed: 47)
           }
         }
         try emit("CANARY_READY \(try memory()) \(try summary())\n")
-        for sequence in 1...64 {
+        for sequence in 1...1024 {
           let text = try command()
           let fields = text.split(separator: " ")
           if fields.count == 3, fields[0] == "STATE", fields[1] == Substring(String(sequence)),
@@ -312,9 +341,7 @@
           if text == "HOLD \(sequence)" {
             guard !holding else { throw ProbeFailure.framing }
             try pressure.withMutableBytes { bytes in
-              for index in bytes.indices {
-                bytes[index] = UInt8(truncatingIfNeeded: index &* 31 &+ 47)
-              }
+              MemoryCanary.fill(&bytes, multiplier: 31, seed: 47)
             }
             holding = true
           } else if text == "DROP \(sequence)" {
@@ -324,19 +351,19 @@
             pressure = try PageRegion.allocate(byteCount: 320 << 20, maximumMappedBytes: 320 << 20)
             holding = false
           } else {
-            guard text == "VERIFY \(sequence)" || text == "QUIT \(sequence)" else {
+            guard text == "VERIFY \(sequence)" || text == "OBS \(sequence)"
+              || text == "QUIT \(sequence)"
+            else {
               throw ProbeFailure.framing
             }
           }
-          try checkPressure()
-          try region.withReadAccess { bytes in
-            for index in bytes.indices {
-              guard bytes[index] == UInt8(truncatingIfNeeded: index &* 17 &+ 91) else {
-                throw ProbeFailure.integrity
-              }
+          if !text.hasPrefix("OBS ") {
+            try checkPressure()
+            try region.withReadAccess { bytes in
+              try MemoryCanary.check(bytes, multiplier: 17, seed: 91)
             }
           }
-          try emit("CANARY_OK \(sequence) \(try memory()) \(try summary())\n")
+          try emit("CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !text.hasPrefix("OBS ")))\n")
           if text.hasPrefix("QUIT") {
             try region.release()
             try pressure.release()

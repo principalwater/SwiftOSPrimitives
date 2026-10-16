@@ -26,7 +26,10 @@ import NativeLinuxVMM
     guard args.count >= 5 else { throw Failure.arguments }
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
-        || args.count == 6 && ["memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy"].contains(args[4])
+        || args.count == 6 && [
+          "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
+          "continuous", "continuous-cancel",
+        ].contains(args[4])
     else { throw Failure.arguments }
     let output = URL(filePath: args[3])
     guard !FileManager.default.fileExists(atPath: output.path) else { throw Failure.arguments }
@@ -44,7 +47,8 @@ import NativeLinuxVMM
     let manager = NativeVirtualMachineManager(
       kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
       console: output.appending(path: "console.log"), held: args[4] == "held",
-      aliasControl: ["alias", "adaptive-busy"].contains(args[4]), group: group)
+      aliasControl: ["alias", "adaptive-busy", "continuous-cancel"].contains(args[4]),
+      group: group)
     let links = try (0..<2).map { try IsolatedNetwork(index: $0) }
     let peers = links.map { EthernetPeer(link: $0) }
     let peerTasks = peers.map { peer in Task { try await peer.run() } }
@@ -77,13 +81,13 @@ import NativeLinuxVMM
       if !smoke {
         let agent = try await vm.dialAgent()
         do {
-          // The measured two-NIC control plane exceeds stock80MiB memory.high.
-          // Preserve throttling and add a hard ceiling instead of removing resource limits.
+          // Observed96.1MiB control-plane working set thrashes below96MiB memory.high.
+          // Keep16MiB headroom below the unchanged128MiB hard ceiling.
           try await agent.writeFile(
             path: "/sys/fs/cgroup/vminitd/memory.max", data: Data("134217728".utf8),
             flags: .init(create: false), mode: 0)
           try await agent.writeFile(
-            path: "/sys/fs/cgroup/vminitd/memory.high", data: Data("100663296".utf8),
+            path: "/sys/fs/cgroup/vminitd/memory.high", data: Data("117440512".utf8),
             flags: .init(create: false), mode: 0)
           let base = "/run/container/swiftos-native/rootfs"
           try await agent.mkdir(path: base + "/lab", all: true, perms: 0o700)
@@ -141,6 +145,7 @@ import NativeLinuxVMM
       "primaryError": primary, "cleanupErrors": cleanup,
       "networkEchoes": peers.map(\.echoed),
       "checked": checked, "serverOutput": serverOutput.text,
+      "controlPlaneHighBytes": 112 << 20, "controlPlaneMaximumBytes": 128 << 20,
       "serverOutputOverflow": serverOutput.overflowed, "physicalReleasedBytes": NSNull(),
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])

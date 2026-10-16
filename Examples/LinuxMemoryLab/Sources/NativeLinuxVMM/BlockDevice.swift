@@ -26,7 +26,7 @@ final class BlockDevice {
     else { throw DeviceFailure.geometry }
     let owner = try JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any]
     guard owner?["root"] as? String == root.path,
-      owner?["purpose"] as? String == "isolated-container-adaptive-G20",
+      owner?["purpose"] as? String == "isolated-container-continuous-G21",
       owner?["uid"] as? Int == Int(getuid())
     else { throw DeviceFailure.geometry }
     descriptor = open(path, (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC | O_NOFOLLOW)

@@ -36,7 +36,7 @@ import Foundation
     else { throw Failure.arguments }
     let owner = try JSONSerialization.jsonObject(with: bytes) as? [String: Any]
     guard owner?["root"] as? String == root.path, owner?["uid"] as? Int == Int(getuid()),
-      owner?["purpose"] as? String == "isolated-container-adaptive-G20"
+      owner?["purpose"] as? String == "isolated-container-continuous-G21"
     else { throw Failure.arguments }
     for (index, directory) in [
       (0, "artifacts"), (1, "inputs"), (2, "artifacts"), (3, "artifacts"), (5, "artifacts"),

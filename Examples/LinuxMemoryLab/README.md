@@ -8,6 +8,10 @@ PageMemory/BoundedMemory products have no Containerization dependency.
 See [G19 measured qualification](QUALIFICATION.md) for the completed SMP/NIC,
 RAM-return controls and real process-crash recovery results and limitations.
 
+See [G21 continuous qualification](CONTINUOUS-QUALIFICATION.md) and
+[full-byte canary measurements](CANARY-PERFORMANCE.md) for the newer finite observer,
+guest-online completion fence and measured native Swift optimization.
+
 ## Current Apple container integration
 
 Apple container1.5.0 (`d265d669ecae041bf338cb3b39c4118316d138f0`) selects

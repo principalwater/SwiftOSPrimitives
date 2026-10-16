@@ -17,6 +17,10 @@ let package = Package(
     .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
   ],
   targets: [
+    .target(name: "MemoryCanary"),
+    .executableTarget(name: "canary-pattern-bench", dependencies: [
+      "MemoryCanary", .product(name: "PageMemory", package: "SwiftOSPrimitives")
+    ]),
     .target(
       name: "NativeLinuxVMM",
       dependencies: [
@@ -36,7 +40,7 @@ let package = Package(
     .executableTarget(
       name: "container-memory-probe",
       dependencies: [
-        "NativeLinux",
+        "NativeLinux", "MemoryCanary",
         .product(name: "PageMemory", package: "SwiftOSPrimitives")
       ]),
     .systemLibrary(name: "NativeLinux"),
@@ -46,5 +50,5 @@ let package = Package(
         "NativeLinux",
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
       ]),
-    .testTarget(name: "LinuxMemoryLabTests", dependencies: ["NativeLinuxVMM", "container-native-lab"]),
+    .testTarget(name: "LinuxMemoryLabTests", dependencies: ["NativeLinuxVMM", "container-native-lab", "MemoryCanary"]),
   ], swiftLanguageModes: [.v6])
