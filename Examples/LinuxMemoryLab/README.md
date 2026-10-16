@@ -12,6 +12,15 @@ See [G21 continuous qualification](CONTINUOUS-QUALIFICATION.md) and
 [full-byte canary measurements](CANARY-PERFORMANCE.md) for the newer finite observer,
 guest-online completion fence and measured native Swift optimization.
 
+See [G22 persistent-governance qualification](PERSISTENT-QUALIFICATION.md) for
+bounded lifetime-independent telemetry, real pending-stop/lifetime controls,
+history wrap under ClickHouse and a new process-crash recovery qualification.
+This optional lab currently expects the separate local `ContainerWorkspace`
+package next to the SwiftOSPrimitives checkout; it supplies the shared native
+telemetry component. Neither root package product depends on that application.
+The qualified companion commit is `8859360429a1dc2909602b782da23f4b5f4d5e46`;
+both repositories are local research checkouts, without a remote release.
+
 ## Current Apple container integration
 
 Apple container1.5.0 (`d265d669ecae041bf338cb3b39c4118316d138f0`) selects
@@ -111,13 +120,13 @@ symbols when stripping a separate guest artifact.
 Disk admission requires a fresh COW copy named `artifacts/clickhouse-run-*.ext4`,
 8GiB logical capacity, single link, current uid, exclusive lock and an enclosing
 private root OWNER.json containing its canonical root, uid and research purpose
-`isolated-container-adaptive-G20`. The marker is experiment-scoped, not a public
+`isolated-container-product-G22`. The marker is experiment-scoped, not a public
 provisioning format. Never reuse a modified image or write to accepted ancestors.
 
 The ClickHouse workload is26.9.19.9, loopback-only inside the guest,896MiB cgroup
 limit,640MiB server bound,192MiB/8s/one-thread query limits and bounded scans/output.
-The two-NIC guest control plane uses memory.high96MiB and a hard memory.max128MiB
-(the upstream80MiB high threshold measurably throttled RPCs). No installed image
+The two-NIC guest control plane uses memory.high112MiB and a hard memory.max128MiB
+(the observed96.1MiBworking set thrashed below96MiBhigh). No installed image
 is modified; only the isolated guest cgroup is configured through native RPC.
 Four100K-row batches have independent fixed count/id-sum/payload-hash/byte oracles.
 The current sustained-load query uses a bounded100K-row/100K-build hash join

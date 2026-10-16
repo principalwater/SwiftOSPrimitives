@@ -21,17 +21,14 @@ final class CommandInput: ReaderStream {
 final class ProbeOutput: Writer {
   private struct State {
     var bytes = Data()
-    var total = 0
     var closed = false
   }
   private let state = Mutex(State())
   func write(_ data: Data) throws {
     try state.withLock { state in
-      guard !state.closed, data.count <= 16384 - state.bytes.count,
-        data.count <= 1024 * 1024 - state.total
+      guard !state.closed, data.count <= 16384 - state.bytes.count
       else { throw LabFailure.framing }
       state.bytes.append(data)
-      state.total += data.count
     }
   }
   func close() { state.withLock { $0.closed = true } }

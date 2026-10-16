@@ -62,7 +62,13 @@ extension Lab {
     var policySamples: [[String: Any]] = []
     var policyRequests: [[String: UInt64]] = []
     let adaptive = ["adaptive", "adaptive-busy"].contains(mode)
-    let continuous = ["continuous", "continuous-cancel"].contains(mode)
+    let continuous = [
+      "continuous", "continuous-cancel", "continuous-soak", "continuous-stop", "continuous-churn",
+      "continuous-expire",
+    ].contains(mode)
+    var churn: [[String: UInt64]] = []
+    var expectedGracefulStop = false
+    var expectedLifetimeExpiry = false
     var observer: ContinuousMemoryGovernor?
     var observerTask: Task<Void, Error>?
     var expectedCancellation = false
@@ -309,10 +315,27 @@ extension Lab {
       try await resourceSnapshot("baseline")
       if continuous {
         let driver = ContinuousMemoryGovernor(
-          probe: session, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+          probe: session, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
+          lifetimeDeadline: mode == "continuous-expire"
+            ? .now.advanced(by: .seconds(2)) : began.advanced(by: .seconds(180)),
+          samplingInterval: mode == "continuous-soak" ? .milliseconds(100) : .milliseconds(200))
         observer = driver
         observerTask = Task { try await driver.run() }
-        if mode == "continuous-cancel" {
+        if mode == "continuous-expire" {
+          switch await observerTask!.result {
+          case .success: throw Failure.check("observer ignored lifetime deadline")
+          case .failure(let error):
+            guard error as? LabFailure == .deadline else { throw error }
+          }
+          observerTask = nil
+          let expired = driver.snapshot
+          guard !expired.running, !expired.pending, expired.capacityReady,
+            expired.requestHistory.totalCount == 0,
+            try await sql(container, query: integrity) == expected
+          else { throw Failure.check("deadline admission/status/integrity") }
+          expectedLifetimeExpiry = true
+          try await resourceSnapshot("lifetime-expired-without-new-admission")
+        } else if mode == "continuous-cancel" || mode == "continuous-stop" {
           let deadline = ContinuousClock.now.advanced(by: .seconds(8))
           while vm.refusalCount == 0 || !driver.status.pending {
             guard ContinuousClock.now < deadline, driver.status.failure.isEmpty else {
@@ -320,6 +343,19 @@ extension Lab {
             }
             try await Task.sleep(for: .milliseconds(10))
           }
+          if mode == "continuous-stop" {
+            driver.requestStop()
+            try vm.releaseDiagnosticAlias()
+            try await observerTask!.value
+            observerTask = nil
+            let stopped = driver.snapshot
+            guard !stopped.running, !stopped.pending, stopped.capacityReady,
+              stopped.failure.isEmpty, stopped.requestHistory.totalCount == 1,
+              try await sql(container, query: integrity) == expected
+            else { throw Failure.check("graceful pending drain/status/integrity") }
+            expectedGracefulStop = true
+            try await resourceSnapshot("gracefully-stopped-pending")
+          } else {
           observerTask!.cancel()
           switch await observerTask!.result {
           case .success: throw Failure.check("observer ignored cancellation")
@@ -332,6 +368,7 @@ extension Lab {
             throw Failure.check("cancel retirement/integrity")
           }
           try await resourceSnapshot("cancelled-pending")
+          }
         } else { try await waitObserver(0) }
       }
       if vm.aliasDiagnosticEnabled, !adaptive, !continuous {
@@ -350,7 +387,7 @@ extension Lab {
         // Validate the refusal separately so its full integrity scan cannot consume the load window.
         try vm.requestMemory(bytes: 128 << 20)
       }
-      for cycle in (expectedCancellation ? [] : [1, 2]) {
+      for cycle in (expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry ? [] : [1, 2]) {
         let queryID = "swiftos-load-\(cycle)"
         let query =
           "SELECT sum(n.number + sleepEachRow(0.00004)) FROM numbers(100000) AS n INNER JOIN (SELECT id, payload FROM default.ram_lab WHERE id < 100000) AS r ON n.number = r.id AND repeat(hex(cityHash64(n.number)), 8) = r.payload LIMIT 1 SETTINGS join_algorithm='hash'"
@@ -493,6 +530,39 @@ extension Lab {
           "regrownGuestBytes": regrown, "integrity": expected, "loadResult": loadResult,
         ])
       }
+      if mode == "continuous-churn" {
+        for cycle in 3...20 {
+          _ = try await verify("HOLD")
+          try await waitObserver(nil)
+          let grown = vm.pluggedBytes
+          guard grown > 0 else { throw Failure.check("churn regrowth") }
+          _ = try await verify("DROP")
+          try await waitObserver(0)
+          _ = try await verify()
+          churn.append(["cycle": UInt64(cycle), "regrownBackingBytes": grown])
+          if cycle % 4 == 0 {
+            guard try await sql(container, query: integrity) == expected else {
+              throw Failure.check("churn durable integrity")
+            }
+          }
+        }
+        guard let observer, observer.snapshot.requestHistory.totalCount > 32 else {
+          throw Failure.check("request history did not wrap")
+        }
+        try await resourceSnapshot("request-history-wrapped")
+      }
+      if mode == "continuous-soak", let observer {
+        while observer.status.sampleCount < 520 {
+          guard observer.status.running, observer.status.failure.isEmpty else {
+            throw Failure.check("continuous soak ended before history wrap")
+          }
+          try await Task.sleep(for: .milliseconds(100))
+        }
+        guard try await sql(container, query: integrity) == expected else {
+          throw Failure.check("soak integrity")
+        }
+        try await resourceSnapshot("history-wrapped")
+      }
       if let observer, let task = observerTask {
         observer.requestStop()
         try await task.value
@@ -547,16 +617,29 @@ extension Lab {
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
       "cycles": observations, "canaryTranscript": transcript, "commands": commands,
+      "churn": churn,
+      "canaryTranscriptTotal": await session.transcriptTotal,
+      "canaryTranscriptDropped": await session.transcriptDropped,
       "canaryBytes": 64 << 20, "rows": 400000, "resources": resources,
       "adaptive": adaptive, "policyRequests": policyRequests, "policySamples": policySamples,
       "continuous": continuous, "observerSamples": observerState?.samples ?? [],
       "observerRequests": observerState?.requests ?? [],
+      "observerSamplesTotal": observerState?.sampleHistory.totalCount ?? 0,
+      "observerSamplesDropped": observerState?.sampleHistory.droppedCount ?? 0,
+      "observerRequestsTotal": observerState?.requestHistory.totalCount ?? 0,
+      "observerRequestsDropped": observerState?.requestHistory.droppedCount ?? 0,
+      "observerPending": observerState?.pending ?? false,
+      "observerCapacityReady": observerState?.capacityReady ?? false,
+      "observerActiveRequest": observerState?.activeRequest ?? [:],
       "observerStopped": observerState?.running == false,
       "observerFailure": observerState?.failure ?? "", "expectedCancellation": expectedCancellation,
+      "expectedGracefulStop": expectedGracefulStop,
+      "expectedLifetimeExpiry": expectedLifetimeExpiry,
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: output.appending(path: "workload.json"), options: .withoutOverwriting)
-    guard primary.isEmpty, cleanup.isEmpty, expectedCancellation || observations.count == 2 else {
+    guard primary.isEmpty, cleanup.isEmpty,
+      expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry || observations.count == 2 else {
       throw Failure.check(primary)
     }
     return true

@@ -99,12 +99,12 @@ func requiresVersionAndOfferedFeatures(_ missingMemoryFeature: Bool) throws {
   request[0] = 3
   request[12] = 1  // GPA0x100000000, independent little-endian literal.
   request[16] = 1
-  #expect(try device.request(request) == Data([0, 0, 0, 0, 0, 0, 0, 0, 1, 0]))
+  #expect(try device.request(request, quiescence: (true, 0, 1)) == Data([0, 0, 0, 0, 0, 0, 0, 0, 1, 0]))
   request[8] = 1  // Misaligned GPA.
-  #expect(try device.request(request) == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+  #expect(try device.request(request, quiescence: (true, 0, 1)) == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
   request[8] = 0
   request[16] = 65  // Region overflow.
-  #expect(try device.request(request) == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+  #expect(try device.request(request, quiescence: (true, 0, 1)) == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
   #expect(device.plugged == 0 && device.observations.isEmpty)
 }
 
@@ -124,7 +124,7 @@ func requiresVersionAndOfferedFeatures(_ missingMemoryFeature: Bool) throws {
   }
   try JSONSerialization.data(withJSONObject: [
     "root": root.path, "uid": Int(getuid()),
-    "purpose": "isolated-container-continuous-G21",
+    "purpose": "isolated-container-product-G22",
   ])
   .write(to: marker, options: .withoutOverwriting)
   let descriptor = open(disk.path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0o600)

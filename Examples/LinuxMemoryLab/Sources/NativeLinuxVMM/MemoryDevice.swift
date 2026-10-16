@@ -1,3 +1,4 @@
+import ContainerWorkspaceCore
 import Darwin
 import Foundation
 import Hypervisor
@@ -19,13 +20,18 @@ final class MemoryDevice {
   let aliasControl: Bool
   var aliasAddress: UInt64?
   var aliasReleased = false
-  var refusals: [[String: Any]] = []
+  private var refusalHistory = RecentHistory<[String: Any]>(capacity: 128)
+  var refusals: [[String: Any]] { refusalHistory.elements }
+  var refusalsTotal: UInt64 { refusalHistory.totalCount }
   let transport = VirtioMMIO(
     identity: 24, features: 1 << 1, interrupt: 35,
     requiredFeatures: (1 << 32) | 2)
   var extents = (0..<64).map { _ in Extent() }
   var requested = UInt64(capacity)
-  var observations: [[String: Any]] = []
+  private var observationHistory = RecentHistory<[String: Any]>(capacity: 1024)
+  var observations: [[String: Any]] { observationHistory.elements }
+  var observationsTotal: UInt64 { observationHistory.totalCount }
+  private(set) var cumulativeBackingRetiredBytes: UInt64 = 0
   var plugged: UInt64 { UInt64(extents.filter(\.plugged).count * Self.block) }
 
   init(held: Bool, aliasControl: Bool = false) {
@@ -49,9 +55,13 @@ final class MemoryDevice {
       withUnsafeBytes(of: &value) { bytes.append(contentsOf: $0) }
     }
   }
-  func request(_ data: Data) throws -> Data {
+  func request(
+    _ data: Data, quiescence: (parked: Bool, epoch: Int, cpus: Int)
+  ) throws -> Data {
     try confined()
-    guard data.count == 24 else { throw DeviceFailure.request }
+    guard data.count == 24, quiescence.parked, (1...4).contains(quiescence.cpus) else {
+      throw DeviceFailure.request
+    }
     func load<T: FixedWidthInteger>(_ offset: Int, _ type: T.Type) -> T {
       data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self).littleEndian }
     }
@@ -62,7 +72,9 @@ final class MemoryDevice {
     var state: UInt16 = 0
     if kind == 2 {
       // Startup/reset only: the standard driver guarantees no active users here.
-      if try !retire(Array(extents.indices.filter { extents[$0].plugged || extents[$0].mapped })) {
+      if try !retire(
+        Array(extents.indices.filter { extents[$0].plugged || extents[$0].mapped }),
+        quiescence: quiescence) {
         response = 2
       }
     } else if kind <= 3 {
@@ -86,7 +98,7 @@ final class MemoryDevice {
         if indices.contains(where: { !extents[$0].plugged }) {
           response = 3
         } else {
-          if try !retire(Array(indices)) { response = 2 }
+          if try !retire(Array(indices), quiescence: quiescence) { response = 2 }
         }
       case 3:
         let count = indices.filter { extents[$0].plugged }.count
@@ -193,8 +205,11 @@ final class MemoryDevice {
       extent.mapped = true
     }
   }
-  private func retire(_ indices: [Int]) throws -> Bool {
-    guard observations.count + indices.count <= 1024,
+  private func retire(
+    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int)
+  ) throws -> Bool {
+    guard observationHistory.remainingCounterValues >= UInt64(indices.count),
+      UInt64.max - cumulativeBackingRetiredBytes >= UInt64(indices.count) * UInt64(Self.block),
       indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
       )
     else { throw DeviceFailure.request }
@@ -212,8 +227,7 @@ final class MemoryDevice {
     do { plans = try indices.map(inspect) } catch let refusal as OwnershipRefusal {
       // BUSY is legal only before any object has been freed and after full remapping.
       try restore(unmapped)
-      guard refusals.count < 128 else { throw DeviceFailure.request }
-      refusals.append([
+      try refusalHistory.append([
         "reason": refusal.detail, "unmappedThenRestored": unmapped.count,
         "ownedBytesDeallocated": 0, "reply": "BUSY",
       ])
@@ -231,7 +245,10 @@ final class MemoryDevice {
       }
       extent.plugged = false
       let after = try ProcessMemorySnapshot.capture()
-      observations.append([
+      if !held { cumulativeBackingRetiredBytes += UInt64(Self.block) }
+      try observationHistory.append([
+        "allVCPUsParked": quiescence.parked, "quiescentEpoch": quiescence.epoch,
+        "vcpuCount": quiescence.cpus,
         "index": index, "held": held,
         "nativeEntryBytes": plan.size, "nativeObjectOffset": plan.info.offset,
         "freshAllocation": extent.freshAllocation, "hostInitializedBytes": Self.block,

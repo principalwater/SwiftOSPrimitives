@@ -1,3 +1,4 @@
+import ContainerWorkspaceCore
 import Foundation
 
 /// The wire has no multiplexing: one lease covers send through validated reply.
@@ -26,7 +27,10 @@ actor MemoryProbeSession {
   private var checkedWork: [UInt64]
   private var seenPackets: UInt64 = 0
   private var checkedPackets: UInt64 = 0
-  private(set) var transcript: [String] = []
+  private var history = RecentHistory<String>(capacity: 1025)
+  var transcript: [String] { history.elements }
+  var transcriptTotal: UInt64 { history.totalCount }
+  var transcriptDropped: UInt64 { history.droppedCount }
 
   init(input: CommandInput, output: ProbeOutput, cpus: Int, began: ContinuousClock.Instant) {
     self.input = input
@@ -68,8 +72,7 @@ actor MemoryProbeSession {
       try Task.checkCancellation()
       guard !closed else { throw LabFailure.disconnected }
       if let text = try output.takeLine() {
-        guard transcript.count < 1025 else { throw LabFailure.framing }
-        transcript.append(text)
+        try history.append(text)
         return text
       }
       try await Task.sleep(for: .milliseconds(5))
@@ -123,7 +126,7 @@ actor MemoryProbeSession {
     }
   }
   private func send(_ command: String, suffix: String = "") throws -> UInt64 {
-    guard ready, sequence < 1024 else { throw LabFailure.framing }
+    guard ready, sequence < UInt64.max else { throw LabFailure.framing }
     sequence += 1
     try input.send(Data("\(command) \(sequence)\(suffix)\n".utf8))
     return sequence

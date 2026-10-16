@@ -12,6 +12,7 @@ let package = Package(
   name: "LinuxMemoryLab", platforms: [.macOS("27.0")],
   products: [.library(name: "NativeLinuxVMM", targets: ["NativeLinuxVMM"])],
   dependencies: [
+    .package(name: "ContainerWorkspace", path: "../../../ContainerWorkspace"),
     .package(path: "../.."),
     .package(name: "containerization", path: containerizationPath),
     .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
@@ -24,6 +25,7 @@ let package = Package(
     .target(
       name: "NativeLinuxVMM",
       dependencies: [
+        .product(name: "ContainerWorkspaceCore", package: "ContainerWorkspace"),
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
         .product(name: "Containerization", package: "containerization"),
         .product(name: "ContainerizationExtras", package: "containerization"),
@@ -35,6 +37,7 @@ let package = Package(
       .product(name: "ContainerizationEXT4", package: "containerization")
     ]),
     .executableTarget(name: "container-native-lab", dependencies: [
+      .product(name: "ContainerWorkspaceCore", package: "ContainerWorkspace"),
       "NativeLinuxVMM", .product(name: "BoundedMemory", package: "SwiftOSPrimitives")
     ]),
     .executableTarget(

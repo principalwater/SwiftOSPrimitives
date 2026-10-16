@@ -196,13 +196,8 @@ final class LinuxMachine {
             else { throw Failure.protocolError }
             let request = Data(bytes: try self.pointer(buffers[0].address, 24), count: 24)
             try self.requireStopped()
-            let before = device.observations.count
-            let response = try device.request(request)
-            for index in before..<device.observations.count {
-              device.observations[index]["allVCPUsParked"] = self.cpus?.isQuiescent ?? true
-              device.observations[index]["quiescentEpoch"] = self.cpus?.epoch ?? 0
-              device.observations[index]["vcpuCount"] = self.cpuCount
-            }
+            let response = try device.request(
+              request, quiescence: (self.cpus?.isQuiescent ?? true, self.cpus?.epoch ?? 0, self.cpuCount))
             let destination = try self.pointer(buffers[1].address, 10)
             response.withUnsafeBytes {
               destination.copyMemory(from: $0.baseAddress!, byteCount: 10)
@@ -644,6 +639,8 @@ public enum StandaloneLab {
       "ready": vm.ready, "primaryError": primary,
       "cleanupErrors": cleanup, "memoryComplete": vm.memoryComplete,
       "memoryObservations": vm.dynamicMemory?.observations ?? [],
+      "memoryObservationsTotal": vm.dynamicMemory?.observationsTotal ?? 0,
+      "cumulativeBackingRetiredBytes": vm.dynamicMemory?.cumulativeBackingRetiredBytes ?? 0,
       "guestEvents": vm.guestEvents, "diskBytesWritten": vm.disk?.written ?? 0,
       "vmDestroyed": !vm.created, "exits": vm.exits,
       "lastPC": String(vm.lastPC, radix: 16), "physicalReleasedBytes": NSNull(),

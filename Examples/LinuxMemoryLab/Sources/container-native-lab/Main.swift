@@ -28,7 +28,8 @@ import NativeLinuxVMM
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
         || args.count == 6 && [
           "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
-          "continuous", "continuous-cancel",
+          "continuous", "continuous-cancel", "continuous-soak", "continuous-stop", "continuous-churn",
+          "continuous-expire",
         ].contains(args[4])
     else { throw Failure.arguments }
     let output = URL(filePath: args[3])
@@ -47,7 +48,7 @@ import NativeLinuxVMM
     let manager = NativeVirtualMachineManager(
       kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
       console: output.appending(path: "console.log"), held: args[4] == "held",
-      aliasControl: ["alias", "adaptive-busy", "continuous-cancel"].contains(args[4]),
+      aliasControl: ["alias", "adaptive-busy", "continuous-cancel", "continuous-stop"].contains(args[4]),
       group: group)
     let links = try (0..<2).map { try IsolatedNetwork(index: $0) }
     let peers = links.map { EthernetPeer(link: $0) }

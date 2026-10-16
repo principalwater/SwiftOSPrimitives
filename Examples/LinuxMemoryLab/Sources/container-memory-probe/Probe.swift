@@ -329,7 +329,9 @@
           }
         }
         try emit("CANARY_READY \(try memory()) \(try summary())\n")
-        for sequence in 1...1024 {
+        var sequence: UInt64 = 0
+        while sequence < UInt64.max {
+          sequence += 1
           let text = try command()
           let fields = text.split(separator: " ")
           if fields.count == 3, fields[0] == "STATE", fields[1] == Substring(String(sequence)),

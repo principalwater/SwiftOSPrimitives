@@ -116,6 +116,9 @@ final class NativeControl: Sendable {
       "vmCreated": machine.wasCreated, "vmDestroyed": machine.wasCreated && !machine.created,
       "memoryObservations": machine.dynamicMemory?.observations ?? [],
       "memoryRefusals": machine.dynamicMemory?.refusals ?? [],
+      "memoryObservationsTotal": machine.dynamicMemory?.observationsTotal ?? 0,
+      "memoryRefusalsTotal": machine.dynamicMemory?.refusalsTotal ?? 0,
+      "cumulativeBackingRetiredBytes": machine.dynamicMemory?.cumulativeBackingRetiredBytes ?? 0,
       "networks": machine.networks.map {
         ["index": $0.index, "txPackets": $0.txPackets, "rxPackets": $0.rxPackets]
       },

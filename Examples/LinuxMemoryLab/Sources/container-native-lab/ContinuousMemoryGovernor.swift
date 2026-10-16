@@ -1,4 +1,5 @@
 import BoundedMemory
+import ContainerWorkspaceCore
 import Darwin
 import Foundation
 import NativeLinuxVMM
@@ -13,28 +14,40 @@ final class ContinuousMemoryGovernor: Sendable {
     var pending = false
     var capacityReady = false
     var failure = ""
-    var samples: [[String: UInt64]] = []
-    var requests: [[String: UInt64]] = []
+    var activeRequest: [String: UInt64] = [:]
+    var sampleHistory = RecentHistory<[String: UInt64]>(capacity: 512)
+    var requestHistory = RecentHistory<[String: UInt64]>(capacity: 32)
+    var samples: [[String: UInt64]] { sampleHistory.elements }
+    var requests: [[String: UInt64]] { requestHistory.elements }
   }
   private let state = Mutex(State())
   private let probe: MemoryProbeSession
   private let vm: NativeVirtualMachine
   private let bootGuestBytes: UInt64
   private let began: ContinuousClock.Instant
+  private let lifetimeDeadline: ContinuousClock.Instant?
+  private let samplingInterval: Duration
   var snapshot: State { state.withLock { $0 } }
   var status: (
     running: Bool, pending: Bool, failure: String, sampleCount: Int, capacityReady: Bool
   ) {
-    state.withLock { ($0.running, $0.pending, $0.failure, $0.samples.count, $0.capacityReady) }
+    state.withLock {
+      ($0.running, $0.pending, $0.failure, Int(clamping: $0.sampleHistory.totalCount), $0.capacityReady)
+    }
   }
   init(
     probe: MemoryProbeSession, vm: NativeVirtualMachine, began: ContinuousClock.Instant,
-    bootGuestBytes: UInt64
+    bootGuestBytes: UInt64, lifetimeDeadline: ContinuousClock.Instant? = nil,
+    samplingInterval: Duration = .milliseconds(200)
   ) {
     self.probe = probe
     self.vm = vm
     self.began = began
     self.bootGuestBytes = bootGuestBytes
+    precondition(began <= .now && bootGuestBytes <= UInt64.max - (128 << 20))
+    precondition(samplingInterval >= .milliseconds(100) && samplingInterval <= .seconds(1))
+    self.lifetimeDeadline = lifetimeDeadline
+    self.samplingInterval = samplingInterval
   }
   func requestStop() { state.withLock { $0.stop = true } }
   private var now: UInt64 {
@@ -72,13 +85,18 @@ final class ContinuousMemoryGovernor: Sendable {
         if state.withLock({ $0.stop }), controller.pendingRequest == nil, geometryDeadline == nil {
           return
         }
-        guard now <= 180_000_000_000 else { throw LabFailure.deadline }
-        guard state.withLock({ $0.samples.count < 512 }) else { throw LabFailure.invariant }
+        if let lifetimeDeadline, ContinuousClock.now >= lifetimeDeadline {
+          throw LabFailure.deadline
+        }
+        guard state.withLock({ $0.sampleHistory.remainingCounterValues > 0 }) else {
+          throw LabFailure.invariant
+        }
         try controller.checkDeadline(nowNanoseconds: now)
         if let geometryDeadline, now >= geometryDeadline {
           throw BalloonController.Failure.completionTimedOut
         }
         var deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        if let lifetimeDeadline { deadline = min(deadline, lifetimeDeadline) }
         if let pending = controller.pendingRequest {
           deadline = min(
             deadline, began.advanced(
@@ -87,25 +105,32 @@ final class ContinuousMemoryGovernor: Sendable {
         if let geometryDeadline {
           deadline = min(deadline, began.advanced(by: .nanoseconds(Int64(geometryDeadline))))
         }
+        // Do not put an ambiguous command on the shared wire just as a fence expires.
+        if deadline < ContinuousClock.now.advanced(by: .milliseconds(50)) {
+          try await Task.sleep(until: deadline, clock: .continuous)
+          continue
+        }
         guard let reply = try await probe.observeIfIdle(deadline: deadline) else {
-          try await Task.sleep(for: .milliseconds(200))
+          try await Task.sleep(
+            until: min(.now.advanced(by: samplingInterval), deadline), clock: .continuous)
           continue
         }
         try Task.checkCancellation()
-        if state.withLock({ $0.stop }), controller.pendingRequest == nil, geometryDeadline == nil {
-          return
-        }
-        let returnedAt = now
-        try controller.checkDeadline(nowNanoseconds: returnedAt)
-        if let geometryDeadline, returnedAt >= geometryDeadline {
-          throw BalloonController.Failure.completionTimedOut
-        }
         var pressure: Int32 = 0
         var size = MemoryLayout<Int32>.size
         guard sysctlbyname("kern.memorystatus_vm_pressure_level", &pressure, &size, nil, 0) == 0,
           size == MemoryLayout<Int32>.size, [1, 2, 4].contains(pressure)
         else { throw LabFailure.invariant }
         let device = vm.memoryState
+        try Task.checkCancellation()
+        let returnedAt = now
+        if let lifetimeDeadline, ContinuousClock.now >= lifetimeDeadline {
+          throw LabFailure.deadline
+        }
+        try controller.checkDeadline(nowNanoseconds: returnedAt)
+        if let geometryDeadline, returnedAt >= geometryDeadline {
+          throw BalloonController.Failure.completionTimedOut
+        }
         guard returnedAt >= reply.capturedAt,
           returnedAt - reply.capturedAt <= 3_000_000_000,
           reply.total >= bootGuestBytes, reply.total <= bootGuestBytes + (128 << 20),
@@ -113,8 +138,8 @@ final class ContinuousMemoryGovernor: Sendable {
         else { throw LabFailure.invariant }
         let capacityReady = reply.total == bootGuestBytes + device.pluggedBytes
         if capacityReady, controller.pendingRequest == nil { geometryDeadline = nil }
-        if state.withLock({ $0.stop }), controller.pendingRequest == nil, geometryDeadline == nil {
-          return
+        else if !capacityReady, geometryDeadline == nil {
+          geometryDeadline = returnedAt + 8_000_000_000
         }
         let sample = BalloonController.Observation(
           epoch: 1, sequence: reply.sequence, capturedAtNanoseconds: reply.capturedAt,
@@ -124,34 +149,47 @@ final class ContinuousMemoryGovernor: Sendable {
           hostUnderPressure: pressure != 1, guestUnderPressure: false)
         // No suspension between policy admission, native setter and delivery fence.
         // Native mapping completion can precede Linux memory-online accounting.
-        let request: BalloonController.Request?
-        // Pending shrink rescue must remain available during guest accounting lag.
-        if capacityReady || controller.pendingRequest != nil || reply.available < 512 << 20 {
-          request = try controller.observe(sample, nowNanoseconds: returnedAt)
-        }
-        else { request = nil }
-        if let request {
-          guard state.withLock({ $0.requests.count < 32 }) else { throw LabFailure.invariant }
-          try vm.requestMemory(bytes: request.targetResidentBytes - (1024 << 20))
-          let deliveredAt = now
-          try controller.didApply(
-            request, afterObservationSequence: reply.sequence, atNanoseconds: deliveredAt)
-          geometryDeadline = request.issuedAtNanoseconds + 8_000_000_000
-          state.withLock {
-            $0.requests.append([
+        // Stop and new admissions share one linearization point; no lock crosses an await.
+        try state.withLock { snapshot in
+          let request: BalloonController.Request?
+          let lifetimeAdmits = lifetimeDeadline.map {
+            ContinuousClock.now.advanced(by: .seconds(8)) <= $0
+          } ?? true
+          if (snapshot.stop || !lifetimeAdmits), controller.pendingRequest == nil,
+            geometryDeadline == nil { request = nil }
+          // Pending rescue remains enabled while Linux online accounting lags.
+          else if capacityReady || controller.pendingRequest != nil || reply.available < 512 << 20 {
+            request = try controller.observe(sample, nowNanoseconds: returnedAt)
+          } else { request = nil }
+          if let request {
+            guard snapshot.requestHistory.remainingCounterValues > 0 else {
+              throw LabFailure.invariant
+            }
+            snapshot.pending = true
+            snapshot.activeRequest = [
+              "initialBytes": request.initialResidentBytes,
+              "targetBytes": request.targetResidentBytes, "sequence": request.sequence,
+              "issuedAt": request.issuedAtNanoseconds,
+            ]
+            geometryDeadline = request.issuedAtNanoseconds + 8_000_000_000
+            try vm.requestMemory(bytes: request.targetResidentBytes - (1024 << 20))
+            let deliveredAt = now
+            snapshot.activeRequest["deliveredAt"] = deliveredAt
+            try snapshot.requestHistory.append([
               "initialBytes": request.initialResidentBytes,
               "targetBytes": request.targetResidentBytes,
               "sequence": request.sequence, "issuedAt": request.issuedAtNanoseconds,
               "deliveredAt": deliveredAt,
             ])
+            try controller.didApply(
+              request, afterObservationSequence: reply.sequence, atNanoseconds: deliveredAt)
           }
-        }
-        if capacityReady, controller.pendingRequest == nil { geometryDeadline = nil }
-        let pending = controller.pendingRequest != nil || geometryDeadline != nil
-        state.withLock {
-          $0.pending = pending
-          $0.capacityReady = capacityReady
-          $0.samples.append([
+          if capacityReady, controller.pendingRequest == nil { geometryDeadline = nil }
+          let pending = controller.pendingRequest != nil || geometryDeadline != nil
+          snapshot.pending = pending
+          if !pending { snapshot.activeRequest = [:] }
+          snapshot.capacityReady = capacityReady
+          try snapshot.sampleHistory.append([
             "sequence": reply.sequence, "capturedAt": reply.capturedAt, "returnedAt": returnedAt,
             "guestAvailableBytes": reply.available, "guestTotalBytes": reply.total,
             "pluggedBytes": device.pluggedBytes, "requestedBytes": device.requestedBytes,
@@ -159,10 +197,18 @@ final class ContinuousMemoryGovernor: Sendable {
             "guestCapacityReady": capacityReady ? 1 : 0,
           ])
         }
-        try await Task.sleep(for: .milliseconds(200))
+        var wake = ContinuousClock.now.advanced(by: samplingInterval)
+        if let lifetimeDeadline { wake = min(wake, lifetimeDeadline) }
+        if let geometryDeadline {
+          wake = min(wake, began.advanced(by: .nanoseconds(Int64(geometryDeadline))))
+        }
+        try await Task.sleep(until: wake, clock: .continuous)
       }
     } catch {
-      state.withLock { $0.failure = String(describing: error) }
+      state.withLock {
+        $0.failure = String(describing: error)
+        $0.running = false
+      }
       throw error
     }
   }

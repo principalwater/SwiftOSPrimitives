@@ -31,7 +31,7 @@ import Foundation
       let bytes = try handle.read(upToCount: 4097), bytes.count == info.st_size,
       let owner = try JSONSerialization.jsonObject(with: bytes) as? [String: Any],
       owner["root"] as? String == root.path, owner["uid"] as? Int == Int(getuid()),
-      owner["purpose"] as? String == "isolated-container-continuous-G21"
+      owner["purpose"] as? String == "isolated-container-product-G22"
     else { throw Failure.arguments }
     let source = root.appending(path: "artifacts/clickhouse-base.ext4")
     let archive = root.appending(path: "build/tmp/journal-rootfs.tar")

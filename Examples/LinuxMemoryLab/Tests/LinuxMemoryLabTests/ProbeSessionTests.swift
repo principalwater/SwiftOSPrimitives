@@ -13,6 +13,49 @@ private func reply(_ output: ProbeOutput, sequence: Int) throws {
     "CANARY_OK \(sequence) 1000 900 cpus=2 packets=\(n) cpu0=\(n) cpu1=\(n)\n".utf8))
 }
 
+@Test(.timeLimit(.minutes(1))) func longLivedProbePreservesSequencesWithBoundedHistory() async throws {
+  let input = CommandInput()
+  defer { input.finish() }
+  let output = ProbeOutput()
+  let session = MemoryProbeSession(input: input, output: output, cpus: 2, began: .now)
+  try ready(output)
+  _ = try await session.start()
+  let peer = Task {
+    var wire = input.stream().makeAsyncIterator()
+    for sequence in 1...1100 {
+      guard await wire.next() == Data("OBS \(sequence)\n".utf8) else {
+        throw LabFailure.framing
+      }
+      try reply(output, sequence: sequence)
+    }
+  }
+  do {
+    for sequence in 1...1100 {
+      #expect(try await session.observe("OBS").sequence == UInt64(sequence))
+    }
+    try await peer.value
+    #expect(await session.transcript.count <= 1025)
+    #expect(await session.transcript.last?.hasPrefix("CANARY_OK 1100 ") == true)
+  } catch {
+    await session.close()
+    peer.cancel()
+    _ = await peer.result
+    throw error
+  }
+  await session.close()
+}
+
+@Test func drainedProbeOutputHasNoCumulativeTrafficLimit() throws {
+  let output = ProbeOutput()
+  let text = String(repeating: "x", count: 8000)
+  for _ in 0..<256 {
+    try output.write(Data((text + "\n").utf8))
+    #expect(try output.takeLine() == text)
+  }
+  #expect(try output.takeLine() == nil)
+  #expect(throws: LabFailure.framing) { try output.write(Data(count: 16385)) }
+}
+
 @Test(.timeLimit(.minutes(1))) func passiveProbeSkipsBusyWireWithoutTakingSequence() async throws {
   let input = CommandInput()
   defer { input.finish() }
