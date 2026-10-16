@@ -1,4 +1,5 @@
 import Foundation
+import NativeLinuxVMM
 import Testing
 
 @testable import container_native_lab
@@ -6,12 +7,12 @@ import Testing
 @Test(.timeLimit(.minutes(1))) func memoryTelemetryProgressesDuringForegroundAllocation()
   async throws
 {
-  let input = CommandInput()
-  let output = ProbeOutput()
-  let diagnostic = MemoryProbeSession(input: input, output: output, cpus: 2, began: .now)
-  let monitorInput = CommandInput()
-  let monitorOutput = ProbeOutput()
-  let monitor = MemoryObservationSession(input: monitorInput, output: monitorOutput, began: .now)
+  let input = NativeMemoryInput()
+  let output = NativeMemoryOutput()
+  let diagnostic = MemoryProbeSession(input: input, output: output, cpus: 2)
+  let monitorInput = NativeMemoryInput()
+  let monitorOutput = NativeMemoryOutput()
+  let monitor = NativeMemorySession(input: monitorInput, output: monitorOutput)
   defer {
     input.finish()
     monitorInput.finish()
@@ -25,6 +26,7 @@ import Testing
   let allocation = Task { try await diagnostic.observe("HOLD") }
   do {
     #expect(await wire.next() == Data("HOLD 1\n".utf8))
+    let before = ContinuousClock.now
     let observation = Task {
       try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1)))
     }
@@ -32,6 +34,7 @@ import Testing
     try monitorOutput.write(Data("MEMORY_OK 1 1000 500\n".utf8))
     let sample = try #require(try await observation.value)
     #expect(sample.sequence == 1 && sample.total == 1000 && sample.available == 500)
+    #expect(sample.capturedAt >= before && sample.capturedAt <= ContinuousClock.now)
     #expect(try await diagnostic.observeIfIdle() == nil)
     try output.write(Data("CANARY_OK 1 1000 500 cpus=2 packets=2 cpu0=2 cpu1=2\n".utf8))
     #expect(try await allocation.value.sequence == 1)
@@ -57,18 +60,18 @@ import Testing
     "MEMORY_OK 1 1000 1001\n", "MEMORY_OK 1 0 0\n",
   ]) func invalidMemoryTelemetryClosesWire(_ invalid: String) async throws
 {
-  let input = CommandInput()
+  let input = NativeMemoryInput()
   defer { input.finish() }
-  let output = ProbeOutput()
-  let monitor = MemoryObservationSession(input: input, output: output, began: .now)
+  let output = NativeMemoryOutput()
+  let monitor = NativeMemorySession(input: input, output: output)
   try output.write(Data("MEMORY_READY 1000 900\n".utf8))
   try await monitor.start()
   var wire = input.stream().makeAsyncIterator()
   let pending = Task { try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1))) }
   #expect(await wire.next() == Data("OBS 1\n".utf8))
   try output.write(Data(invalid.utf8))
-  await #expect(throws: LabFailure.framing) { try await pending.value }
-  await #expect(throws: LabFailure.disconnected) {
+  await #expect(throws: NativeControlFailure.framing) { try await pending.value }
+  await #expect(throws: NativeControlFailure.disconnected) {
     try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1)))
   }
   #expect(await wire.next() == nil)
@@ -76,10 +79,10 @@ import Testing
 
 @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func abandonedMemoryTelemetryCannotConsumeLateReply(cancel: Bool) async throws {
-  let input = CommandInput()
+  let input = NativeMemoryInput()
   defer { input.finish() }
-  let output = ProbeOutput()
-  let monitor = MemoryObservationSession(input: input, output: output, began: .now)
+  let output = NativeMemoryOutput()
+  let monitor = NativeMemorySession(input: input, output: output)
   try output.write(Data("MEMORY_READY 1000 900\n".utf8))
   try await monitor.start()
   var wire = input.stream().makeAsyncIterator()
@@ -92,10 +95,10 @@ func abandonedMemoryTelemetryCannotConsumeLateReply(cancel: Bool) async throws {
     pending.cancel()
     await #expect(throws: CancellationError.self) { try await pending.value }
   } else {
-    await #expect(throws: LabFailure.deadline) { try await pending.value }
+    await #expect(throws: NativeControlFailure.wireTimedOut) { try await pending.value }
   }
   try output.write(Data("MEMORY_OK 1 1000 900\n".utf8))
-  await #expect(throws: LabFailure.disconnected) {
+  await #expect(throws: NativeControlFailure.disconnected) {
     try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1)))
   }
   #expect(await wire.next() == nil)

@@ -131,6 +131,21 @@ final class LinuxMachine {
     device.transport.interruptStatus |= 2
     try check(hv_gic_set_spi(device.transport.interrupt, true), "memory-config-irq")
   }
+  private func synchronizeMemoryQuarantine() throws {
+    guard let control, let device = dynamicMemory,
+      control.memoryQuarantineRequested.load(ordering: .acquiring), !device.quarantined
+    else { return }
+    try device.quarantine(
+      quiescence: (cpus?.isQuiescent ?? false, cpus?.epoch ?? 0, cpuCount))
+    // Use actual extents while all vCPUs are parked, never a stale published count.
+    try requestMemory(device.plugged)
+    control.state.withLock {
+      $0.requested = device.requested
+      $0.plugged = device.plugged
+      $0.backingRetiredBytes = device.cumulativeBackingRetiredBytes
+      $0.memoryQuarantineApplied = true
+    }
+  }
   func blockMMIO(_ offset: UInt64, width: Int, write: UInt32?, target: BlockDevice? = nil) throws
     -> UInt64
   {
@@ -296,6 +311,7 @@ final class LinuxMachine {
     control?.state.withLock { $0.running = true }
     while control != nil || (dynamicMemory == nil ? !ready : !memoryComplete) {
       if let control, let vsock {
+        try synchronizeMemoryQuarantine()
         let releaseAlias = control.state.withLock {
           let requested = $0.releaseAlias
           $0.releaseAlias = false
@@ -315,7 +331,8 @@ final class LinuxMachine {
         }
         let update = control.state.withLock { state in
           state.plugged = dynamicMemory?.plugged ?? 0
-          return (state.stop, state.requested)
+          state.backingRetiredBytes = dynamicMemory?.cumulativeBackingRetiredBytes ?? 0
+          return (state.stop, state.requested, state.memoryControlRetired)
         }
         if update.0 { break }
         // Pop one ownership transfer at a time; an exception leaves every other fd in State.
@@ -331,7 +348,7 @@ final class LinuxMachine {
           case .cancel(let token): vsock.cancel(token)
           }
         }
-        if dynamicMemory?.requested != update.1 { try requestMemory(update.1) }
+        if !update.2, dynamicMemory?.requested != update.1 { try requestMemory(update.1) }
         try vsock.poll(memory: pointer, payloadMemory: dataPointer)
         try check(hv_gic_set_spi(38, vsock.transport.interruptStatus != 0), "vsock-irq")
       } else {
@@ -346,6 +363,7 @@ final class LinuxMachine {
       }
       running = false
       for (index, event) in events {
+        try synchronizeMemoryQuarantine()
         activeCPU = index
         activeRegisters = event.registers
         try handleExit(event)

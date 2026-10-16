@@ -14,7 +14,9 @@ final class EthernetPeer: Sendable {
     let deadline = ContinuousClock.now.advanced(by: .seconds(150))
     while !state.withLock({ $0.stop }) {
       try Task.checkCancellation()
-      guard ContinuousClock.now < deadline, echoed < 100000 else { throw LabFailure.deadline }
+      guard ContinuousClock.now < deadline, echoed < 100000 else {
+        throw NativeControlFailure.wireTimedOut
+      }
       if let packet = pending {
         if try link.send(packet) { pending = nil }
       } else if let packet = try link.receive() {
@@ -36,19 +38,19 @@ final class EthernetPeer: Sendable {
     return ~UInt16(sum)
   }
   static func reply(_ frame: Data, index: Int = 0) throws -> Data? {
-    guard (14...1514).contains(frame.count) else { throw LabFailure.framing }
-    guard (0...1).contains(index) else { throw LabFailure.framing }
+    guard (14...1514).contains(frame.count) else { throw NativeControlFailure.framing }
+    guard (0...1).contains(index) else { throw NativeControlFailure.framing }
     let guest: [UInt8] = [2, 0, 0, 0, UInt8(index), 2]
     let peer: [UInt8] = [2, 0, 0, 0, UInt8(index), 1]
     let prefix: [UInt8] = index == 0 ? [192, 0, 2] : [198, 51, 100]
     let guestIP = prefix + [2]
     let peerIP = prefix + [1]
-    guard Array(frame[6..<12]) == guest else { throw LabFailure.framing }
+    guard Array(frame[6..<12]) == guest else { throw NativeControlFailure.framing }
     func word(_ offset: Int) -> Int { Int(frame[offset]) << 8 | Int(frame[offset + 1]) }
     if word(12) == 0x806 {
       guard frame.count >= 42, word(14) == 1, word(16) == 0x800,
         frame[18] == 6, frame[19] == 4
-      else { throw LabFailure.framing }
+      else { throw NativeControlFailure.framing }
       guard word(20) == 1, Array(frame[28..<32]) == guestIP,
         Array(frame[38..<42]) == peerIP
       else { return nil }
@@ -62,17 +64,17 @@ final class EthernetPeer: Sendable {
       word(20) & 0x3fff == 0,
       Array(frame[26..<30]) == guestIP, Array(frame[30..<34]) == peerIP,
       checksum(Data(frame[14..<34])) == 0
-    else { throw LabFailure.framing }
+    else { throw NativeControlFailure.framing }
     guard frame[23] == 17 else { return nil }
     guard frame.count >= 42, word(16) >= 28, word(36) == 7070, word(38) == word(16) - 20
-    else { throw LabFailure.framing }
+    else { throw NativeControlFailure.framing }
     let end = 14 + word(16)
     let datagram = Data(frame[34..<end])
     if word(40) != 0 {
       var pseudo = Data(frame[26..<34])
       pseudo.append(contentsOf: [0, 17, frame[38], frame[39]])
       pseudo.append(datagram)
-      guard checksum(pseudo) == 0 else { throw LabFailure.framing }
+      guard checksum(pseudo) == 0 else { throw NativeControlFailure.framing }
     }
     var response = Data(frame.prefix(end))
     response.replaceSubrange(0..<6, with: guest)

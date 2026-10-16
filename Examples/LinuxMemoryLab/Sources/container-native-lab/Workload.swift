@@ -93,13 +93,15 @@ extension Lab {
     var policyRequests: [[String: UInt64]] = []
     let adaptive = ["adaptive", "adaptive-busy"].contains(mode)
     let continuous = [
-      "continuous", "continuous-cancel", "continuous-soak", "continuous-stop", "continuous-churn",
-      "continuous-expire", "continuous-sustained", "continuous-uart",
+      "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
+      "continuous-stop", "continuous-churn",
+      "continuous-expire", "continuous-expired-stop", "continuous-unsettled",
+      "continuous-sustained", "continuous-uart",
     ].contains(mode)
     var churn: [[String: UInt64]] = []
     var expectedGracefulStop = false
     var expectedLifetimeExpiry = false
-    var observer: ContinuousMemoryGovernor?
+    var observer: NativeMemoryGovernor?
     var observerTask: Task<Void, Error>?
     var expectedCancellation = false
     let began = ContinuousClock.now
@@ -117,13 +119,13 @@ extension Lab {
         completionTimeoutNanoseconds: 8_000_000_000)
     else { throw Failure.check("policy geometry") }
     defer { governor.retire() }
-    let input = CommandInput()
-    let canaryOutput = ProbeOutput()
+    let input = NativeMemoryInput()
+    let canaryOutput = NativeMemoryOutput()
     let session = MemoryProbeSession(
-      input: input, output: canaryOutput, cpus: vm.processorCount, began: began)
+      input: input, output: canaryOutput, cpus: vm.processorCount)
     var canary: LinuxProcess?
     var memoryMonitor: LinuxProcess?
-    var memorySession: MemoryObservationSession?
+    var memorySession: NativeMemorySession?
     var activeLoad: Task<String, Error>?
     var primary = ""
     var cleanup: [String] = []
@@ -228,7 +230,11 @@ extension Lab {
         }
         guestCapacity = reply.total
         sequence = Int(reply.sequence)
-        capturedAt = reply.capturedAt
+        guard reply.capturedAt >= began else { throw Failure.check("observation clock") }
+        let capture = began.duration(to: reply.capturedAt).components
+        capturedAt =
+          UInt64(capture.seconds) * 1_000_000_000
+          + UInt64(capture.attoseconds / 1_000_000_000)
         available = reply.available
         return reply.total
       }
@@ -360,10 +366,10 @@ extension Lab {
       try await waitMemory(vm, bytes: geometry.dynamicBytes)
       try await resourceSnapshot("baseline")
       if continuous {
-        let monitorInput = CommandInput()
-        let monitorOutput = ProbeOutput()
-        let telemetry = MemoryObservationSession(
-          input: monitorInput, output: monitorOutput, began: began)
+        let monitorInput = NativeMemoryInput()
+        let monitorOutput = NativeMemoryOutput()
+        let telemetry = NativeMemorySession(
+          input: monitorInput, output: monitorOutput)
         memorySession = telemetry
         memoryMonitor = try await container.exec("memory-monitor") { config in
           config.arguments = [guestProbe, "--memory-monitor"]
@@ -374,19 +380,123 @@ extension Lab {
         }
         try await memoryMonitor!.start()
         try await telemetry.start()
-        let driver = ContinuousMemoryGovernor(
+        if mode == "continuous-unsettled" {
+          try vm.requestMemory(bytes: 0)
+          let premature = NativeMemoryGovernor(
+            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+          do {
+            try await premature.run()
+            throw Failure.check("unsettled device admitted a controller")
+          } catch NativeControlFailure.unsettled {}
+          let refused = vm.memoryControlStatus
+          guard refused.generation == 0, !refused.retired, !refused.quarantined else {
+            throw Failure.check("retryable refusal consumed memory authority")
+          }
+          try vm.requestMemory(bytes: geometry.dynamicBytes)
+          try await waitMemory(vm, bytes: geometry.dynamicBytes)
+          _ = try await waitGuestMemory(initialMemory, deadline: .now.advanced(by: .seconds(8)))
+          try vm.releaseDiagnosticAlias()
+        }
+        if mode == "continuous" {
+          let cancelled = NativeMemoryGovernor(
+            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+          let gate = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingOldest(1))
+          let task = Task {
+            var events = gate.stream.makeAsyncIterator()
+            _ = await events.next()
+            try await cancelled.run()
+          }
+          task.cancel()
+          switch await task.result {
+          case .success: throw Failure.check("pre-cancelled governor was admitted")
+          case .failure(let error):
+            guard error is CancellationError else { throw error }
+          }
+          gate.continuation.finish()
+          let admission = vm.memoryControlStatus
+          guard !cancelled.snapshot.claimed, admission.generation == 0, !admission.retired else {
+            throw Failure.check("pre-cancelled entry retired healthy authority")
+          }
+          commands.append(["preCancelledControlAdmission": "refused"])
+        }
+        let driver = NativeMemoryGovernor(
           probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
-          lifetimeDeadline: mode == "continuous-expire"
-            ? .now.advanced(by: .seconds(2))
-            : mode == "continuous-sustained" ? nil : began.advanced(by: .seconds(180)),
+          lifetimeDeadline: mode == "continuous-expired-stop"
+            ? .now.advanced(by: .seconds(-1))
+            : mode == "continuous-expire"
+              ? .now.advanced(by: .seconds(2))
+              : mode == "continuous-sustained" ? nil : began.advanced(by: .seconds(180)),
           samplingInterval: mode == "continuous-soak" ? .milliseconds(100) : .milliseconds(200))
         observer = driver
+        if ["continuous-expired-stop", "continuous-unsettled"].contains(mode) {
+          driver.requestStop()
+        }
         observerTask = Task { try await driver.run() }
-        if mode == "continuous-expire" {
+        if mode == "continuous" {
+          let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+          while driver.status.sampleCount == 0 {
+            guard ContinuousClock.now < deadline, driver.status.failure.isEmpty else {
+              throw Failure.check("exclusive owner not observed")
+            }
+            try await Task.sleep(for: .milliseconds(5))
+          }
+          do {
+            try vm.requestMemory(bytes: 0)
+            throw Failure.check("manual setter bypassed active governor")
+          } catch NativeControlFailure.ownership {}
+          let competitor = NativeMemoryGovernor(
+            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+          do {
+            try await competitor.run()
+            throw Failure.check("second governor bypassed memory authority")
+          } catch NativeControlFailure.ownership {}
+          guard !competitor.status.running,
+            competitor.snapshot.failureError as? NativeControlFailure == .ownership
+          else { throw Failure.check("competing owner final state") }
+          commands.append(["exclusiveControllerOwnership": "verified"])
+        }
+        if mode == "continuous-unsettled" {
+          try await observerTask!.value
+          observerTask = nil
+          let admitted = vm.memoryControlStatus
+          let durable = try await sql(container, query: integrity)
+          guard admitted.generation == 1, !admitted.retired, !admitted.quarantined,
+            !driver.status.running, driver.snapshot.requestHistory.totalCount == 0,
+            durable == expected
+          else { throw Failure.check("settled controller retry failed") }
+          expectedGracefulStop = true
+          commands.append([
+            "unsettledAdmission": "refused", "retryGeneration": "1", "integrity": durable,
+          ])
+          try await resourceSnapshot("unsettled-admission-retried")
+        } else if mode == "continuous-expired-stop" {
+          switch await observerTask!.result {
+          case .success: throw Failure.check("observer ignored expired lifetime with late stop")
+          case .failure(let error):
+            guard error as? NativeControlFailure == .lifetimeExpired else { throw error }
+          }
+          observerTask = nil
+          let expired = driver.snapshot
+          let integrityAfterExpiry = try await sql(container, query: integrity)
+          guard !expired.running, !expired.pending, expired.sampleHistory.totalCount == 0,
+            expired.requestHistory.totalCount == 0,
+            expired.failureError as? NativeControlFailure == .lifetimeExpired,
+            integrityAfterExpiry == expected
+          else { throw Failure.check("late stop concealed lifetime expiry") }
+          do {
+            try vm.requestMemory(bytes: geometry.dynamicBytes)
+            throw Failure.check("expired authority admitted a manual setter")
+          } catch NativeControlFailure.ownership {}
+          expectedLifetimeExpiry = true
+          commands.append([
+            "lateStopPreservesLifetimeFailure": "verified", "integrity": integrityAfterExpiry,
+          ])
+          try await resourceSnapshot("late-stop-lifetime-expired")
+        } else if mode == "continuous-expire" {
           switch await observerTask!.result {
           case .success: throw Failure.check("observer ignored lifetime deadline")
           case .failure(let error):
-            guard error as? LabFailure == .deadline else { throw error }
+            guard error as? NativeControlFailure == .lifetimeExpired else { throw error }
           }
           observerTask = nil
           let expired = driver.snapshot
@@ -396,7 +506,9 @@ extension Lab {
           else { throw Failure.check("deadline admission/status/integrity") }
           expectedLifetimeExpiry = true
           try await resourceSnapshot("lifetime-expired-without-new-admission")
-        } else if mode == "continuous-cancel" || mode == "continuous-stop" {
+        } else if ["continuous-cancel", "continuous-cancel-release", "continuous-stop"].contains(
+          mode)
+        {
           let deadline = ContinuousClock.now.advanced(by: .seconds(8))
           while vm.refusalCount == 0 || !driver.status.pending {
             guard ContinuousClock.now < deadline, driver.status.failure.isEmpty else {
@@ -429,11 +541,34 @@ extension Lab {
             else {
               throw Failure.check("cancel retirement/integrity")
             }
+            if mode == "continuous-cancel-release" {
+              // A fresh round trip requires coordinator progress after authority retirement.
+              _ = try await verify()
+              let retained = vm.pluggedBytes
+              try vm.releaseDiagnosticAlias()
+              let until = ContinuousClock.now.advanced(by: .seconds(2))
+              repeat {
+                _ = try await verify()
+                guard vm.pluggedBytes == retained else {
+                  throw Failure.check("retired memory control continued shrinking")
+                }
+                try await Task.sleep(for: .milliseconds(50))
+              } while ContinuousClock.now < until
+              commands.append(["retiredControlPreservesBacking": "verified"])
+            }
             try await resourceSnapshot("cancelled-pending")
           }
         } else {
           try await waitObserver(0)
         }
+      }
+      if expectedCancellation || expectedLifetimeExpiry {
+        try await vm.waitForMemoryControlRetirement(deadline: .now.advanced(by: .seconds(1)))
+        let retirement = vm.memoryControlStatus
+        guard retirement.retired, retirement.quarantined else {
+          throw Failure.check("native memory quarantine not acknowledged")
+        }
+        commands.append(["nativeMemoryQuarantine": "acknowledged"])
       }
       if vm.aliasDiagnosticEnabled, !adaptive, !continuous {
         try vm.requestMemory(bytes: 0)
@@ -708,7 +843,7 @@ extension Lab {
       try await canary!.delete()
       canary = nil
       if let memorySession {
-        if expectedCancellation {
+        if expectedCancellation || expectedLifetimeExpiry {
           await memorySession.close()
         } else {
           try await memorySession.quit()
@@ -716,7 +851,10 @@ extension Lab {
       }
       if let memoryMonitor {
         let status = try await memoryMonitor.wait(timeoutInSeconds: 5)
-        guard expectedCancellation || status.exitCode == 0 else {
+        // Closing the owned input intentionally retires this strict command protocol with exit1.
+        let expectedExit: Int32 = expectedCancellation || expectedLifetimeExpiry ? 1 : 0
+        commands.append(["memoryMonitorExit": String(status.exitCode)])
+        guard status.exitCode == expectedExit else {
           throw Failure.check("memory monitor exit")
         }
         try await memoryMonitor.delete()
@@ -761,6 +899,13 @@ extension Lab {
     }
     let transcript = await session.transcript
     let observerState = observer?.snapshot
+    var observerStopNanoseconds: Any = NSNull()
+    if let instant = observerState?.stopRequestedAt {
+      let value = began.duration(to: instant).components
+      observerStopNanoseconds =
+        UInt64(value.seconds) * 1_000_000_000
+        + UInt64(value.attoseconds / 1_000_000_000)
+    }
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
       "cycles": observations, "canaryTranscript": transcript, "commands": commands,
@@ -779,6 +924,7 @@ extension Lab {
       "observerCapacityReady": observerState?.capacityReady ?? false,
       "observerActiveRequest": observerState?.activeRequest ?? [:],
       "observerStopped": observerState?.running == false,
+      "observerStopRequestedAt": observerStopNanoseconds,
       "observerFailure": observerState?.failure ?? "", "expectedCancellation": expectedCancellation,
       "expectedGracefulStop": expectedGracefulStop,
       "expectedLifetimeExpiry": expectedLifetimeExpiry,

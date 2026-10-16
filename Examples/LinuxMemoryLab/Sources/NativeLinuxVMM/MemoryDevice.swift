@@ -32,6 +32,8 @@ final class MemoryDevice {
   var observations: [[String: Any]] { observationHistory.elements }
   var observationsTotal: UInt64 { observationHistory.totalCount }
   private(set) var cumulativeBackingRetiredBytes: UInt64 = 0
+  private(set) var quarantined = false
+  private(set) var quarantineRecord: [String: UInt64] = [:]
   var plugged: UInt64 { UInt64(extents.filter(\.plugged).count * Self.block) }
 
   init(
@@ -49,6 +51,20 @@ final class MemoryDevice {
   }
   private func confined() throws {
     guard pthread_equal(thread, pthread_self()) != 0 else { throw DeviceFailure.request }
+  }
+  func quarantine(quiescence: (parked: Bool, epoch: Int, cpus: Int)) throws {
+    try confined()
+    guard quiescence.parked, quiescence.epoch >= 0, (1...4).contains(quiescence.cpus) else {
+      throw DeviceFailure.request
+    }
+    guard !quarantined else { return }
+    quarantined = true
+    requested = plugged
+    quarantineRecord = [
+      "pluggedBytes": plugged, "requestedBytes": requested,
+      "epoch": UInt64(quiescence.epoch), "vcpuCount": UInt64(quiescence.cpus),
+      "allVCPUsParked": 1,
+    ]
   }
   func config() -> Data {
     let words: [UInt64] = [
@@ -76,6 +92,7 @@ final class MemoryDevice {
     var response: UInt16 = 0
     var state: UInt16 = 0
     if kind == 2 {
+      if quarantined { return Self.reply(type: 2, state: 0) }
       // Startup/reset only: the standard driver guarantees no active users here.
       if try !retire(
         Array(extents.indices.filter { extents[$0].plugged || extents[$0].mapped }),
@@ -91,6 +108,7 @@ final class MemoryDevice {
       else { return Self.reply(type: 3, state: 0) }
       let first = Int((address - Self.base) / UInt64(Self.block))
       let indices = first..<(first + blocks)
+      if quarantined, kind != 3 { return Self.reply(type: 2, state: 0) }
       switch kind {
       case 0:
         if indices.contains(where: { extents[$0].plugged })

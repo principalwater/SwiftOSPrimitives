@@ -1,17 +1,17 @@
 import BoundedMemory
 import Foundation
+import NativeLinuxVMM
 
 /// The wire has no multiplexing: one lease covers send through validated reply.
 actor MemoryProbeSession {
-  typealias Observation = GuestMemoryObservation
+  typealias Observation = NativeMemoryObservation
   struct Load: Sendable {
     let sequence: UInt64
     let count: Int
     let bytes: UInt64
   }
-  private let input: CommandInput
-  private let output: ProbeOutput
-  private let began: ContinuousClock.Instant
+  private let input: NativeMemoryInput
+  private let output: NativeMemoryOutput
   private let cpus: Int
   private var sequence: UInt64 = 0
   private var busy = false
@@ -27,71 +27,66 @@ actor MemoryProbeSession {
   var transcriptTotal: UInt64 { history.totalCount }
   var transcriptDropped: UInt64 { history.droppedCount }
 
-  init(input: CommandInput, output: ProbeOutput, cpus: Int, began: ContinuousClock.Instant) {
+  init(input: NativeMemoryInput, output: NativeMemoryOutput, cpus: Int) {
     self.input = input
     self.output = output
     self.cpus = cpus
-    self.began = began
     seenWork = Array(repeating: 0, count: cpus)
     checkedWork = Array(repeating: 0, count: cpus)
-  }
-  private var now: UInt64 {
-    let d = began.duration(to: .now).components
-    return UInt64(d.seconds) * 1_000_000_000 + UInt64(d.attoseconds / 1_000_000_000)
   }
   private func acquire(
     until deadline: ContinuousClock.Instant, wait: Bool = true
   ) async throws -> Bool {
     try Task.checkCancellation()
-    guard !closed else { throw LabFailure.disconnected }
-    guard ContinuousClock.now < deadline else { throw LabFailure.deadline }
+    guard !closed else { throw NativeControlFailure.disconnected }
+    guard ContinuousClock.now < deadline else { throw NativeControlFailure.wireTimedOut }
     if busy, !wait { return false }
-    guard waiting < 2 else { throw LabFailure.invariant }
+    guard waiting < 2 else { throw NativeControlFailure.invariant }
     waiting += 1
     defer { waiting -= 1 }
     // shortcut: two finite lab callers; replace with a queued permit for interactive clients.
     while busy {
       try Task.checkCancellation()
-      guard !closed else { throw LabFailure.disconnected }
-      guard ContinuousClock.now < deadline else { throw LabFailure.deadline }
+      guard !closed else { throw NativeControlFailure.disconnected }
+      guard ContinuousClock.now < deadline else { throw NativeControlFailure.wireTimedOut }
       try await Task.sleep(for: .milliseconds(5))
     }
     try Task.checkCancellation()
-    guard !closed else { throw LabFailure.disconnected }
-    guard ContinuousClock.now < deadline else { throw LabFailure.deadline }
+    guard !closed else { throw NativeControlFailure.disconnected }
+    guard ContinuousClock.now < deadline else { throw NativeControlFailure.wireTimedOut }
     busy = true
     return true
   }
   private func line(until deadline: ContinuousClock.Instant) async throws -> String {
     while ContinuousClock.now < deadline {
       try Task.checkCancellation()
-      guard !closed else { throw LabFailure.disconnected }
+      guard !closed else { throw NativeControlFailure.disconnected }
       if let text = try output.takeLine() {
         try history.append(text)
         return text
       }
       try await Task.sleep(for: .milliseconds(5))
     }
-    throw LabFailure.deadline
+    throw NativeControlFailure.wireTimedOut
   }
   private func checkWork(_ fields: ArraySlice<Substring>, progress: Bool) throws {
     var values: [String: UInt64] = [:]
     for field in fields {
       let pair = field.split(separator: "=")
       guard pair.count == 2, let n = UInt64(pair[1]), values[String(pair[0])] == nil else {
-        throw LabFailure.framing
+        throw NativeControlFailure.framing
       }
       values[String(pair[0])] = n
     }
     guard values.count == cpus + 2, values["cpus"] == UInt64(cpus),
       let packets = values["packets"], packets >= seenPackets,
       !progress || packets > checkedPackets
-    else { throw LabFailure.invariant }
+    else { throw NativeControlFailure.invariant }
     var work: [UInt64] = []
     for core in 0..<cpus {
       guard let n = values["cpu\(core)"], n >= seenWork[core],
         !progress || n > checkedWork[core]
-      else { throw LabFailure.invariant }
+      else { throw NativeControlFailure.invariant }
       work.append(n)
     }
     seenWork = work
@@ -106,12 +101,12 @@ actor MemoryProbeSession {
     _ = try await acquire(until: deadline)
     defer { busy = false }
     do {
-      guard !ready else { throw LabFailure.invariant }
-      let capturedAt = now
+      guard !ready else { throw NativeControlFailure.invariant }
+      let capturedAt = ContinuousClock.now
       let words = try await line(until: deadline).split(separator: " ")
       guard words.count == 5 + cpus, words[0] == "CANARY_READY",
         let total = UInt64(words[1]), let available = UInt64(words[2]), available <= total
-      else { throw LabFailure.framing }
+      else { throw NativeControlFailure.framing }
       try checkWork(words.dropFirst(3), progress: true)
       ready = true
       return .init(sequence: 0, capturedAt: capturedAt, total: total, available: available)
@@ -121,7 +116,7 @@ actor MemoryProbeSession {
     }
   }
   private func send(_ command: String, suffix: String = "") throws -> UInt64 {
-    guard ready, sequence < UInt64.max else { throw LabFailure.framing }
+    guard ready, sequence < UInt64.max else { throw NativeControlFailure.framing }
     sequence += 1
     try input.send(Data("\(command) \(sequence)\(suffix)\n".utf8))
     return sequence
@@ -131,7 +126,7 @@ actor MemoryProbeSession {
     deadline: ContinuousClock.Instant = .now.advanced(by: .seconds(5))
   ) async throws -> Observation {
     guard ["VERIFY", "OBS", "HOLD", "DROP", "QUIT"].contains(command) else {
-      throw LabFailure.arguments
+      throw NativeControlFailure.arguments
     }
     _ = try await acquire(until: deadline)
     return try await observation(command, deadline: deadline)
@@ -148,14 +143,14 @@ actor MemoryProbeSession {
   ) async throws -> Observation {
     defer { busy = false }
     do {
-      let capturedAt = now
+      let capturedAt = ContinuousClock.now
       let sent = try send(command)
       let words = try await line(until: deadline).split(separator: " ")
       try Task.checkCancellation()
       guard !closed, words.count == 6 + cpus, words[0] == "CANARY_OK",
         UInt64(words[1]) == sent, let total = UInt64(words[2]),
         let available = UInt64(words[3]), available <= total
-      else { throw LabFailure.framing }
+      else { throw NativeControlFailure.framing }
       try checkWork(words.dropFirst(4), progress: command != "OBS")
       if command == "QUIT" { close() }
       return .init(sequence: sent, capturedAt: capturedAt, total: total, available: available)
@@ -165,7 +160,7 @@ actor MemoryProbeSession {
     }
   }
   func load(cycle: Int) async throws -> Load {
-    guard (1...2).contains(cycle) else { throw LabFailure.arguments }
+    guard (1...2).contains(cycle) else { throw NativeControlFailure.arguments }
     let deadline = ContinuousClock.now.advanced(by: .seconds(5))
     _ = try await acquire(until: deadline)
     defer { busy = false }
@@ -175,7 +170,7 @@ actor MemoryProbeSession {
       try Task.checkCancellation()
       guard !closed, words.count == 4, words[0] == "LOAD_STATE", UInt64(words[1]) == sent,
         let count = Int(words[2]), (0...1).contains(count), let bytes = UInt64(words[3])
-      else { throw LabFailure.framing }
+      else { throw NativeControlFailure.framing }
       return .init(sequence: sent, count: count, bytes: bytes)
     } catch {
       close()

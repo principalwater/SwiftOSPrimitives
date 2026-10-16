@@ -115,6 +115,40 @@ func requiresVersionAndOfferedFeatures(_ missingMemoryFeature: Bool) throws {
   #expect(device.plugged == 0 && device.observations.isEmpty)
 }
 
+@Test func quarantinedMemoryWireRefusesMutationsButRetainsValidationAndStateReads() throws {
+  let device = MemoryDevice(held: false)
+  #expect(throws: DeviceFailure.self) {
+    try device.quarantine(quiescence: (false, 7, 2))
+  }
+  #expect(!device.quarantined)
+  try device.quarantine(quiescence: (true, 7, 2))
+  #expect(device.quarantined && device.requested == 0)
+  for kind: UInt8 in [0, 1, 2] {
+    var request = Data(count: 24)
+    request[0] = kind
+    request[12] = 1
+    request[16] = 1
+    #expect(
+      try device.request(request, quiescence: (true, 8, 2))
+        == Data([2, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+  }
+  var state = Data(count: 24)
+  state[0] = 3
+  state[12] = 1
+  state[16] = 1
+  #expect(
+    try device.request(state, quiescence: (true, 8, 2))
+      == Data([0, 0, 0, 0, 0, 0, 0, 0, 1, 0]))
+  state[0] = 1
+  state[8] = 1
+  #expect(
+    try device.request(state, quiescence: (true, 8, 2))
+      == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+  try device.quarantine(quiescence: (true, 9, 2))
+  #expect(device.quarantineRecord["epoch"] == 7)
+  #expect(device.plugged == 0 && device.observations.isEmpty)
+}
+
 @Test func unsupportedDiskCommandReturnsStatusWithoutIO() throws {
   let temporaryPath = try #require(ProcessInfo.processInfo.environment["TMPDIR"])
   let root = URL(filePath: temporaryPath, directoryHint: .isDirectory)

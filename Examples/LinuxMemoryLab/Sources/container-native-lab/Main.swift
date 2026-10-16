@@ -29,9 +29,12 @@ import NativeLinuxVMM
         || args.count == 6
           && [
             "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
-            "continuous", "continuous-cancel", "continuous-soak", "continuous-stop",
+            "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
+            "continuous-stop",
             "continuous-churn",
-            "continuous-expire", "continuous-sustained", "continuous-uart", "memory-wide",
+            "continuous-expire", "continuous-expired-stop", "continuous-unsettled",
+            "continuous-sustained",
+            "continuous-uart", "memory-wide",
             "memory-boot-wide",
           ].contains(args[4])
     else { throw Failure.arguments }
@@ -59,7 +62,10 @@ import NativeLinuxVMM
     let manager = NativeVirtualMachineManager(
       kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
       console: output.appending(path: "console.log"), held: args[4] == "held",
-      aliasControl: ["alias", "adaptive-busy", "continuous-cancel", "continuous-stop"].contains(
+      aliasControl: [
+        "alias", "adaptive-busy", "continuous-cancel", "continuous-cancel-release",
+        "continuous-unsettled", "continuous-stop",
+      ].contains(
         args[4]),
       group: group, memoryGeometry: geometry,
       executionPolicy: args[4] == "continuous-sustained" ? .sustained : .qualification)

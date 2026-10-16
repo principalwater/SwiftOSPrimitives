@@ -270,3 +270,6 @@ cross-version configuration migration or host power-loss recovery.
 `adaptive-busy` retains the diagnostic alias instead of releasing it. The expected
 negative outcome is `completionTimedOut`, zero successful UNPLUG frees and clean
 vCPU/coordinator join and VM destruction. It is not a successful workload run.
+
+See [G24 native API qualification](NATIVE-API-QUALIFICATION.md) for the public
+memory-control API, native quarantine repair, 17 profiles and crash recovery.

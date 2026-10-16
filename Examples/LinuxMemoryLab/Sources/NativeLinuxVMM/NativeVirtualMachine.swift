@@ -1,5 +1,6 @@
 import Containerization
 import Darwin
+import Dispatch
 import Foundation
 import NIOPosix
 import Synchronization
@@ -34,6 +35,11 @@ final class NativeControl: Sendable {
     var refusals = 0
     var requested: UInt64 = 0
     var plugged: UInt64 = 0
+    var memoryOwner: UInt64?
+    var memoryGeneration: UInt64 = 0
+    var memoryControlRetired = false
+    var memoryQuarantineApplied = false
+    var backingRetiredBytes: UInt64 = 0
     var error = ""
     var result = Data()
     var commands: [Command] = []
@@ -42,6 +48,7 @@ final class NativeControl: Sendable {
     var nextPort: UInt32 = 0x2000_0000
   }
   let state: Mutex<State>
+  let memoryQuarantineRequested = Atomic(false)
   let kernel: URL
   let initfs: URL
   let rootfs: URL
@@ -135,6 +142,10 @@ final class NativeControl: Sendable {
       "maximumScheduledVCPUs": machine.cpus?.maximumScheduled ?? 0,
       "executionPolicy": executionPolicy.rawValue,
       "bootBytes": geometry.bootBytes, "dynamicCapacityBytes": geometry.dynamicBytes,
+      "memoryControlGeneration": state.withLock { $0.memoryGeneration },
+      "memoryControlRetired": state.withLock { $0.memoryControlRetired },
+      "memoryQuarantineApplied": state.withLock { $0.memoryQuarantineApplied },
+      "memoryQuarantine": machine.dynamicMemory?.quarantineRecord ?? [:],
       "diskAdmittedWriteBytes": machine.rootDisk?.written ?? 0,
       "consoleRetainedBytes": machine.console.count,
       "exits": machine.exits, "lastPC": String(machine.lastPC, radix: 16),
@@ -267,11 +278,67 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
   public var memoryState: (pluggedBytes: UInt64, requestedBytes: UInt64) {
     control.state.withLock { ($0.plugged, $0.requested) }
   }
+  /// Coordinator acknowledgement is distinct from the synchronous setter-admission retirement.
+  public var memoryControlStatus:
+    (generation: UInt64, retired: Bool, quarantined: Bool, backingRetiredBytes: UInt64)
+  {
+    control.state.withLock {
+      (
+        $0.memoryGeneration, $0.memoryControlRetired, $0.memoryQuarantineApplied,
+        $0.backingRetiredBytes
+      )
+    }
+  }
+  /// Cleanup wait, independent of cancellation. A timeout requires outer VM/process retirement.
+  public func waitForMemoryControlRetirement(deadline: ContinuousClock.Instant) async throws {
+    while true {
+      let value = control.state.withLock {
+        ($0.memoryControlRetired, $0.memoryQuarantineApplied, $0.ended, $0.error)
+      }
+      guard value.0 else { throw NativeControlFailure.ownership }
+      if value.1 { return }
+      if value.2 { throw NativeFailure.stopped(value.3) }
+      guard ContinuousClock.now < deadline else { throw NativeControlFailure.quarantineTimedOut }
+      await withCheckedContinuation { continuation in
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(5)) {
+          continuation.resume()
+        }
+      }
+    }
+  }
+  /// Changes desired dynamic capacity, not confirmed RAM. Refuses competing or retired authority.
   public func requestMemory(bytes: UInt64) throws {
+    try requestMemory(bytes: bytes, owner: nil)
+  }
+  func claimMemoryControl() throws -> UInt64 {
+    try control.state.withLock {
+      guard $0.memoryOwner == nil, !$0.memoryControlRetired, $0.memoryGeneration < UInt64.max
+      else { throw NativeControlFailure.ownership }
+      guard $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
+      guard $0.plugged == $0.requested else { throw NativeControlFailure.unsettled }
+      $0.memoryGeneration += 1
+      $0.memoryOwner = $0.memoryGeneration
+      return $0.memoryGeneration
+    }
+  }
+  func finishMemoryControl(owner: UInt64, reusable: Bool) {
+    control.state.withLock {
+      precondition($0.memoryOwner == owner, "Only the current governor can release its authority")
+      $0.memoryOwner = nil
+      if !reusable {
+        $0.memoryControlRetired = true
+        control.memoryQuarantineRequested.store(true, ordering: .releasing)
+      }
+    }
+  }
+  func requestMemory(bytes: UInt64, owner: UInt64?) throws {
     guard bytes <= control.geometry.dynamicBytes, bytes % UInt64(MemoryDevice.block) == 0 else {
       throw NativeFailure.unsupported
     }
     try control.state.withLock {
+      guard $0.memoryOwner == owner, !$0.memoryControlRetired else {
+        throw NativeControlFailure.ownership
+      }
       guard $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
       $0.requested = bytes
     }

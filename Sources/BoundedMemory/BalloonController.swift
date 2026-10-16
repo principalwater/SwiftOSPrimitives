@@ -134,7 +134,11 @@ public struct BalloonController: ~Copyable {
   /// One bounded request or nil for stable/pending/cooldown. A low-reserve guest may replace
   /// one applied shrink with restoration of its previously reserved allowance. Unknown delivery
   /// or conflicting host pressure quarantines it instead of stacking uncertain writes.
-  public mutating func observe(_ sample: borrowing Observation, nowNanoseconds now: UInt64)
+  /// Closing admission still validates observations, completes pending work and permits its rescue.
+  public mutating func observe(
+    _ sample: borrowing Observation, nowNanoseconds now: UInt64,
+    admittingNewRequests: Bool = true
+  )
     throws(Failure) -> Request?
   {
     try advance(to: now)
@@ -202,6 +206,7 @@ public struct BalloonController: ~Copyable {
     }
     latestSequence = sample.sequence
     latestCapture = sample.capturedAtNanoseconds
+    guard admittingNewRequests else { return nil }
     let highWater = guestReserveBytes + hysteresisBytes
     let desired: UInt64
     if needsSafety {

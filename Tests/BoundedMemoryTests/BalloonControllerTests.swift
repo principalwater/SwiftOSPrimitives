@@ -102,14 +102,14 @@ struct BalloonControllerTests {
         sample(6, at: 105, actual: 56 * page, available: 7 * page), nowNanoseconds: 105))
     #expect(grown.targetResidentBytes == 61 * page)
   }
-  @Test func urgentGrowthSupersedesOneAppliedShrink() throws {
+  @Test func closedAdmissionStillRescuesAndCompletesOneAppliedShrink() throws {
     var state = controller()
     let first = try request(state.observe(sample(1), nowNanoseconds: 1))
     try state.didApply(first, afterObservationSequence: 1, atNanoseconds: 1)
     let rescue = try request(
       state.observe(
         sample(2, at: 2, actual: 60 * page, requested: 56 * page, available: 7 * page),
-        nowNanoseconds: 2))
+        nowNanoseconds: 2, admittingNewRequests: false))
     #expect(rescue.targetResidentBytes == 64 * page)
     #expect(rescue.supersededTargetResidentBytes == 56 * page)
     #expect(throws: BalloonController.Failure.invalidApplication) {
@@ -117,10 +117,33 @@ struct BalloonControllerTests {
     }
     try state.didApply(rescue, afterObservationSequence: 2, atNanoseconds: 2)
     _ = try state.observe(
-      sample(3, at: 3, actual: 56 * page, available: 7 * page), nowNanoseconds: 3)
+      sample(3, at: 3, actual: 56 * page, available: 7 * page), nowNanoseconds: 3,
+      admittingNewRequests: false)
     check(state, pending: rescue)
-    _ = try state.observe(sample(4, at: 4), nowNanoseconds: 4)
+    _ = try state.observe(sample(4, at: 4), nowNanoseconds: 4, admittingNewRequests: false)
     check(state, pending: nil)
+    let stopped = try state.observe(
+      sample(5, at: 104), nowNanoseconds: 104, admittingNewRequests: false)
+    #expect(stopped == nil)
+    let reopened = try request(state.observe(sample(6, at: 105), nowNanoseconds: 105))
+    #expect(reopened.targetResidentBytes == 56 * page)
+  }
+  @Test(arguments: [7, 24])
+  func closedAdmissionBlocksFreshGrowthAndShrinkWithoutSkippingValidation(available: UInt64) throws
+  {
+    var state = controller()
+    let observation = sample(1, actual: 32 * page, available: available * page)
+    let stopped = try state.observe(
+      observation, nowNanoseconds: 1, admittingNewRequests: false)
+    #expect(stopped == nil)
+    check(state, pending: nil)
+    #expect(throws: BalloonController.Failure.invalidObservation) {
+      try state.observe(observation, nowNanoseconds: 2, admittingNewRequests: false)
+    }
+    let opened = try request(
+      state.observe(
+        sample(2, at: 2, actual: 32 * page, available: available * page), nowNanoseconds: 2))
+    #expect(opened.targetResidentBytes != 32 * page)
   }
   @Test func safetyCannotStackOntoUnknownDelivery() throws {
     var state = controller()
