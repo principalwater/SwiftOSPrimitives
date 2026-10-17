@@ -38,6 +38,32 @@ the VM and report no cleanup error. Freeing a mapped extent is refused. Native
 geometry and complete page-query counts are checked without changing sysctls.
 Failures remain failures, and cleanup errors are separate from the primary error.
 
+## Mapped advice and cold replacement controls
+
+The `advice-dontneed`, `advice-free` and `advice-reusable` modes measure native
+advice while the data extent is still mapped and the vCPU is stopped. They record
+the native status, errno, owned residency, footprint and raw global free-page
+counters before returning to guest execution. Reusable advice is paired with
+`MADV_FREE_REUSE` before any subsequent guest use. A successful advice call is
+never counted as reclaimed backing. The guest writes and verifies a fresh pattern,
+the host checks every word, and a deliberate host-side corruption must be visible
+to the guest before restoration. The separate canary must remain intact.
+
+`cold-remap` checks a different primitive: after unmapping and retiring an exclusive
+extent, install fresh backing at the same GPA before resuming the vCPU. The fresh
+mapping must have zero observed residency and stay within the existing footprint
+baseline tolerance. The next guest access verifies zeroes throughout the extent
+before writing another pattern. Unlike `release`, this mode does not resume the
+guest to probe the deliberately absent GPA between unmap and replacement.
+
+These controls have passed real-hardware execution alongside `release`, `held`,
+`alias` and the expected `corrupt` failure. The observed mapped advice controls
+kept the dirty extent resident; cold replacement was observed without resident
+data pages before guest reuse. Neither result qualifies a Linux free-page-reporting
+backend. Safe reporting ownership, multi-vCPU/device quiescence, host subpage
+geometry, poison handling, map-failure containment and application compatibility
+still require their own tests. No host memory pressure is forced by this lab.
+
 These facts establish retirement of the exclusively owned backing and its
 physical accounting charge. They do **not** identify physical frame numbers or
 promise a simultaneous 64MiB global free-list delta. The JSON therefore keeps
@@ -95,3 +121,6 @@ Under an external 180s watchdog, run it with `guest.bin result.json release` (or
 Expected native exit is0 for release/held/alias,1 for corruption. No permanent service
 is installed. CI builds the optional host package; VM execution is a separately
 signed, opt-in real-host acceptance gate.
+
+The advice and cold-remap modes also expect exit0 for a completed experiment;
+inspect their observations rather than treating that exit as a reclamation result.

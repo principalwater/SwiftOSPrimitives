@@ -294,7 +294,12 @@ private final class Machine {
 
   private static func run() throws {
     let arguments = CommandLine.arguments
-    guard arguments.count == 4, ["release", "held", "corrupt", "alias"].contains(arguments[3])
+    guard arguments.count == 4,
+      [
+        "release", "held", "corrupt", "alias", "advice-dontneed", "advice-free",
+        "advice-reusable", "cold-remap",
+      ]
+        .contains(arguments[3])
     else {
       throw Failure.arguments
     }
@@ -318,6 +323,7 @@ private final class Machine {
     var samples: [[String: Any]] = []
     var cycles = 0
     var releaseObservations: [UInt64] = []
+    var adviceObservations: [[String: Any]] = []
     do {
       try check(hv_vm_create(nil), "create")
       vm.created = true
@@ -354,15 +360,36 @@ private final class Machine {
         ])
       }
       var held: Region?
+      var coldReplacement: Region?
+      func hostFreePages() throws -> UInt64 {
+        var info = vm_statistics64_data_t()
+        let capacity = MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
+        var count = mach_msg_type_number_t(capacity)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+          pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) {
+            host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+          }
+        }
+        try check(result, "host-vm-statistics")
+        guard count == capacity else { throw Failure.observation }
+        return UInt64(info.free_count)
+      }
       for cycle in 0..<4 {
         guard let cycleStart = try ProcessMemorySnapshot.capture().physicalFootprintBytes
         else { throw Failure.observation }
         let data: Region
-        if let held {
+        if let replacement = coldReplacement {
+          data = replacement
+          coldReplacement = nil
+        } else if let held {
           try vm.remap(held)
           data = held
         } else {
           data = try vm.allocate(address: 0x4000_0000, size: size)
+        }
+        if mode.hasPrefix("advice-") || mode == "cold-remap" {
+          try sample("mapped-untouched-\(cycle)", data)
+          guard try vm.resident(data) == 0 else { throw Failure.observation }
         }
         let salt = UInt64(0x1234_5678_0000_0000) + UInt64(cycle)
         try vm.execute(
@@ -375,6 +402,43 @@ private final class Machine {
         try vm.execute(data: data, operation: 2, salt: salt)
         try sample("written-\(cycle)", data)
         guard try vm.resident(data) == UInt64(size) else { throw Failure.observation }
+        if mode.hasPrefix("advice-"), let pointer = data.pointer {
+          let advice = mode == "advice-dontneed" ? MADV_DONTNEED
+            : mode == "advice-free" ? MADV_FREE : MADV_FREE_REUSABLE
+          let before = try ProcessMemorySnapshot.capture()
+          let freeBefore = try hostFreePages()
+          let status = madvise(pointer, size, advice)
+          let error = status == 0 ? 0 : errno
+          let after = try ProcessMemorySnapshot.capture()
+          adviceObservations.append([
+            "cycle": cycle, "nativeAdvice": advice, "nativeStatus": status, "errno": error,
+            "residentOwnedAfterAdviceBytes": try vm.resident(data),
+            "footprintBeforeBytes": before.physicalFootprintBytes as Any,
+            "footprintAfterAdviceBytes": after.physicalFootprintBytes as Any,
+            "hostFreePagesBefore": freeBefore, "hostFreePagesAfter": try hostFreePages(),
+          ])
+          if status == 0, advice == MADV_FREE_REUSABLE {
+            guard madvise(pointer, size, MADV_FREE_REUSE) == 0 else {
+              throw Failure.native("madvise-reuse", errno)
+            }
+          }
+          // Never treat advice success as reclamation; prove both access views still agree.
+          try vm.execute(data: data, operation: 1, salt: salt)
+          try vm.execute(data: data, operation: 2, salt: salt)
+          let words = pointer.assumingMemoryBound(to: UInt64.self)
+          for index in 0..<(size / 8) {
+            guard words[index] == salt ^ UInt64(index) else { throw Failure.mismatch }
+          }
+          words[0] = salt ^ 1
+          do {
+            try vm.execute(data: data, operation: 2, salt: salt)
+            throw Failure.mismatch
+          } catch Failure.guestResult(3) {}
+          words[0] = salt
+          try vm.execute(data: data, operation: 2, salt: salt)
+          try vm.execute(data: canary, operation: 2, salt: canarySalt)
+          guard try vm.resident(data) == UInt64(size) else { throw Failure.observation }
+        }
         // A mapped, quiescent extent must never be freed while a stage-2 alias exists.
         do {
           try vm.release(data)
@@ -383,8 +447,10 @@ private final class Machine {
         try vm.unmap(data)
         try sample("unmapped-\(cycle)", data)
         guard try vm.resident(data) == UInt64(size) else { throw Failure.observation }
-        for offset in stride(from: UInt64(0), to: UInt64(size), by: vm.pageSize) {
-          try vm.execute(data: data, operation: 0, salt: salt, fault: .translation, offset: offset)
+        if mode != "cold-remap" {
+          for offset in stride(from: UInt64(0), to: UInt64(size), by: vm.pageSize) {
+            try vm.execute(data: data, operation: 0, salt: salt, fault: .translation, offset: offset)
+          }
         }
         if mode == "alias" {
           try vm.makeAlias(data)
@@ -422,6 +488,15 @@ private final class Machine {
           "processResidentBytes": process.residentBytes,
           "physicalFootprintBytes": process.physicalFootprintBytes as Any,
         ])
+        if mode == "cold-remap", cycle < 3 {
+          let replacement = try vm.allocate(address: data.address, size: size)
+          try sample("cold-replacement-before-resume-\(cycle)", replacement)
+          guard try vm.resident(replacement) == 0,
+            let remapped = try ProcessMemorySnapshot.capture().physicalFootprintBytes,
+            remapped <= after + 65536
+          else { throw Failure.observation }
+          coldReplacement = replacement
+        }
         try vm.execute(data: canary, operation: 2, salt: canarySalt)
         guard try vm.resident(canary) == UInt64(canary.size) else { throw Failure.observation }
         cycles += 1
@@ -436,6 +511,8 @@ private final class Machine {
       "completedDeallocations": releaseObservations.count,
       "footprintReductionBytesPerCycle": releaseObservations,
       "hostFreeListDelta": NSNull(),
+      "adviceObservations": adviceObservations,
+      "mappedAdviceBackendQualified": false,
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: destination, options: .withoutOverwriting)
