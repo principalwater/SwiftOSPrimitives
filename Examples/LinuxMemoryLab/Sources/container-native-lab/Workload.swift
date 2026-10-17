@@ -45,7 +45,7 @@ extension Lab {
 
   static func startSQL(
     _ container: LinuxContainer, id: String = UUID().uuidString,
-    query: String, queryID: String? = nil
+    query: String, queryID: String? = nil, nativeProbe: String? = nil
   ) async throws -> RunningSQL {
     let output = BoundedOutput()
     let process = try await container.exec(id) { config in
@@ -56,8 +56,13 @@ extension Lab {
         "--timeout_before_checking_execution_speed=0", "--max_rows_to_read=500000",
         "--max_bytes_to_read=100663296", "--max_result_rows=1000",
       ]
-      if let queryID { config.arguments += ["--query_id", queryID] }
-      config.arguments += ["--query", query]
+      if let nativeProbe {
+        config.arguments = [nativeProbe, "--http-query", query]
+        if let queryID { config.arguments.append(queryID) }
+      } else {
+        if let queryID { config.arguments += ["--query_id", queryID] }
+        config.arguments += ["--query", query]
+      }
       config.stdout = output
       config.stderr = output
       config.noNewPrivileges = true
@@ -86,10 +91,14 @@ extension Lab {
     probe: URL, mode: String
   ) async throws -> Bool {
     let geometry = vm.memoryGeometry
+    let classicPressure = mode == "pressure-balloon"
+    let classic = ["memory-balloon", "memory-balloon-wide", "pressure-balloon"].contains(mode)
+    let pulseBytes: UInt64 = (classicPressure ? 2048 : mode == "memory-balloon-wide" ? 768 : 128)
+      << 20
     let reporting = [
       "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
     ].contains(mode)
-    let protectedCapacity = mode == "continuous-pressure-protected" || reporting
+    let protectedCapacity = mode == "continuous-pressure-protected" || reporting || classicPressure
     let pressureWide = mode == "continuous-pressure-wide" || protectedCapacity
     let memoryLimit: UInt64 = (pressureWide ? 2816 : 896) << 20
     var commands: [[String: String]] = []
@@ -141,6 +150,14 @@ extension Lab {
     var cleanup: [String] = []
     // writeFile(create:) does not truncate; a recovered filesystem can contain an older probe.
     let guestProbe = "/lab/canary-" + UUID().uuidString.lowercased()
+    func sql(
+      _ container: LinuxContainer, id: String = UUID().uuidString,
+      query: String, queryID: String? = nil
+    ) async throws -> String {
+      let execution = try await Lab.startSQL(
+        container, id: id, query: query, queryID: queryID, nativeProbe: classic ? guestProbe : nil)
+      return try await execution.finish()
+    }
     do {
       let agent = try await vm.dialAgent()
       do {
@@ -170,6 +187,16 @@ extension Lab {
         try await Task.sleep(for: .milliseconds(100))
       }
       guard ready else { throw Failure.check("server readiness") }
+      if classic {
+        var refused = false
+        do { _ = try await sql(container, query: "SELECT throwIf(1) LIMIT 1") } catch {
+          guard String(describing: error).contains("loadResponse"),
+            String(describing: error).contains("Code: 395.") else { throw error }
+          refused = true
+        }
+        guard refused else { throw Failure.check("native HTTP accepted SQL exception") }
+        commands.append(["nativeHTTPErrorControl": "refused", "sqlTransport": "native-swift-http"])
+      }
       if pressureWide {
         let interval = try await sql(
           container,
@@ -648,9 +675,93 @@ extension Lab {
           throw error
         }
       }
+      func balloonPulse(cycle: Int, minimumResidentReturn: UInt64 = 0) async throws
+        -> [String: UInt64]
+      {
+        let releasedAt = now()
+        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+        let before = vm.backingRecyclingStatus.coldResidentBytes
+        let totalBefore = try await verify("OBS_REFRESH")
+        let availableBefore = available
+        guard totalBefore == initialMemory, availableBefore >= pulseBytes + (512 << 20) else {
+          throw Failure.check("balloon guest reserve/capacity")
+        }
+        let issuedAt = now()
+        try vm.requestBalloon(bytes: pulseBytes)
+        while true {
+          let state = vm.balloonState
+          guard ContinuousClock.now < deadline, !state.quarantined else {
+            throw Failure.check("balloon inflate deadline/quarantine")
+          }
+          if minimumResidentReturn > 0 {
+            if vm.backingRecyclingStatus.coldResidentBytes - before >= minimumResidentReturn { break }
+          } else if state.settled, state.targetBytes == pulseBytes,
+            state.actualBytes == state.ownedBytes, state.ownedBytes == pulseBytes
+          { break }
+          try await Task.sleep(for: .milliseconds(5))
+        }
+        let inflatedAt = now()
+        let ownedAtGoal = vm.balloonState.ownedBytes
+        let heldTotal = try await verify("OBS_REFRESH")
+        let heldAvailable = available
+        guard heldTotal == initialMemory, ContinuousClock.now < deadline,
+          vm.balloonState.targetBytes == pulseBytes
+        else { throw Failure.check("balloon held capacity/lease") }
+        if minimumResidentReturn == 0 {
+          guard availableBefore >= heldAvailable,
+            ((pulseBytes - (64 << 20))...(pulseBytes + (64 << 20)))
+              .contains(availableBefore - heldAvailable)
+          else {
+            commands.append([
+              "balloonAccountingCycle": String(cycle),
+              "availableBefore": String(availableBefore), "availableHeld": String(heldAvailable),
+            ])
+            throw Failure.check("balloon synchronized MemAvailable accounting")
+          }
+        }
+        let during = try await loadState(cycle: cycle)
+        guard during.0 == 1, during.1 >= 16 << 20 else {
+          throw Failure.check("SQL not live during classic balloon")
+        }
+        try vm.requestBalloon(bytes: 0)
+        let rescueDeadline = ContinuousClock.now.advanced(by: .seconds(8))
+        while true {
+          let state = vm.balloonState
+          guard ContinuousClock.now < rescueDeadline, !state.quarantined else {
+            throw Failure.check("balloon deflate deadline/quarantine")
+          }
+          if state.settled, state.targetBytes == 0, state.actualBytes == 0, state.ownedBytes == 0 {
+            break
+          }
+          try await Task.sleep(for: .milliseconds(5))
+        }
+        let deflatedAt = now()
+        let restored = try await verify()
+        guard restored == initialMemory else { throw Failure.check("balloon restore capacity") }
+        return [
+          "initialGuestBytes": initialMemory, "heldGuestBytes": heldTotal,
+          "restoredGuestBytes": restored, "balloonOwnedBytes": ownedAtGoal,
+          "requestedBalloonBytes": pulseBytes,
+          "availableBefore": availableBefore, "availableHeld": heldAvailable,
+          "releasedAtNanoseconds": releasedAt, "issuedAtNanoseconds": issuedAt,
+          "inflatedAtNanoseconds": inflatedAt, "deflatedAtNanoseconds": deflatedAt,
+          "reportedResidentBytesRecycled": vm.backingRecyclingStatus.coldResidentBytes - before,
+          "activeDuringBalloonMemoryBytes": during.1,
+        ]
+      }
       for cycle
         in (expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry ? [] : [1, 2])
       {
+        if classic {
+          if !classicPressure {
+            _ = try await verify("HOLD")
+            _ = try await verify("DROP")
+          }
+          do {
+            try vm.requestMemory(bytes: 0)
+            throw Failure.check("competing virtio-mem setter admitted during balloon mode")
+          } catch NativeControlFailure.ownership {}
+        }
         if mode == "memory-reporting" {
           let deadline = ContinuousClock.now.advanced(by: .seconds(8))
           while vm.backingRecyclingStatus.bytes == 0 {
@@ -666,9 +777,11 @@ extension Lab {
         if pressureWide {
           // Sixteen 128 MiB policy steps need their own aggregate phase fence;
           // the governor's wire/completion/drain fences remain unchanged.
-          try await waitObserver(
-            protectedCapacity ? geometry.dynamicBytes : 0,
-            deadline: .now.advanced(by: .seconds(30)))
+          if !classicPressure {
+            try await waitObserver(
+              protectedCapacity ? geometry.dynamicBytes : 0,
+              deadline: .now.advanced(by: .seconds(30)))
+          }
           _ = try await sql(
             container,
             query:
@@ -692,21 +805,28 @@ extension Lab {
               "pluggedBytes": String(vm.pluggedBytes), "capturedAt": String(now()),
             ])
             // Backpressure the workload on fresh guest headroom, not on a fixed success delay.
-            let firstSequence = observer!.snapshot.sampleHistory.totalCount
-            let headroomDeadline = ContinuousClock.now.advanced(by: .seconds(8))
-            while true {
-              let sample = observer!.snapshot
-              guard sample.failure.isEmpty, ContinuousClock.now < headroomDeadline else {
-                throw Failure.check("pressure ramp headroom")
+            if classicPressure {
+              let total = try await verify("OBS")
+              guard total == initialMemory, vm.pluggedBytes == geometry.dynamicBytes else {
+                throw Failure.check("classic pressure ramp capacity")
               }
-              if sample.sampleHistory.totalCount >= firstSequence + 2, !sample.pending,
-                sample.capacityReady,
-                sample.samples.last?["guestAvailableBytes"].map({ $0 >= 480 << 20 }) == true
-                  || vm.pluggedBytes == geometry.dynamicBytes
-              {
-                break
+            } else {
+              let firstSequence = observer!.snapshot.sampleHistory.totalCount
+              let headroomDeadline = ContinuousClock.now.advanced(by: .seconds(8))
+              while true {
+                let sample = observer!.snapshot
+                guard sample.failure.isEmpty, ContinuousClock.now < headroomDeadline else {
+                  throw Failure.check("pressure ramp headroom")
+                }
+                if sample.sampleHistory.totalCount >= firstSequence + 2, !sample.pending,
+                  sample.capacityReady,
+                  sample.samples.last?["guestAvailableBytes"].map({ $0 >= 480 << 20 }) == true
+                    || vm.pluggedBytes == geometry.dynamicBytes
+                {
+                  break
+                }
+                try await Task.sleep(for: .milliseconds(200))
               }
-              try await Task.sleep(for: .milliseconds(200))
             }
           }
           let pressureTable = try await sql(
@@ -721,8 +841,10 @@ extension Lab {
           commands.append([
             "pressureTableRows": "557056", "pressureTableAllocatedBytes": String(allocated),
           ])
-          try await waitObserver(
-            geometry.dynamicBytes, deadline: .now.advanced(by: .seconds(30)))
+          if !classicPressure {
+            try await waitObserver(
+              geometry.dynamicBytes, deadline: .now.advanced(by: .seconds(30)))
+          }
           pressurePeakGuest = try await verify("OBS")
           guard pressurePeakGuest == initialMemory else { throw Failure.check("pressure growth") }
           pressurePeakBacking = vm.memoryControlStatus.backingRetiredBytes
@@ -738,7 +860,8 @@ extension Lab {
         let queryID = "swiftos-load-\(cycle)"
         let query =
           "SELECT sum(n.number + sleepEachRow(0.00004)) FROM numbers(100000) AS n INNER JOIN (SELECT id, payload FROM default.ram_lab WHERE id < 100000) AS r ON n.number = r.id AND repeat(hex(cityHash64(n.number)), 8) = r.payload LIMIT 1 SETTINGS join_algorithm='hash'"
-        let execution = try await startSQL(container, query: query, queryID: queryID)
+        let execution = try await startSQL(
+          container, query: query, queryID: queryID, nativeProbe: classic ? guestProbe : nil)
         commands.append([
           "cycle": String(cycle), "loadProcessPID": String(execution.process.pid),
           "loadStartReturnedAt": String(now()),
@@ -754,11 +877,44 @@ extension Lab {
           try await Task.sleep(for: .milliseconds(25))
         }
         guard observed >= 16 << 20 else { throw Failure.check("active query not observed") }
+        if classic && !classicPressure {
+          let pulse = try await balloonPulse(cycle: cycle)
+          let aggregate = try await activeLoad!.value
+          activeLoad = nil
+          guard aggregate == "4999950000", vm.memoryControlStatus.backingRetiredBytes == 0,
+            try await sql(container, query: integrity) == expected
+          else { throw Failure.check("balloon restore/integrity") }
+          try await resourceSnapshot("balloon-restored-\(cycle)")
+          var record: [String: Any] = pulse.mapValues { $0 as Any }
+          record["cycle"] = cycle
+          record["integrity"] = expected
+          record["loadResult"] = aggregate
+          observations.append(record)
+          continue
+        }
         if pressureWide {
           _ = try await sql(container, query: "TRUNCATE TABLE default.pressure_lab")
           // This releases the workload's allocator pages; VM capacity changes remain autonomous.
           _ = try await sql(container, query: "SYSTEM JEMALLOC PURGE")
           if protectedCapacity {
+            if classicPressure {
+              let pulse = try await balloonPulse(cycle: cycle, minimumResidentReturn: 1 << 30)
+              let aggregate = try await activeLoad!.value
+              activeLoad = nil
+              guard aggregate == "4999950000", vm.memoryControlStatus.backingRetiredBytes == 0,
+                try await sql(container, query: integrity) == expected
+              else { throw Failure.check("classic pressure return/integrity") }
+              try await resourceSnapshot("classic-pressure-restored-\(cycle)")
+              var record: [String: Any] = pulse.mapValues { $0 as Any }
+              record["cycle"] = cycle
+              record["pressureTableRows"] = 557056
+              record["heldPressureBytes"] = 2176 << 20
+              record["workloadAllocatorPurgeRequested"] = true
+              record["integrity"] = expected
+              record["loadResult"] = aggregate
+              observations.append(record)
+              continue
+            }
             if reporting {
               let deadline = ContinuousClock.now.advanced(by: .seconds(8))
               while vm.backingRecyclingStatus.coldResidentBytes - peakRecycledResidentBytes < 1 << 30
@@ -1063,6 +1219,16 @@ extension Lab {
       memoryMonitor = nil
     } catch {
       primary = String(describing: error)
+      if classic {
+        do {
+          try vm.requestBalloon(bytes: 0)
+          let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+          while vm.balloonState.ownedBytes != 0 || !vm.balloonState.settled {
+            guard ContinuousClock.now < deadline else { throw Failure.check("balloon rescue drain") }
+            try await Task.sleep(for: .milliseconds(5))
+          }
+        } catch { cleanup.append("balloon-rescue \(error)") }
+      }
       if reporting, case Failure.check(let reason) = error,
         reason == "reported resident backing did not return"
       {
@@ -1163,6 +1329,7 @@ extension Lab {
       "canaryTranscriptDropped": await session.transcriptDropped,
       "canaryBytes": 64 << 20, "rows": 400000, "resources": resources,
       "adaptive": adaptive, "policyRequests": policyRequests, "policySamples": policySamples,
+      "classicBallooning": classic,
       "continuous": continuous, "observerSamples": observerState?.samples ?? [],
       "observerRequests": observerState?.requests ?? [],
       "observerSamplesTotal": observerState?.sampleHistory.totalCount ?? 0,

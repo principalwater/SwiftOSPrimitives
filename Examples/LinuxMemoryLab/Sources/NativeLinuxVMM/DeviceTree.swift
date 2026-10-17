@@ -54,8 +54,9 @@ struct DeviceTree {
 
   static func linux(
     memoryBytes: UInt64, initrd: Range<UInt64>, command: String, memoryDevice: Bool = false,
+    initialDynamicBytes: UInt64 = 0,
     blockDevice: Bool = false, container: Bool = false, cpuCount: Int = 1, networkCount: Int = 0,
-    freePageReporting: Bool = false
+    balloonDevice: Bool = false
   ) -> Data {
     var tree = Self()
     tree.begin("")
@@ -68,6 +69,12 @@ struct DeviceTree {
     tree.property("device_type", string("memory"))
     tree.property("reg", range(0x4000_0000, memoryBytes))
     tree.end()
+    if initialDynamicBytes > 0 {
+      tree.begin("memory@100000000")
+      tree.property("device_type", string("memory"))
+      tree.property("reg", range(MemoryDevice.base, initialDynamicBytes))
+      tree.end()
+    }
     tree.begin("cpus")
     tree.property("#address-cells", cells(1))
     tree.property("#size-cells", cells(0))
@@ -149,7 +156,7 @@ struct DeviceTree {
       tree.property("interrupts", cells(0, UInt32(7 + index), 4))
       tree.end()
     }
-    if freePageReporting {
+    if balloonDevice {
       tree.begin("virtio_mmio@a006000")
       tree.property("compatible", string("virtio,mmio"))
       tree.property("dma-coherent", Data())

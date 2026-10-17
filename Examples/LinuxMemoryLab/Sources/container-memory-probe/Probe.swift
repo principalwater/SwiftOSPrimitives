@@ -1,4 +1,5 @@
 #if os(Linux)
+  import LabHTTP
   import MemoryCanary
   import NativeLinux
   import PageMemory
@@ -11,7 +12,7 @@
 
   private enum ProbeFailure: Error {
     case system(Int32)
-    case framing, integrity, topology
+    case framing, integrity, topology, loadTimedOut
     case capacityTimedOut(total: UInt64, minimum: UInt64, elapsedNanoseconds: UInt64)
     case execution(Int32)
   }
@@ -38,6 +39,23 @@
     }
     throw ProbeFailure.framing
   }
+  private func refreshMemoryStatistics() throws {
+    let fd = open("/proc/sys/vm/stat_refresh", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+    guard fd >= 0 else { throw ProbeFailure.system(errno) }
+    var owned = true
+    defer { if owned { _ = close(fd) } }
+    var byte: UInt8 = 0
+    var count: Int
+    repeat { count = read(fd, &byte, 1) } while count < 0 && errno == EINTR
+    guard count == 0 else {
+      if count < 0 { throw ProbeFailure.system(errno) }
+      throw ProbeFailure.framing
+    }
+    let closed = close(fd)
+    owned = false
+    guard closed == 0 else { throw ProbeFailure.system(errno) }
+  }
+
   private func memory() throws -> String {
     let fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC)
     guard fd >= 0 else { throw ProbeFailure.system(errno) }
@@ -56,12 +74,21 @@
     }
     return "\(try field("MemTotal")) \(try field("MemAvailable"))"
   }
-  private func loadState(cycle: Int) throws -> String {
+  private func localSQL(
+    _ query: String, queryID: String? = nil, executionSeconds: Int = 8, receiveSeconds: Int = 10
+  ) throws -> String {
+    guard !query.isEmpty, query.utf8.count <= 4096,
+      executionSeconds == 2 && receiveSeconds == 3
+        || executionSeconds == 8 && receiveSeconds == 10,
+      queryID.map({ !$0.isEmpty && $0.utf8.count <= 128
+        && $0.utf8.allSatisfy { (48...57).contains($0) || (65...90).contains($0)
+          || (97...122).contains($0) || [45, 46, 95].contains($0) } }) ?? true
+    else { throw ProbeFailure.framing }
     let fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)
     guard fd >= 0 else { throw ProbeFailure.system(errno) }
     var owned = true
     defer { if owned { _ = close(fd) } }
-    var timeout = timeval(tv_sec: 1, tv_usec: 0)
+    var timeout = timeval(tv_sec: executionSeconds == 2 ? 1 : 2, tv_usec: 0)
     for option in [SO_RCVTIMEO, SO_SNDTIMEO] {
       guard setsockopt(fd, SOL_SOCKET, option, &timeout, socklen_t(MemoryLayout<timeval>.size)) == 0
       else { throw ProbeFailure.system(errno) }
@@ -76,11 +103,17 @@
       }
     }
     guard connected == 0 else { throw ProbeFailure.system(errno) }
-    let query =
-      "SELECT count(), sum(memory_usage) FROM system.processes WHERE query_id = 'swiftos-load-\(cycle)' LIMIT 1 FORMAT TSVRaw"
+    var options = "max_execution_time=\(executionSeconds)&max_threads=1"
+      + "&max_memory_usage=201326592&timeout_before_checking_execution_speed=0"
+      + "&max_rows_to_read=500000&max_bytes_to_read=100663296&max_result_rows=1000"
+      + "&default_format=TSVRaw&wait_end_of_query=1&buffer_size=4096"
+    if let queryID { options += "&query_id=" + queryID }
     let request = Array(
-      ("POST /?max_execution_time=2&max_threads=1 HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\nContent-Length: \(query.utf8.count)\r\n\r\n"
-        + query).utf8)
+      ("POST /?\(options) HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n"
+        + "Content-Length: \(query.utf8.count)\r\n\r\n" + query).utf8)
+    timeout = timeval(tv_sec: 3, tv_usec: 0)
+    guard setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+      == 0 else { throw ProbeFailure.system(errno) }
     var sent = 0
     while sent < request.count {
       let count = request.withUnsafeBytes {
@@ -97,40 +130,39 @@
     while response.count < 4096 {
       var now = timespec()
       guard clock_gettime(CLOCK_MONOTONIC, &now) == 0, now.tv_sec >= start.tv_sec,
-        now.tv_sec - start.tv_sec <= 3
-      else { throw ProbeFailure.framing }
+        now.tv_sec - start.tv_sec <= receiveSeconds
+      else { throw ProbeFailure.loadTimedOut }
       let elapsed = (now.tv_sec - start.tv_sec) * 1_000_000_000 + now.tv_nsec - start.tv_nsec
-      guard elapsed >= 0, elapsed < 3_000_000_000 else { throw ProbeFailure.framing }
-      let micros = min(1_000_000, (3_000_000_000 - elapsed + 999) / 1000)
+      guard elapsed >= 0, elapsed < receiveSeconds * 1_000_000_000 else {
+        throw ProbeFailure.loadTimedOut
+      }
+      let micros = min(1_000_000, (receiveSeconds * 1_000_000_000 - elapsed + 999) / 1000)
       var remaining = timeval(tv_sec: micros / 1_000_000, tv_usec: micros % 1_000_000)
       guard
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &remaining, socklen_t(MemoryLayout<timeval>.size))
           == 0
       else { throw ProbeFailure.system(errno) }
       let count = recv(fd, &chunk, min(chunk.count, 4096 - response.count), 0)
-      // A socket timeout is transient until this transaction's original3second deadline.
+      // Retry only inside this transaction's original bounded receive deadline.
       if count < 0, errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK { continue }
       guard count >= 0 else { throw ProbeFailure.system(errno) }
       if count == 0 { break }
       response += chunk.prefix(count)
     }
-    guard response.count < 4096, response.count >= 4,
-      let boundary = (0...(response.count - 4)).first(where: {
-        response[$0..<($0 + 4)].elementsEqual([13, 10, 13, 10])
-      })
-    else { throw ProbeFailure.framing }
-    let header = String(decoding: response[..<boundary], as: UTF8.self)
-    guard header.hasPrefix("HTTP/1.0 200 ") || header.hasPrefix("HTTP/1.1 200 "),
-      !header.lowercased().contains("transfer-encoding:")
-    else { throw ProbeFailure.framing }
-    let fields = String(decoding: response[(boundary + 4)...], as: UTF8.self)
+    let body = try LabHTTPResponse.body(response)
+    let closed = close(fd)
+    owned = false
+    guard closed == 0 else { throw ProbeFailure.system(errno) }
+    return body
+  }
+  private func loadState(cycle: Int) throws -> String {
+    let query =
+      "SELECT count(), sum(memory_usage) FROM system.processes WHERE query_id = 'swiftos-load-\(cycle)' LIMIT 1 FORMAT TSVRaw"
+    let fields = try localSQL(query, executionSeconds: 2, receiveSeconds: 3)
       .split(whereSeparator: { $0 == "\n" || $0 == "\t" })
     guard fields.count == 2, ["0", "1"].contains(fields[0]),
       let bytes = UInt64(fields[1]), bytes < 1 << 40
     else { throw ProbeFailure.framing }
-    let closed = close(fd)
-    owned = false
-    guard closed == 0 else { throw ProbeFailure.system(errno) }
     return "\(fields[0]) \(bytes)"
   }
   private final class ProbeState: Sendable {
@@ -240,6 +272,11 @@
     static func run() throws {
       let args = Array(CommandLine.arguments.dropFirst())
       if args.first == "--wait-capacity-exec" { try launchAfterCapacity(args) }
+      if args.first == "--http-query" {
+        guard (2...3).contains(args.count) else { throw ProbeFailure.framing }
+        try emit(try localSQL(args[1], queryID: args.count == 3 ? args[2] : nil))
+        return
+      }
       if args == ["--memory-monitor"] {
         try emit("MEMORY_READY \(try memory())\n")
         var sequence: UInt64 = 0
@@ -374,19 +411,21 @@
           } else {
             guard
               text == "VERIFY \(sequence)" || text == "OBS \(sequence)"
-                || text == "QUIT \(sequence)"
+                || text == "OBS_REFRESH \(sequence)" || text == "QUIT \(sequence)"
             else {
               throw ProbeFailure.framing
             }
           }
-          if !text.hasPrefix("OBS ") {
+          let passive = text.hasPrefix("OBS ") || text.hasPrefix("OBS_REFRESH ")
+          if text.hasPrefix("OBS_REFRESH ") { try refreshMemoryStatistics() }
+          if !passive {
             try checkPressure()
             try region.withReadAccess { bytes in
               try MemoryCanary.check(bytes, multiplier: 17, seed: 91)
             }
           }
           try emit(
-            "CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !text.hasPrefix("OBS ")))\n"
+            "CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !passive))\n"
           )
           if text.hasPrefix("QUIT") {
             try region.release()

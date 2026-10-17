@@ -125,7 +125,7 @@ actor MemoryProbeSession {
     _ command: String = "VERIFY",
     deadline: ContinuousClock.Instant = .now.advanced(by: .seconds(5))
   ) async throws -> Observation {
-    guard ["VERIFY", "OBS", "HOLD", "DROP", "QUIT"].contains(command) else {
+    guard ["VERIFY", "OBS", "OBS_REFRESH", "HOLD", "DROP", "QUIT"].contains(command) else {
       throw NativeControlFailure.arguments
     }
     _ = try await acquire(until: deadline)
@@ -151,7 +151,7 @@ actor MemoryProbeSession {
         UInt64(words[1]) == sent, let total = UInt64(words[2]),
         let available = UInt64(words[3]), available <= total
       else { throw NativeControlFailure.framing }
-      try checkWork(words.dropFirst(4), progress: command != "OBS")
+      try checkWork(words.dropFirst(4), progress: command != "OBS" && command != "OBS_REFRESH")
       if command == "QUIT" { close() }
       return .init(sequence: sent, capturedAt: capturedAt, total: total, available: available)
     } catch {

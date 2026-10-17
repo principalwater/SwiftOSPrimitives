@@ -15,6 +15,7 @@ final class MemoryDevice {
     var plugged = false
     var freshAllocation = false
     var initializedByHost = false
+    var metadataPinned = false
   }
   let thread = pthread_self()
   let held: Bool
@@ -61,6 +62,15 @@ final class MemoryDevice {
   }
   private func confined() throws {
     guard pthread_equal(thread, pthread_self()) != 0 else { throw DeviceFailure.request }
+  }
+  /// Pins are conservative until VM destruction; reset or forged PFNs cannot revoke host pointers.
+  func pinMetadata(_ index: Int, quiescence: (parked: Bool, epoch: Int, cpus: Int)) throws {
+    try confined()
+    guard quiescence.parked, quiescence.epoch >= 0, (1...4).contains(quiescence.cpus),
+      extents.indices.contains(index), extents[index].plugged, extents[index].mapped,
+      extents[index].pointer != nil
+    else { throw DeviceFailure.request }
+    extents[index].metadataPinned = true
   }
   func quarantine(quiescence: (parked: Bool, epoch: Int, cpus: Int)) throws {
     try confined()
@@ -255,6 +265,13 @@ final class MemoryDevice {
       indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
       )
     else { throw DeviceFailure.request }
+    if indices.contains(where: { extents[$0].metadataPinned }) {
+      try refusalHistory.append([
+        "reason": "metadata-pinned", "unmappedThenRestored": 0,
+        "ownedBytesDeallocated": 0, "reply": replacing ? "REPORT_SKIPPED" : "BUSY",
+      ])
+      return false
+    }
     var unmapped: [Int] = []
     for index in indices {
       let extent = extents[index]

@@ -81,7 +81,8 @@ private func reply(_ output: NativeMemoryOutput, sequence: Int) throws {
   #expect(await wire.next() == nil)
 }
 
-@Test(.timeLimit(.minutes(1))) func probeSerializesConcurrentTransactions() async throws {
+@Test(.timeLimit(.minutes(1)), arguments: ["OBS", "OBS_REFRESH"])
+func probeSerializesConcurrentTransactions(_ command: String) async throws {
   let input = NativeMemoryInput()
   defer { input.finish() }
   let output = NativeMemoryOutput()
@@ -89,10 +90,10 @@ private func reply(_ output: NativeMemoryOutput, sequence: Int) throws {
   try ready(output)
   _ = try await session.start()
   var wire = input.stream().makeAsyncIterator()
-  let first = Task { try await session.observe("OBS") }
-  #expect(await wire.next() == Data("OBS 1\n".utf8))
+  let first = Task { try await session.observe(command) }
+  #expect(await wire.next() == Data("\(command) 1\n".utf8))
   let second = Task { try await session.observe() }
-  try reply(output, sequence: 1)
+  try output.write(Data("CANARY_OK 1 1000 900 cpus=2 packets=1 cpu0=1 cpu1=1\n".utf8))
   #expect(await wire.next() == Data("VERIFY 2\n".utf8))
   try reply(output, sequence: 2)
   #expect(try await first.value.sequence == 1)

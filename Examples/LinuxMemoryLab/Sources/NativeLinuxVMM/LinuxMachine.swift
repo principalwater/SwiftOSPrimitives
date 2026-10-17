@@ -41,6 +41,7 @@ final class LinuxMachine {
   }
   var dynamicMemory: MemoryDevice?
   var freePageReporting: FreePageReportingDevice?
+  var classicBalloon: ClassicBalloonDevice?
   var disk: BlockDevice?
   var rootDisk: BlockDevice?
   var vsock: VsockDevice?
@@ -124,7 +125,7 @@ final class LinuxMachine {
     }
   }
   func requestMemory(_ size: UInt64) throws {
-    guard let device = dynamicMemory, size <= UInt64(device.capacity) else {
+    guard classicBalloon == nil, let device = dynamicMemory, size <= UInt64(device.capacity) else {
       throw Failure.protocolError
     }
     device.requested = size
@@ -139,7 +140,7 @@ final class LinuxMachine {
     try device.quarantine(
       quiescence: (cpus?.isQuiescent ?? false, cpus?.epoch ?? 0, cpuCount))
     // Use actual extents while all vCPUs are parked, never a stale published count.
-    try requestMemory(device.plugged)
+    if classicBalloon == nil { try requestMemory(device.plugged) }
     control.state.withLock {
       $0.requested = device.requested
       $0.plugged = device.plugged
@@ -161,9 +162,9 @@ final class LinuxMachine {
     guard width == 4, offset % 4 == 0 else { throw Failure.protocolError }
     let transport = disk.transport
     if let write {
-      if try transport.write(offset, write, memory: pointer) {
+      if try transport.write(offset, write, memory: queuePointer) {
         if try transport.queue.drain(
-          memory: pointer,
+          memory: queuePointer,
           process: { buffers in
             try disk.process(buffers, memory: self.dataPointer)
           })
@@ -178,6 +179,11 @@ final class LinuxMachine {
   }
   func dataPointer(_ address: UInt64, _ count: Int) throws -> UnsafeMutableRawPointer {
     try requireStopped()
+    if count > 0, let balloon = classicBalloon,
+      try balloon.ledger.overlapsOwned(address: address, count: count)
+    {
+      throw Failure.boundary
+    }
     if address >= MemoryDevice.base, let device = dynamicMemory, count > 0 {
       let offset = address - MemoryDevice.base
       guard offset < UInt64(device.capacity),
@@ -192,7 +198,7 @@ final class LinuxMachine {
     return try pointer(address, count)
   }
   func memoryMMIO(_ offset: UInt64, width: Int, write: UInt32?) throws -> UInt64 {
-    guard let device = dynamicMemory else { throw Failure.protocolError }
+    guard classicBalloon == nil, let device = dynamicMemory else { throw Failure.protocolError }
     let transport = device.transport
     if offset >= 0x100 {
       guard write == nil, offset - 0x100 <= 56, width <= 4,
@@ -203,10 +209,10 @@ final class LinuxMachine {
     }
     guard width == 4, offset % 4 == 0 else { throw Failure.protocolError }
     if let write {
-      if try transport.write(offset, write, memory: pointer) {
+      if try transport.write(offset, write, memory: queuePointer) {
         guard transport.driverFeatures & 2 != 0 else { throw Failure.protocolError }
         if try transport.queue.drain(
-          memory: pointer,
+          memory: queuePointer,
           process: { buffers in
             guard buffers.count == 2, !buffers[0].writable, buffers[0].size == 24,
               buffers[1].writable, buffers[1].size == 10
@@ -244,6 +250,16 @@ final class LinuxMachine {
     else { throw Failure.boundary }
     return memory.advanced(by: Int(address - base))
   }
+  func queuePointer(_ address: UInt64, _ count: Int) throws -> UnsafeMutableRawPointer {
+    if classicBalloon != nil, address >= MemoryDevice.base, let device = dynamicMemory {
+      let pointer = try dataPointer(address, count)
+      try device.pinMetadata(
+        Int((address - MemoryDevice.base) / UInt64(MemoryDevice.block)),
+        quiescence: (cpus?.isQuiescent ?? true, cpus?.epoch ?? 0, cpuCount))
+      return pointer
+    }
+    return try pointer(address, count)
+  }
   func load(_ data: Data, at address: UInt64) throws {
     let destination = try pointer(address, data.count)
     data.withUnsafeBytes { destination.copyMemory(from: $0.baseAddress!, byteCount: data.count) }
@@ -280,10 +296,31 @@ final class LinuxMachine {
         memory!, base, capacity,
         UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)), "map")
     mapped = true
+    if classicBalloon != nil, let device = dynamicMemory {
+      // Stock classic balloon can use normal boot RAM even without BALLOON_COMPACTION.
+      var request = Data(count: 24)
+      request.withUnsafeMutableBytes {
+        $0.storeBytes(of: MemoryDevice.base.littleEndian, toByteOffset: 8, as: UInt64.self)
+        $0.storeBytes(
+          of: UInt16(device.capacity / MemoryDevice.block).littleEndian,
+          toByteOffset: 16, as: UInt16.self)
+      }
+      let reply = try device.request(request, quiescence: (true, 0, cpuCount))
+      guard reply.count == 10, reply.allSatisfy({ $0 == 0 }) else { throw Failure.protocolError }
+    }
     let initrdAddress: UInt64 = base + 128 * 1024 * 1024
     let dtbAddress: UInt64 = base + 120 * 1024 * 1024
     var command =
       "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 rdinit=/init panic=-1 nokaslr loglevel=6 memhp_default_state=online_movable memory_hotplug.memmap_on_memory=0 irqchip.gicv3_nolpi=1"
+    if classicBalloon != nil {
+      let transports = [disk?.transport, rootDisk?.transport, vsock?.transport,
+        classicBalloon?.transport].compactMap { $0 } + networks.map(\.transport)
+      guard transports.allSatisfy({ $0.features & (1 << 33) == 0 }) else {
+        throw Failure.arguments
+      }
+      // Closed CPU-copy devices have no passthrough/ACCESS_PLATFORM DMA needing bounce buffers.
+      command += " swiotlb=noforce"
+    }
     if control != nil {
       command = command.replacingOccurrences(
         of: "rdinit=/init", with: "root=/dev/vda rootfstype=ext4 ro init=/sbin/vminitd")
@@ -293,8 +330,11 @@ final class LinuxMachine {
     let tree = DeviceTree.linux(
       memoryBytes: UInt64(capacity),
       initrd: initrdAddress..<(initrdAddress + UInt64(initrd.count)), command: command,
-      memoryDevice: dynamicMemory != nil, blockDevice: disk != nil, container: control != nil,
-      cpuCount: cpuCount, networkCount: networks.count, freePageReporting: freePageReporting != nil)
+      memoryDevice: dynamicMemory != nil && classicBalloon == nil,
+      initialDynamicBytes: classicBalloon == nil ? 0 : UInt64(dynamicMemory?.capacity ?? 0),
+      blockDevice: disk != nil, container: control != nil,
+      cpuCount: cpuCount, networkCount: networks.count,
+      balloonDevice: freePageReporting != nil || classicBalloon != nil)
     guard kernel.count < 100 << 20, initrd.count < 64 << 20 else { throw Failure.arguments }
     let textOffset = kernel[8..<16].enumerated().reduce(UInt64(0)) {
       $0 | (UInt64($1.element) << ($1.offset * 8))
@@ -313,6 +353,28 @@ final class LinuxMachine {
     while control != nil || (dynamicMemory == nil ? !ready : !memoryComplete) {
       if let control, let vsock {
         try synchronizeMemoryQuarantine()
+        if let balloon = classicBalloon {
+          let request = control.state.withLock {
+            ($0.balloonGeneration, $0.balloonApplied, $0.balloonDesired)
+          }
+          if request.0 != request.1 {
+            guard let memory = dynamicMemory else { throw Failure.protocolError }
+            try balloon.request(bytes: request.2, memory: memory, now: .now)
+            control.state.withLock { $0.balloonApplied = request.0 }
+          }
+          try balloon.poll(
+            now: .now, quarantine: control.memoryQuarantineRequested.load(ordering: .acquiring))
+          control.state.withLock {
+            $0.balloonTarget = balloon.target
+            $0.balloonActual = balloon.actual
+            $0.balloonOwned = balloon.ledger.count
+            $0.balloonReady = balloon.transport.status & 15 == 15
+            $0.balloonQuarantined = balloon.quarantined
+          }
+          try check(
+            hv_gic_set_spi(balloon.transport.interrupt, balloon.transport.interruptStatus != 0),
+            "balloon-irq")
+        }
         let releaseAlias = control.state.withLock {
           let requested = $0.releaseAlias
           $0.releaseAlias = false
@@ -321,11 +383,11 @@ final class LinuxMachine {
         if releaseAlias, let device = dynamicMemory {
           try device.releaseAlias()
           // Linux BUSY retry starts at50s; changed availability needs an explicit config event.
-          try requestMemory(device.requested)
+          if classicBalloon == nil { try requestMemory(device.requested) }
         }
         control.state.withLock { $0.refusals = dynamicMemory?.refusals.count ?? 0 }
         for network in networks {
-          try network.poll(memory: pointer, payloadMemory: dataPointer)
+          try network.poll(memory: queuePointer, payloadMemory: dataPointer)
           try check(
             hv_gic_set_spi(network.transport.interrupt, network.transport.interruptStatus != 0),
             "net-irq")
@@ -353,7 +415,7 @@ final class LinuxMachine {
           }
         }
         if !update.2, dynamicMemory?.requested != update.1 { try requestMemory(update.1) }
-        try vsock.poll(memory: pointer, payloadMemory: dataPointer)
+        try vsock.poll(memory: queuePointer, payloadMemory: dataPointer)
         try check(hv_gic_set_spi(38, vsock.transport.interruptStatus != 0), "vsock-irq")
       } else {
         try memoryProgress()
@@ -441,6 +503,27 @@ final class LinuxMachine {
       let rt = UInt32((syndrome >> 16) & 31)
       let width = 1 << Int((syndrome >> 22) & 3)
       if address >= 0x0a00_6000, address < 0x0a00_7000,
+        let balloon = classicBalloon, let memory = dynamicMemory
+      {
+        try requireStopped()
+        try balloon.poll(
+          now: .now, quarantine: control?.memoryQuarantineRequested.load(ordering: .acquiring)
+            ?? memory.quarantined)
+        let write = syndrome & 64 != 0
+        let value = try balloon.access(
+          address - 0x0a00_6000, width: width,
+          write: write
+            ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt))) : nil,
+          memory: memory, metadata: queuePointer, payload: dataPointer,
+          quiescence: (cpus?.isQuiescent ?? false, cpus?.epoch ?? 0, cpuCount))
+        try check(
+          hv_gic_set_spi(balloon.transport.interrupt, balloon.transport.interruptStatus != 0),
+          "balloon-irq")
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
+      if address >= 0x0a00_6000, address < 0x0a00_7000,
         let reporting = freePageReporting, let memory = dynamicMemory
       {
         try requireStopped()
@@ -453,7 +536,7 @@ final class LinuxMachine {
         do {
           value = try reporting.access(
             offset, width: width, write: supplied,
-            boot: base..<(base + UInt64(capacity)), memory: memory, metadata: pointer,
+            boot: base..<(base + UInt64(capacity)), memory: memory, metadata: queuePointer,
             quiescence: (cpus?.isQuiescent ?? false, cpus?.epoch ?? 0, cpuCount))
         } catch {
           throw DeviceFailure.reporting(
@@ -488,8 +571,8 @@ final class LinuxMachine {
             _ = try network.transport.write(
               offset,
               UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt))),
-              memory: pointer)
-            try network.poll(memory: pointer, payloadMemory: dataPointer)
+              memory: queuePointer)
+            try network.poll(memory: queuePointer, payloadMemory: dataPointer)
             value = 0
           } else {
             value = UInt64(network.transport.read(offset))
@@ -514,8 +597,8 @@ final class LinuxMachine {
           if write {
             let raw = UInt32(
               truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt)))
-            if try vsock.transport.write(offset, raw, memory: pointer) {
-              try vsock.notify(raw, memory: pointer, payloadMemory: dataPointer)
+            if try vsock.transport.write(offset, raw, memory: queuePointer) {
+              try vsock.notify(raw, memory: queuePointer, payloadMemory: dataPointer)
             }
             value = 0
           } else {
@@ -655,10 +738,12 @@ public enum StandaloneLab {
   private static func run() throws {
     let args = CommandLine.arguments
     if args.count == 4,
-      ["--memory-device-check", "--memory-device-check-cold"].contains(args[1])
+      ["--memory-device-check", "--memory-device-check-cold",
+        "--balloon-device-check", "--balloon-device-check-cold"].contains(args[1])
     {
       try NativeMemoryDeviceCheck.run(
-        image: args[2], destination: args[3], coldProvisioning: args[1].hasSuffix("-cold"))
+        image: args[2], destination: args[3], coldProvisioning: args[1].hasSuffix("-cold"),
+        classicBallooning: args[1].hasPrefix("--balloon-"))
       return
     }
     guard (4...6).contains(args.count) else { throw Failure.arguments }

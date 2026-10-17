@@ -24,12 +24,14 @@ import NativeLinuxVMM
   static func run() async throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 5 else { throw Failure.arguments }
+    let classic = ["memory-balloon", "memory-balloon-wide", "pressure-balloon"].contains(args[4])
     let reporting = [
       "memory-reporting", "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
     ].contains(args[4])
     let pressureWide = [
       "continuous-pressure-wide", "continuous-pressure-protected", "continuous-pressure-reporting",
       "continuous-pressure-reporting-small-boot",
+      "pressure-balloon",
     ]
       .contains(args[4])
     guard
@@ -37,6 +39,7 @@ import NativeLinuxVMM
         || [6, 8].contains(args.count)
           && [
             "memory", "memory-reporting", "held", "alias", "crash", "recover", "adaptive",
+            "memory-balloon", "memory-balloon-wide", "pressure-balloon",
             "adaptive-busy",
             "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
             "continuous-stop",
@@ -51,13 +54,15 @@ import NativeLinuxVMM
             "memory-boot-wide",
           ].contains(args[4])
     else { throw Failure.arguments }
-    guard !(pressureWide || reporting) || args.count == 8 else {
+    let capacityProtected = pressureWide || classic
+    guard !(capacityProtected || reporting) || args.count == 8 else {
       throw Failure.arguments
     }
     if args.count == 8 {
       guard args[6] == "--boot-directory",
         [
           "memory", "memory-reporting", "adaptive", "continuous", "continuous-sustained",
+          "memory-balloon", "memory-balloon-wide", "pressure-balloon",
           "memory-wide",
           "memory-boot-wide", "continuous-pressure-wide", "continuous-pressure-protected",
           "continuous-pressure-reporting",
@@ -83,7 +88,8 @@ import NativeLinuxVMM
     case "memory-wide", "continuous-pressure-wide", "continuous-pressure-protected",
       "continuous-pressure-reporting":
       geometry = try .init(bootBytes: 1024 << 20, dynamicBytes: 2 << 30)
-    case "continuous-pressure-reporting-small-boot":
+    case "continuous-pressure-reporting-small-boot", "memory-balloon", "memory-balloon-wide",
+      "pressure-balloon":
       geometry = try .init(bootBytes: 512 << 20, dynamicBytes: 2560 << 20)
     case "memory-boot-wide":
       geometry = try .init(bootBytes: 2 << 30, dynamicBytes: 256 << 20)
@@ -102,13 +108,14 @@ import NativeLinuxVMM
     let manager: NativeVirtualMachineManager
     let policy: NativeExecutionPolicy =
       ["continuous-sustained", "continuous-pressure-wide", "continuous-pressure-protected",
-        "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot"]
+        "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
+        "pressure-balloon"]
         .contains(args[4])
       ? .sustained : .qualification
     if let resources {
       manager = NativeVirtualMachineManager(
         resources: resources, group: group, memoryGeometry: geometry, executionPolicy: policy,
-        freePageReporting: reporting)
+        freePageReporting: reporting, classicBallooning: classic)
     } else {
       manager = NativeVirtualMachineManager(
         kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),
@@ -139,7 +146,7 @@ import NativeLinuxVMM
         smoke
         ? ["/usr/bin/clickhouse", "--version"]
         : ["/usr/bin/clickhouse", "server", "--config-file=/lab/server.xml"]
-      if pressureWide {
+      if capacityProtected {
         config.process.arguments =
           [capacityLauncher, "--wait-capacity-exec", String(launchMinimum)]
           + config.process.arguments
@@ -181,7 +188,7 @@ import NativeLinuxVMM
           try await agent.writeFile(
             path: base + "/lab/users.xml", data: Data(ClickHouseConfiguration.users.utf8),
             flags: .init(create: true), mode: 0o600)
-          if pressureWide {
+          if capacityProtected {
             _ = try await uploadProbe(
               URL(filePath: args[5]), path: base + capacityLauncher, agent: agent)
           }
@@ -194,7 +201,7 @@ import NativeLinuxVMM
       try await container.start()
       print("CONTAINER_STARTED")
       fflush(nil)
-      if pressureWide {
+      if capacityProtected {
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while launchReceipt == nil {
           let transcript = serverOutput.text

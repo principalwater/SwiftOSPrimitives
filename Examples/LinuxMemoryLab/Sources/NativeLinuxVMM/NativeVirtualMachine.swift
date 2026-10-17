@@ -43,6 +43,14 @@ final class NativeControl: Sendable {
     var recycledBackingBytes: UInt64 = 0
     var recycledResidentBytes: UInt64 = 0
     var recycledColdResidentBytes: UInt64 = 0
+    var balloonDesired: UInt64 = 0
+    var balloonGeneration: UInt64 = 0
+    var balloonApplied: UInt64 = 0
+    var balloonTarget: UInt32 = 0
+    var balloonActual: UInt32 = 0
+    var balloonOwned: UInt32 = 0
+    var balloonReady = false
+    var balloonQuarantined = false
     var error = ""
     var result = Data()
     var commands: [Command] = []
@@ -62,6 +70,7 @@ final class NativeControl: Sendable {
   let cpus: Int
   let geometry: NativeMemoryGeometry
   let freePageReporting: Bool
+  let classicBallooning: Bool
   let executionPolicy: NativeExecutionPolicy
   let networks: [IsolatedNetwork]
 
@@ -69,11 +78,12 @@ final class NativeControl: Sendable {
     kernel: URL?, initfs: URL?, rootfs: URL, console: URL?, held: Bool, alias: Bool, cpus: Int = 1,
     networks: [IsolatedNetwork] = [], geometry: NativeMemoryGeometry = .qualification,
     executionPolicy: NativeExecutionPolicy = .qualification, resources: NativeBootResources? = nil,
-    freePageReporting: Bool = false
+    freePageReporting: Bool = false, classicBallooning: Bool = false
   ) {
     state = Mutex(State(requested: geometry.dynamicBytes))
     self.geometry = geometry
     self.freePageReporting = freePageReporting
+    self.classicBallooning = classicBallooning
     self.executionPolicy = executionPolicy
     self.kernel = kernel
     self.initfs = initfs
@@ -93,7 +103,7 @@ final class NativeControl: Sendable {
     machine.cpuCount = cpus
     machine.dynamicMemory = MemoryDevice(
       held: held, aliasControl: alias, geometry: geometry,
-      coldProvisioning: freePageReporting && !held)
+      coldProvisioning: (freePageReporting || classicBallooning) && !held)
     if freePageReporting { machine.freePageReporting = FreePageReportingDevice() }
     let lease = NativeProcessLease.claimed.withLock { claimed -> Bool in
       guard !claimed else { return false }
@@ -103,6 +113,11 @@ final class NativeControl: Sendable {
     var primary = ""
     do {
       guard lease else { throw NativeFailure.processBusy }
+      if classicBallooning {
+        machine.classicBalloon = try ClassicBalloonDevice(
+          boot: machine.base..<(machine.base + UInt64(machine.capacity)),
+          dynamicBytes: geometry.dynamicBytes)
+      }
       let kernelImage: Data
       if let resources {
         machine.disk = try BlockDevice(
@@ -170,6 +185,26 @@ final class NativeControl: Sendable {
       "freePageReportedBytes": machine.freePageReporting?.reportedBytes ?? 0,
       "freePageReportingObservations": machine.freePageReporting?.observations ?? [],
       "freePagePoison": machine.freePageReporting?.poison ?? 0,
+      "classicBallooningEnabled": classicBallooning,
+      "balloonObservations": machine.classicBalloon?.observations ?? [],
+      "balloonAcceptedPackets": machine.classicBalloon?.accepted ?? 0,
+      "balloonRefusedPackets": machine.classicBalloon?.refused ?? 0,
+      "balloonInvalidActualWrites": machine.classicBalloon?.invalidActualWrites ?? 0,
+      "balloonLeaseExpirations": machine.classicBalloon?.leaseExpirations ?? 0,
+      "balloonRefusalObservations": machine.classicBalloon?.refusals ?? [],
+      "balloonOwnedPFNs": machine.classicBalloon?.ledger.count ?? 0,
+      "balloonEpoch": machine.classicBalloon?.ledger.epoch ?? 0,
+      "balloonActualPFNs": machine.classicBalloon?.actual ?? 0,
+      "balloonTargetPFNs": machine.classicBalloon?.target ?? 0,
+      "balloonQuarantined": machine.classicBalloon?.quarantined ?? false,
+      "balloonPeakBootPFNs": machine.classicBalloon?.peakBootPFNs ?? 0,
+      "balloonPeakDynamicPFNs": machine.classicBalloon?.peakDynamicPFNs ?? 0,
+      "initialDynamicBootMemory": classicBallooning,
+      "guestBounceBuffersRequestedDisabled": classicBallooning,
+      "memoryTransportStatus": machine.dynamicMemory?.transport.status ?? 0,
+      "metadataPinnedExtentsTotal": machine.dynamicMemory?.extents.reduce(0) {
+        $0 + ($1.metadataPinned ? 1 : 0)
+      } ?? 0,
       "recycledBackingBytes": machine.dynamicMemory?.recycledBackingBytes ?? 0,
       "recycledResidentBytes": machine.dynamicMemory?.recycledResidentBytes ?? 0,
       "recycledResidentBytesFromColdBacking": machine.dynamicMemory?.recycledColdResidentBytes ?? 0,
@@ -216,6 +251,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public let memoryGeometry: NativeMemoryGeometry
   public let executionPolicy: NativeExecutionPolicy
   public let freePageReporting: Bool
+  public let classicBallooning: Bool
   private let resources: NativeBootResources?
   private let owner = Mutex<NativeVirtualMachine?>(nil)
 
@@ -223,11 +259,13 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     kernel: URL, initfs: URL, console: URL, held: Bool = false,
     aliasControl: Bool = false, group: MultiThreadedEventLoopGroup,
     memoryGeometry: NativeMemoryGeometry = .qualification,
-    executionPolicy: NativeExecutionPolicy = .qualification, freePageReporting: Bool = false
+    executionPolicy: NativeExecutionPolicy = .qualification, freePageReporting: Bool = false,
+    classicBallooning: Bool = false
   ) {
     self.memoryGeometry = memoryGeometry
     self.executionPolicy = executionPolicy
     self.freePageReporting = freePageReporting
+    self.classicBallooning = classicBallooning
     self.kernel = kernel
     self.initfs = initfs
     self.console = console
@@ -240,7 +278,8 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public init(
     resources: NativeBootResources, group: MultiThreadedEventLoopGroup,
     memoryGeometry: NativeMemoryGeometry = .qualification,
-    executionPolicy: NativeExecutionPolicy = .sustained, freePageReporting: Bool = false
+    executionPolicy: NativeExecutionPolicy = .sustained, freePageReporting: Bool = false,
+    classicBallooning: Bool = false
   ) {
     self.resources = resources
     kernel = nil
@@ -252,11 +291,13 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     self.memoryGeometry = memoryGeometry
     self.executionPolicy = executionPolicy
     self.freePageReporting = freePageReporting
+    self.classicBallooning = classicBallooning
   }
   public var instance: NativeVirtualMachine? { owner.withLock { $0 } }
   public func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
     let config = config.configuration
-    guard (1...4).contains(config.cpus), config.memoryInBytes == memoryGeometry.maximumBytes,
+    guard !(classicBallooning && (freePageReporting || held)),
+      (1...4).contains(config.cpus), config.memoryInBytes == memoryGeometry.maximumBytes,
       config.interfaces.count <= 2, !config.nestedVirtualization, config.extensions.isEmpty,
       config.mountsByID.count == 1, let entry = config.mountsByID.first,
       let mount = entry.value.first, mount.type == "ext4", mount.destination == "/",
@@ -290,7 +331,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
       kernel: kernel, initfs: initfs, rootfs: URL(filePath: mount.source),
       console: console, held: held, alias: aliasControl, cpus: config.cpus, networks: networks,
       geometry: memoryGeometry, executionPolicy: executionPolicy, resources: resources,
-      freePageReporting: freePageReporting)
+      freePageReporting: freePageReporting, classicBallooning: classicBallooning)
     let machine = NativeVirtualMachine(
       control: control, group: group, id: entry.key,
       attachments: attachments)
@@ -387,7 +428,8 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
     try requestMemory(bytes: bytes, owner: nil)
   }
   func claimMemoryControl(minimumResidentBytes: UInt64) throws -> UInt64 {
-    try control.state.withLock {
+    guard !control.classicBallooning else { throw NativeControlFailure.ownership }
+    return try control.state.withLock {
       guard $0.memoryOwner == nil, !$0.memoryControlRetired, $0.memoryGeneration < UInt64.max
       else { throw NativeControlFailure.ownership }
       guard $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
@@ -411,6 +453,7 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
     }
   }
   func requestMemory(bytes: UInt64, owner: UInt64?) throws {
+    guard !control.classicBallooning else { throw NativeControlFailure.ownership }
     guard bytes <= control.geometry.dynamicBytes, bytes % UInt64(MemoryDevice.block) == 0 else {
       throw NativeFailure.unsupported
     }
@@ -420,6 +463,34 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       }
       guard $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
       $0.requested = bytes
+    }
+  }
+  /// Experimental finite stock-balloon pulse; zero requests rescue and never grant PFN ownership.
+  public func requestBalloon(bytes: UInt64) throws {
+    guard control.classicBallooning, bytes % 4096 == 0, bytes <= control.geometry.dynamicBytes
+    else { throw NativeFailure.unsupported }
+    try control.state.withLock {
+      guard $0.running, !$0.ended, !$0.stop, $0.balloonReady,
+        $0.balloonGeneration < .max,
+        bytes == 0 || !$0.balloonQuarantined && $0.balloonGeneration == $0.balloonApplied
+          && $0.balloonTarget == 0 && $0.balloonActual == 0 && $0.balloonOwned == 0
+          && $0.plugged == control.geometry.dynamicBytes
+      else { throw NativeControlFailure.unsettled }
+      $0.balloonDesired = bytes
+      $0.balloonGeneration += 1
+    }
+  }
+  /// Current coordinator observations; actual is guest telemetry, owned is the separate PFN ledger.
+  public var balloonState: (
+    ready: Bool, targetBytes: UInt64, actualBytes: UInt64, ownedBytes: UInt64,
+    quarantined: Bool, settled: Bool
+  ) {
+    control.state.withLock {
+      ($0.balloonReady && $0.running && !$0.ended,
+        UInt64($0.balloonTarget) * 4096, UInt64($0.balloonActual) * 4096,
+        UInt64($0.balloonOwned) * 4096, $0.balloonQuarantined,
+        $0.balloonGeneration == $0.balloonApplied && $0.balloonActual == $0.balloonTarget
+          && $0.balloonOwned == $0.balloonTarget)
     }
   }
   public func start() async throws {

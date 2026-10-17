@@ -25,6 +25,12 @@ is recorded separately and does not imply product adoption.
 See [G23 managed qualification](MANAGED-QUALIFICATION.md) for the final fourteen
 profiles, independent telemetry, disk-reserve test and real SIGKILL recovery.
 
+G24 adds default-off stock balloon ownership with native cold-backing replacement,
+normal initial RAM and permanent metadata pins. See
+[classic balloon qualification](CLASSIC-BALLOON.md) for the repaired ownership/wire
+contracts and two-cycle, two/four-vCPU ClickHouse resident-return results. This
+qualifies finite controls; autonomous governance and all product gates stay open.
+
 ## Current Apple container integration
 
 Apple container1.5.0 (`d265d669ecae041bf338cb3b39c4118316d138f0`) selects

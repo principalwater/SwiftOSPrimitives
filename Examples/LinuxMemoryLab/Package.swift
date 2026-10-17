@@ -18,6 +18,7 @@ let package = Package(
   ],
   targets: [
     .target(name: "MemoryCanary"),
+    .target(name: "LabHTTP"),
     .executableTarget(
       name: "canary-pattern-bench",
       dependencies: [
@@ -50,7 +51,7 @@ let package = Package(
     .executableTarget(
       name: "container-memory-probe",
       dependencies: [
-        "NativeLinux", "MemoryCanary",
+        "NativeLinux", "MemoryCanary", "LabHTTP",
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
       ]),
     .systemLibrary(name: "NativeLinux"),
@@ -62,5 +63,5 @@ let package = Package(
       ]),
     .testTarget(
       name: "LinuxMemoryLabTests",
-      dependencies: ["NativeLinuxVMM", "container-native-lab", "MemoryCanary"]),
+      dependencies: ["NativeLinuxVMM", "container-native-lab", "MemoryCanary", "LabHTTP"]),
   ], swiftLanguageModes: [.v6])

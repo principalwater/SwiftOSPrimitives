@@ -25,7 +25,10 @@ enum NativeMemoryDeviceCheck {
     var pointer: UnsafeMutableRawPointer?
     var mapped = false
   }
-  static func run(image: String, destination: String, coldProvisioning: Bool = false) throws {
+  static func run(
+    image: String, destination: String, coldProvisioning: Bool = false,
+    classicBallooning: Bool = false
+  ) throws {
     func require(_ value: Bool, _ label: String) throws {
       guard value else { throw DeviceFailure.observation("cold-check " + label) }
     }
@@ -57,6 +60,11 @@ enum NativeMemoryDeviceCheck {
     let address = MemoryDevice.base + UInt64(index * MemoryDevice.block)
     let ringAddress: UInt64 = 0x230000
     let reporting = FreePageReportingDevice()
+    let balloon = try ClassicBalloonDevice(boot: 0x200000..<0x400000, dynamicBytes: 128 << 20)
+    let projection = LinuxMachine()
+    projection.dynamicMemory = memory
+    if classicBallooning { projection.classicBalloon = balloon }
+    var balloonPublished = InlineArray<2, UInt16>(repeating: 0)
     var published: UInt16 = 0
     var epoch = 0
     var primary = ""
@@ -88,6 +96,42 @@ enum NativeMemoryDeviceCheck {
       try require(reporting.transport.interruptStatus == 1, "used interrupt")
       try deviceWrite(0x64, 1)
       try require(reporting.transport.interruptStatus == 0, "interrupt acknowledgement")
+    }
+    func balloonWrite(_ offset: UInt64, _ value: UInt32) throws {
+      _ = try balloon.access(
+        offset, width: 4, write: value, memory: memory,
+        metadata: metadata, payload: metadata, quiescence: (true, epoch, 1))
+    }
+    func transfer(inflate: Bool, half: Int) throws {
+      let queue = inflate ? 0 : 1
+      let ring = try metadata(ringAddress, 65536)
+      let payloadOffset = 8192 + queue * 1024
+      for index in 0..<256 {
+        ring.storeBytes(
+          of: UInt32(address / 4096 + UInt64(half * 256 + index)).littleEndian,
+          toByteOffset: payloadOffset + index * 4, as: UInt32.self)
+      }
+      balloonPublished[queue] += 1
+      ring.storeBytes(
+        of: balloonPublished[queue].littleEndian, toByteOffset: queue * 2048 + 258, as: UInt16.self)
+      try balloonWrite(0x50, UInt32(queue))
+      try require(
+        ring.loadUnaligned(fromByteOffset: queue * 2048 + 514, as: UInt16.self).littleEndian
+          == balloonPublished[queue], "balloon used ACK")
+      try require(balloon.transport.interruptStatus & 1 != 0, "balloon used IRQ")
+      try balloonWrite(0x64, 3)
+      try balloonWrite(0x104, balloon.ledger.count)
+    }
+    func inflate() throws {
+      try balloon.request(bytes: 2 << 20, memory: memory, now: .now)
+      try transfer(inflate: true, half: 0)
+      try transfer(inflate: true, half: 1)
+    }
+    func deflate() throws {
+      try balloon.request(bytes: 0, memory: memory, now: .now)
+      try transfer(inflate: false, half: 0)
+      try transfer(inflate: false, half: 1)
+      try require(balloon.ledger.count == 0 && balloon.actual == 0, "balloon drained")
     }
     func request(_ kind: UInt16) throws -> Data {
       var bytes = Data(count: 24)
@@ -166,21 +210,42 @@ enum NativeMemoryDeviceCheck {
       watchdog.resume()
       timer = watchdog
       let ring = try metadata(ringAddress, 65536)
-      ring.storeBytes(of: address.littleEndian, as: UInt64.self)
-      ring.storeBytes(of: UInt32(2 << 20).littleEndian, toByteOffset: 8, as: UInt32.self)
-      ring.storeBytes(of: UInt16(2).littleEndian, toByteOffset: 12, as: UInt16.self)
-      try deviceWrite(0x70, 3)
-      try deviceWrite(0x20, (1 << 4) | (1 << 5))
-      try deviceWrite(0x24, 1)
-      try deviceWrite(0x20, 1)
-      try deviceWrite(0x70, 11)
-      try deviceWrite(0x30, 2)
-      for (offset, value): (UInt64, UInt32) in [
-        (0x38, 8), (0x80, UInt32(ringAddress)), (0x90, UInt32(ringAddress + 256)),
-        (0xa0, UInt32(ringAddress + 512)),
-      ] { try deviceWrite(offset, value) }
-      try deviceWrite(0x44, 1)
-      try deviceWrite(0x70, 15)
+      if classicBallooning {
+        for (offset, value): (UInt64, UInt32) in [
+          (0x70, 3), (0x20, 5), (0x24, 1), (0x20, 1), (0x70, 11),
+        ] { try balloonWrite(offset, value) }
+        for queue: UInt32 in 0...1 {
+          let base = ringAddress + UInt64(queue * 2048)
+          ring.storeBytes(
+            of: (ringAddress + 8192 + UInt64(queue * 1024)).littleEndian,
+            toByteOffset: Int(queue * 2048), as: UInt64.self)
+          ring.storeBytes(of: UInt32(1024).littleEndian,
+            toByteOffset: Int(queue * 2048 + 8), as: UInt32.self)
+          try balloonWrite(0x30, queue)
+          for (offset, value): (UInt64, UInt32) in [
+            (0x38, 8), (0x80, UInt32(base)), (0x90, UInt32(base + 256)),
+            (0xa0, UInt32(base + 512)),
+          ] { try balloonWrite(offset, value) }
+          try balloonWrite(0x44, 1)
+        }
+        try balloonWrite(0x70, 15)
+      } else {
+        ring.storeBytes(of: address.littleEndian, as: UInt64.self)
+        ring.storeBytes(of: UInt32(2 << 20).littleEndian, toByteOffset: 8, as: UInt32.self)
+        ring.storeBytes(of: UInt16(2).littleEndian, toByteOffset: 12, as: UInt16.self)
+        try deviceWrite(0x70, 3)
+        try deviceWrite(0x20, (1 << 4) | (1 << 5))
+        try deviceWrite(0x24, 1)
+        try deviceWrite(0x20, 1)
+        try deviceWrite(0x70, 11)
+        try deviceWrite(0x30, 2)
+        for (offset, value): (UInt64, UInt32) in [
+          (0x38, 8), (0x80, UInt32(ringAddress)), (0x90, UInt32(ringAddress + 256)),
+          (0xa0, UInt32(ringAddress + 512)),
+        ] { try deviceWrite(offset, value) }
+        try deviceWrite(0x44, 1)
+        try deviceWrite(0x70, 15)
+      }
       try acknowledged(0)
       let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
       try require(pageSize > 0 && MemoryDevice.block % pageSize == 0, "native page geometry")
@@ -195,61 +260,149 @@ enum NativeMemoryDeviceCheck {
       try require(
         initialResidentBytes == (coldProvisioning ? 0 : UInt64(MemoryDevice.block)),
         "initial plug residency \(initialResidentBytes ?? .max)")
-      try execute(0, pages: 512)
-      try report()
-      try require(memory.recycledBackingBytes == 0 && memory.refusalsTotal == 1, "alias refused")
-      try execute(0, pages: 512)
-      try memory.releaseAlias()
-      try report()
-      try require(
-        memory.recyclingObservations.last?["hostInitializedBytes"] as? Int
-          == (coldProvisioning ? 0 : 2 << 20),
-        "first report provenance")
-      steps.append("alias refusal restores data, first report preserves initialization provenance")
-      try report()
-      try require(memory.recyclingObservations.last?["residentBytesObservedBefore"] as? UInt64 == 0,
-        "untouched cold report")
-      steps.append("untouched cold backing reports again")
-      let coldResidentBeforeTouch = memory.recycledColdResidentBytes
-      try execute(1, pages: 16)
-      try report()
-      try require(
-        memory.recycledColdResidentBytes - coldResidentBeforeTouch == 65536,
-        "guest-touch resident accounting")
-      memory.requested = 0
-      try acknowledged(1)
-      try require(memory.observations.last?["residentBytesObservedBefore"] as? UInt64 == 0,
-        "untouched cold unplug")
-      try require(memory.observations.last?["hostInitializedBytes"] as? Int == 0,
-        "cold unplug provenance")
-      steps.append("guest-touched backing reports, untouched replacement unplugs")
-      memory.requested = UInt64(MemoryDevice.block)
-      try acknowledged(0)
-      try report()
-      try execute(0, pages: 512)
-      try execute(1, pages: 512)
-      try execute(2, pages: 512)
-      let pointer = memory.extents[index].pointer!
-      let word = pointer.load(as: UInt64.self)
-      pointer.storeBytes(of: word ^ 1, as: UInt64.self)
-      try execute(2, pages: 512, expected: 3)
-      pointer.storeBytes(of: word, as: UInt64.self)
-      try execute(2, pages: 512)
-      let beforePoison = memory.recycledBackingBytes
-      try report(poison: 0xa5a5_a5a5)
-      try require(memory.recycledBackingBytes == beforePoison, "poison preserves backing")
-      try execute(2, pages: 512)
-      try report()
-      try execute(0, pages: 512)
-      try execute(1, pages: 512)
-      try execute(2, pages: 512)
-      let recycled = memory.recycledBackingBytes
-      try memory.quarantine(quiescence: (true, epoch, 1))
-      try report()
-      try require(memory.recycledBackingBytes == recycled, "quarantine preserves backing")
-      try execute(2, pages: 512)
-      steps.append("zero/pattern/corruption, poison and quarantine preserve guest data")
-      try require(reporting.reports == 8 && published == 8, "wire report count")
+      if classicBallooning {
+        try execute(0, pages: 512)
+        try inflate()
+        try require(memory.recycledBackingBytes == 0 && memory.refusalsTotal == 1,
+          "balloon alias refused")
+        try execute(0, pages: 512)
+        try deflate()
+        try memory.releaseAlias()
+        try inflate()
+        try require(memory.recycledBackingBytes == 2 << 20, "balloon alias release")
+        do {
+          _ = try projection.dataPointer(address, 16)
+          throw DeviceFailure.observation("owned PFNs accepted as device payload")
+        } catch Failure.boundary {}
+        try deflate()
+        try require(try projection.dataPointer(address, 16) == memory.extents[index].pointer!,
+          "deflate restores device payload access")
+        steps.append("split inflate ownership, alias refusal/restoration and deflate ACK")
+        try inflate()
+        try require(
+          memory.recyclingObservations.last?["residentBytesObservedBefore"] as? UInt64 == 0,
+          "balloon untouched cold recycle")
+        try deflate()
+        steps.append("persistent PFNs coalesce across two packets without warming replacement")
+        let coldBefore = memory.recycledColdResidentBytes
+        try execute(1, pages: 16)
+        try inflate()
+        try require(memory.recycledColdResidentBytes - coldBefore == 65536,
+          "balloon guest-touch resident accounting")
+        try deflate()
+        memory.requested = 0
+        try acknowledged(1)
+        try require(memory.observations.last?["residentBytesObservedBefore"] as? UInt64 == 0,
+          "balloon untouched cold unplug")
+        memory.requested = UInt64(MemoryDevice.block)
+        try acknowledged(0)
+        steps.append("64KiB guest touch retires, deflates and unplugs without touching replacement")
+        try execute(0, pages: 512)
+        try execute(1, pages: 512)
+        try execute(2, pages: 512)
+        let pointer = memory.extents[index].pointer!
+        let word = pointer.load(as: UInt64.self)
+        pointer.storeBytes(of: word ^ 1, as: UInt64.self)
+        try execute(2, pages: 512, expected: 3)
+        pointer.storeBytes(of: word, as: UInt64.self)
+        try execute(2, pages: 512)
+        let beforeExpired = memory.recycledBackingBytes
+        try balloon.request(bytes: 2 << 20, memory: memory, now: .now.advanced(by: .seconds(-9)))
+        try balloon.poll(now: .now, quarantine: false)
+        try transfer(inflate: true, half: 0)
+        try transfer(inflate: true, half: 1)
+        try require(memory.recycledBackingBytes == beforeExpired,
+          "expired lease replaced backing")
+        try execute(2, pages: 512)
+        try deflate()
+        let pinnedPointer = try projection.queuePointer(address, 16)
+        try require(pinnedPointer == pointer && memory.extents[index].metadataPinned,
+          "metadata resolver pins before returning current pointer")
+        let beforePin = memory.recycledBackingBytes
+        try inflate()
+        try require(memory.recycledBackingBytes == beforePin
+          && memory.refusals.last?["reason"] as? String == "metadata-pinned",
+          "metadata pin prevents replacement before unmap")
+        try execute(2, pages: 512)
+        try deflate()
+        try balloon.request(bytes: 2 << 20, memory: memory, now: .now)
+        try transfer(inflate: true, half: 0)
+        try transfer(inflate: false, half: 0)
+        try require(balloon.target == 0 && balloon.quarantined && balloon.ledger.count == 0,
+          "unsolicited deflate rescues")
+        let beforeQuarantine = memory.recycledBackingBytes
+        try memory.quarantine(quiescence: (true, epoch, 1))
+        try balloon.poll(now: .now, quarantine: true)
+        try transfer(inflate: true, half: 0)
+        try transfer(inflate: true, half: 1)
+        try require(memory.recycledBackingBytes == beforeQuarantine,
+          "balloon quarantine preserves data")
+        try execute(2, pages: 512)
+        try deflate()
+        try require(balloon.accepted == 30 && balloon.refused == 0, "balloon wire count")
+        try balloonWrite(0x70, 0)
+        try require(balloon.ledger.epoch == 2 && memory.extents[index].metadataPinned,
+          "device reset cannot revoke metadata pin")
+        steps.append("metadata pin, corruption, unsolicited deflate and quarantine preserve data")
+      } else {
+        try execute(0, pages: 512)
+        try report()
+        try require(memory.recycledBackingBytes == 0 && memory.refusalsTotal == 1, "alias refused")
+        try execute(0, pages: 512)
+        try memory.releaseAlias()
+        try report()
+        try require(
+          memory.recyclingObservations.last?["hostInitializedBytes"] as? Int
+            == (coldProvisioning ? 0 : 2 << 20),
+          "first report provenance")
+        steps.append(
+          "alias refusal restores data, first report preserves initialization provenance")
+        try report()
+        try require(
+          memory.recyclingObservations.last?["residentBytesObservedBefore"] as? UInt64 == 0,
+          "untouched cold report")
+        steps.append("untouched cold backing reports again")
+        let coldResidentBeforeTouch = memory.recycledColdResidentBytes
+        try execute(1, pages: 16)
+        try report()
+        try require(
+          memory.recycledColdResidentBytes - coldResidentBeforeTouch == 65536,
+          "guest-touch resident accounting")
+        memory.requested = 0
+        try acknowledged(1)
+        try require(memory.observations.last?["residentBytesObservedBefore"] as? UInt64 == 0,
+          "untouched cold unplug")
+        try require(memory.observations.last?["hostInitializedBytes"] as? Int == 0,
+          "cold unplug provenance")
+        steps.append("guest-touched backing reports, untouched replacement unplugs")
+        memory.requested = UInt64(MemoryDevice.block)
+        try acknowledged(0)
+        try report()
+        try execute(0, pages: 512)
+        try execute(1, pages: 512)
+        try execute(2, pages: 512)
+        let pointer = memory.extents[index].pointer!
+        let word = pointer.load(as: UInt64.self)
+        pointer.storeBytes(of: word ^ 1, as: UInt64.self)
+        try execute(2, pages: 512, expected: 3)
+        pointer.storeBytes(of: word, as: UInt64.self)
+        try execute(2, pages: 512)
+        let beforePoison = memory.recycledBackingBytes
+        try report(poison: 0xa5a5_a5a5)
+        try require(memory.recycledBackingBytes == beforePoison, "poison preserves backing")
+        try execute(2, pages: 512)
+        try report()
+        try execute(0, pages: 512)
+        try execute(1, pages: 512)
+        try execute(2, pages: 512)
+        let recycled = memory.recycledBackingBytes
+        try memory.quarantine(quiescence: (true, epoch, 1))
+        try report()
+        try require(memory.recycledBackingBytes == recycled, "quarantine preserves backing")
+        try execute(2, pages: 512)
+        steps.append("zero/pattern/corruption, poison and quarantine preserve guest data")
+        try require(reporting.reports == 8 && published == 8, "wire report count")
+      }
     } catch { primary = String(describing: error) }
     kick?.running.store(false, ordering: .releasing)
     timer?.cancel()
@@ -284,6 +437,13 @@ enum NativeMemoryDeviceCheck {
       "recycledResidentBytesFromColdBacking": memory.recycledColdResidentBytes,
       "freePageReports": reporting.reports,
       "reportingObservations": reporting.observations,
+      "classicBallooning": classicBallooning,
+      "balloonAcceptedPackets": balloon.accepted, "balloonRefusedPackets": balloon.refused,
+      "balloonOwnedPFNs": balloon.ledger.count, "balloonTargetPFNs": balloon.target,
+      "balloonActualPFNs": balloon.actual, "balloonObservations": balloon.observations,
+      "balloonEpoch": balloon.ledger.epoch,
+      "balloonLeaseExpirations": balloon.leaseExpirations,
+      "balloonRefusalObservations": balloon.refusals,
       "physicalReleasedBytes": NSNull(), "scope": "single-vCPU HVF wire/owner, not Linux/SMP",
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
