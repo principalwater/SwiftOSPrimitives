@@ -12,7 +12,7 @@ let package = Package(
   name: "LinuxMemoryLab", platforms: [.macOS("27.0")],
   products: [.library(name: "NativeLinuxVMM", targets: ["NativeLinuxVMM"])],
   dependencies: [
-    .package(path: "../.."),
+    .package(name: "SwiftOSPrimitives", path: "../.."),
     .package(name: "containerization", path: containerizationPath),
     .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
   ],

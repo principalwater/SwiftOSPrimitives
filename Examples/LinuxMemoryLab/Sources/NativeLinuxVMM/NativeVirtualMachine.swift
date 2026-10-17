@@ -262,6 +262,7 @@ final class NativeControl: Sendable {
       "balloonPeakBootPFNs": machine.classicBalloon?.peakBootPFNs ?? 0,
       "balloonPeakDynamicPFNs": machine.classicBalloon?.peakDynamicPFNs ?? 0,
       "balloonPeakFullyOwnedDynamicExtents": machine.classicBalloon?.ledger.peakFullyOwnedDynamicExtents ?? 0,
+      "balloonOwnershipCoverage": machine.classicBalloon?.coverageEvidence ?? [:],
       "balloonRecyclingAttempts": machine.classicBalloon?.recyclingAttempts ?? 0,
       "balloonRecyclingReplaced": machine.classicBalloon?.recyclingReplaced ?? 0,
       "balloonRecyclingSkippedPinned": machine.classicBalloon?.recyclingSkippedPinned ?? 0,

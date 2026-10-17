@@ -140,6 +140,12 @@ struct BalloonPFNs {
     return (first..<(first + 8)).allSatisfy { words[$0] == .max }
   }
 
+  /// Complete aligned dynamic units owned now; boot is skipped (2 MiB aligned, so whole words).
+  /// An upper bound before metadata pins, residency or backing, and no ledger state changes.
+  func ownedCoverage() -> BalloonOwnershipCoverage {
+    BalloonOwnershipCoverage(dynamicWords: words[(bootPages / 64)...])
+  }
+
   /// Deflate never remaps: release every known owned PFN before ACK, even in a mixed packet.
   mutating func releaseOwned(_ pfns: [UInt32]) -> Bool {
     guard !pfns.isEmpty, pfns.count <= 256 else { return false }
@@ -201,6 +207,9 @@ final class ClassicBalloonDevice {
   var refusals: [[String: Any]] { refusalHistory.elements }
   private(set) var peakBootPFNs: UInt32 = 0
   private(set) var peakDynamicPFNs: UInt32 = 0
+  private var coverageJournal = BalloonCoverageJournal()
+  /// Final saved evidence only, read by the owning coordinator after the VM stops.
+  var coverageEvidence: [String: Any] { coverageJournal.evidence(pulseActive: target != 0) }
 
   init(boot: Range<UInt64>, dynamicBytes: UInt64) throws {
     ledger = try BalloonPFNs(boot: boot, dynamicBytes: dynamicBytes)
@@ -208,11 +217,14 @@ final class ClassicBalloonDevice {
 
   private func setTarget(_ value: UInt32) throws {
     guard transport.generation < .max else { throw DeviceFailure.request }
+    let previous = target
     target = value
     if value == 0 { ledger.cancelRecycling() }
     zeroReadGeneration = nil
     transport.generation += 1
     transport.interruptStatus |= 2
+    // Diagnostics follow the safety mutation and cannot throw, renew a lease or edit ownership.
+    coverageJournal.recordZeroTransition(from: previous, to: value, ledger: ledger)
   }
 
   /// One finite pulse; even a stalled caller cannot leave a nonzero target indefinitely.
