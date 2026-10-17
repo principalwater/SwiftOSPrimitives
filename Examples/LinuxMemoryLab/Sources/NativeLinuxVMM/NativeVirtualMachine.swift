@@ -414,6 +414,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
 
 public final class NativeVirtualMachine: VirtualMachineInstance {
   public typealias Agent = Vminitd
+  private let memoryServiceClaimed = Mutex(false)
   let control: NativeControl
   let group: MultiThreadedEventLoopGroup
   public let mounts: [String: [AttachedFilesystem]]
@@ -439,6 +440,19 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       ?? Data()
   }
   public var memoryGeometry: NativeMemoryGeometry { control.geometry }
+  /// A failed or retired monitor is never replaced within the same guest boot.
+  func claimMemoryService() throws {
+    guard state == .running else { throw NativeControlFailure.ownership }
+    try memoryServiceClaimed.withLock {
+      guard !$0 else { throw NativeControlFailure.ownership }
+      $0 = true
+    }
+  }
+  var memoryServiceCanRetire: Bool {
+    control.state.withLock {
+      $0.ended && $0.joinComplete && $0.joined && $0.joinError == 0 && $0.error.isEmpty
+    }
+  }
   /// Cumulative native object retirement; resident pages are observations, not global free RAM.
   public var backingRecyclingStatus:
     (bytes: UInt64, residentBytes: UInt64, coldResidentBytes: UInt64)

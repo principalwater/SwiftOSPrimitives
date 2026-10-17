@@ -19,21 +19,16 @@ public struct NativeMemoryObservation: Sendable {
 
 /// A separate process and wire keep allocation diagnostics from blocking memory observations.
 public actor NativeMemorySession {
-  private let input: NativeMemoryInput
-  private let output: NativeMemoryOutput
+  private let wire: any MemorySessionWire
   private let maximumGuestBytes: UInt64
   private var sequence: UInt64 = 0
   private var ready = false
   private var busy = false
   private var closed = false
 
-  /// The owner supplies the VM's configured maximum, including all potentially online memory.
-  public init(
-    input: NativeMemoryInput, output: NativeMemoryOutput, maximumGuestBytes: UInt64
-  ) throws {
+  init(wire: any MemorySessionWire, maximumGuestBytes: UInt64) throws {
     guard maximumGuestBytes > 0 else { throw NativeControlFailure.arguments }
-    self.input = input
-    self.output = output
+    self.wire = wire
     self.maximumGuestBytes = maximumGuestBytes
   }
 
@@ -43,7 +38,7 @@ public actor NativeMemorySession {
     while ContinuousClock.now < deadline {
       try Task.checkCancellation()
       guard !closed else { throw NativeControlFailure.disconnected }
-      if let text = try output.takeLine(allowAfterClose: allowAfterClose) { return text }
+      if let text = try wire.takeLine(allowAfterClose: allowAfterClose) { return text }
       try await Task.sleep(for: .milliseconds(5))
     }
     throw NativeControlFailure.wireTimedOut
@@ -51,11 +46,14 @@ public actor NativeMemorySession {
 
   /// Accepts one validated READY frame within five seconds; a failed handshake closes the wire.
   public func start() async throws {
+    try await start(until: .now.advanced(by: .seconds(5)))
+  }
+
+  func start(until deadline: ContinuousClock.Instant) async throws {
     guard !ready, !busy, !closed else { throw NativeControlFailure.invariant }
     busy = true
     defer { busy = false }
     do {
-      let deadline = ContinuousClock.now.advanced(by: .seconds(5))
       let text = try await line(until: deadline)
       let words = text.split(separator: " ")
       guard words.count == 3, words[0] == "MEMORY_READY", let total = UInt64(words[1]),
@@ -86,8 +84,12 @@ public actor NativeMemorySession {
 
   /// Requests a validated graceful exit; the process owner must still wait and delete the process.
   public func quit() async throws {
+    try await quit(until: .now.advanced(by: .seconds(5)))
+  }
+
+  func quit(until deadline: ContinuousClock.Instant) async throws {
     guard ready, !busy, !closed else { throw NativeControlFailure.disconnected }
-    _ = try await exchange("QUIT", deadline: .now.advanced(by: .seconds(5)))
+    _ = try await exchange("QUIT", deadline: deadline)
   }
 
   private func exchange(_ command: String, deadline: ContinuousClock.Instant) async throws
@@ -100,7 +102,7 @@ public actor NativeMemorySession {
       guard sequence < UInt64.max else { throw NativeControlFailure.invariant }
       sequence += 1
       let capturedAt = ContinuousClock.now
-      try input.send(Data("\(command) \(sequence)\n".utf8))
+      try await wire.send(Data("\(command) \(sequence)\n".utf8), until: deadline)
       let text = try await line(until: deadline, allowAfterClose: command == "QUIT")
       let words = text.split(separator: " ")
       try Task.checkCancellation()
@@ -122,6 +124,6 @@ public actor NativeMemorySession {
   /// Retires the wire, not the guest process. Its owner still must reap it.
   public func close() {
     closed = true
-    input.finish()
+    wire.close()
   }
 }

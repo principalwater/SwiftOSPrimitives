@@ -31,6 +31,7 @@ let package = Package(
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
         .product(name: "Containerization", package: "containerization"),
         .product(name: "ContainerizationExtras", package: "containerization"),
+        .product(name: "ContainerizationOCI", package: "containerization"),
         .product(name: "NIOPosix", package: "swift-nio"),
       ]),
     .executableTarget(name: "linux-memory-lab", dependencies: ["NativeLinuxVMM"]),

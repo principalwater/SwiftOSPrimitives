@@ -1,5 +1,8 @@
 # Native Linux backing-memory lab
 
+See [memory-service ownership](MEMORY-SERVICE-OWNERSHIP.md) for the retained native
+monitor owner, real cancellation/deadline/retirement tests and remaining product gates.
+
 SMP/private-NIC Swift HVF backend for Apple Containerization, plus the earlier
 standalone Linux experiment. Requires an Apple-silicon Mac, macOS27 deployment
 target/SDK and Swift6.4.1. This is optional research code; the root package's

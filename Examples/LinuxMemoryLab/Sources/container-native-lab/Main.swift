@@ -24,9 +24,13 @@ import NativeLinuxVMM
   static func run() async throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 5 else { throw Failure.arguments }
-    if args[4] == "monitor-service" {
+    if args[4] == "monitor-service" || args[4] == "monitor-owner" {
       guard args.count == 8, args[6] == "--boot-directory" else { throw Failure.arguments }
-      try await MonitorServiceCheck.run(args: args)
+      if args[4] == "monitor-owner" {
+        try await MonitorOwnerCheck.run(args: args)
+      } else {
+        try await MonitorServiceCheck.run(args: args)
+      }
       return
     }
     let classic = [
