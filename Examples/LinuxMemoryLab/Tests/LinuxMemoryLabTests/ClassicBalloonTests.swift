@@ -145,3 +145,23 @@ func classicBalloonRequiresBothRescueFeatures(_ lowFeatures: UInt32) throws {
     metadata: fixture.memory, payload: fixture.memory, quiescence: (true, 1, 2))
   #expect(!device.zeroTargetObserved)
 }
+
+// A positive target needs plugged HVF backing, which unit tests cannot own: the positive-to-zero
+// recording itself is covered through BalloonCoverageJournal and on hardware.
+@Test func zeroPathsWithoutAPositiveTargetRecordNothingAndKeepTheRescueUnchanged() throws {
+  let memory = MemoryDevice(held: false)
+  let device = try ClassicBalloonDevice(boot: 0..<(2 << 20), dynamicBytes: 128 << 20)
+  let fixture = RingFixture()
+  for (offset, value): (UInt64, UInt32) in [
+    (0x70, 3), (0x20, 5), (0x24, 1), (0x20, 1), (0x70, 15),
+  ] { _ = try device.transport.write(offset, value, memory: fixture.memory) }
+  try device.request(bytes: 0, memory: memory, now: .now)
+  try device.poll(now: .now, quarantine: true)
+  #expect(device.target == 0 && device.quarantined && device.leaseExpirations == 0)
+  // The idle zero still publishes exactly one configuration generation and its interrupt.
+  #expect(device.transport.generation == 1 && device.transport.interruptStatus & 2 != 0)
+  let evidence = device.coverageEvidence
+  #expect((evidence["samples"] as? [[String: UInt64]])?.isEmpty == true)
+  #expect(evidence["samplesTotal"] as? UInt64 == 0 && evidence["recordFailures"] as? UInt64 == 0)
+  #expect(evidence["pulseActiveAtEvidence"] as? Bool == false)
+}
