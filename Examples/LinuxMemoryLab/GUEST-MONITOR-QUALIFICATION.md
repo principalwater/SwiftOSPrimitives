@@ -99,9 +99,8 @@ Exact Claude Opus 5.5 with max effort returned the tool-free correction review i
 with the actual service-container result and withdraws the nil-container route.
 Only its public answer and public outcome metadata were inspected.
 
-Before product adoption, implement and qualify confinement self-checks before
-READY, narrower read-only proc paths, measured cgroup/pid limits, no extra open fds
-and runtime threads, non-dumpable operation where supported, and workload admission
+Before product adoption, qualify measured cgroup/pid limits, sustained fd/thread
+behavior, non-dumpable operation where supported, and workload admission
 only after a live monitor owns its established channels. Test lifecycle cancellation,
 partial creation, unexpected EOF/exit, reader/wait races, no in-boot respawn or port
 reuse, exact deadline/reap ownership, cgroup OOM accounting and longer fd/thread
@@ -137,3 +136,48 @@ in 99.711 seconds including compilation. The complete release suite then passed
 or errors. The collector has no validated Swift Testing event mapping for this
 toolchain, so the retained raw log is the test evidence. No memory ownership or
 RAM reclamation API changed. Actual service-owner integration remains open.
+
+
+## Dedicated-service confinement admission
+
+Only the dedicated executable now checks confinement before its shared monitor
+loop; the diagnostic exec probe remains usable outside PID1. Native calls require
+PID1 and uid/euid/gid/egid0. A bounded proc-status read requires all five observed
+capability sets to be zero, NoNewPrivs1 and Threads1. Root and /proc/sys must exist
+and be read-only. Every present optional proc interface (sysrq-trigger, irq, bus,
+fs) must also be read-only. ENOENT is permitted only for those optional interfaces,
+matching vmexec's skip-missing behavior; other errors retain their path and errno.
+A bounded native proc-fd listing allows only stdin/stdout/stderr plus its own
+temporary listing fd, after checking that all three standard descriptors exist.
+
+The guest proc reader reuses the existing checked, no-follow, bounded 8 KiB
+stack-buffer lifetime; no dependency was added. The OCI service explicitly encodes
+empty arrays for bounding/effective/inheritable/permitted/ambient capability sets.
+It no longer relies on nil/default JSON semantics. Requested policies alone are
+not counted as observed confinement.
+
+The first actual normal guest refused before READY. Its original stderr was lost
+by the lab harness; a bounded200ms best-effort stderr drain was added only to the
+lab startup failure path, without replacing its primary failure or stop limits.
+A second run with byte-identical guest ELF exposed ENOENT after the identity,
+capability, NNP and thread checks. The initial implementation incorrectly required
+all optional proc interfaces to exist. Both failed receipts and clean native
+VM/CPU/NIO joins are retained; no production outage or source-image mutation occurred.
+
+With optional absence handled, Linux Swift6.4.1 static compilation passed6.750s;
+the full host suite passed116 declarations (84.331s including build, zero warnings).
+The frozen stripped monitor is6548440bytes, SHA256
+c2c0e6e83bd68cd7863ba40408e80d0dfa9714cd756069a0cb5fc0bd844b6b22.
+Separate debug ELF and host symbols are retained. The earlier10.1MB artifact used
+strip-debug and retained the static symbol table; allocated code/data increased
+only about13KiB. No RSS saving or performance conclusion is inferred from stripping.
+
+Four fresh actual2-vCPU guests then passed in64.993s outer: normal
+READY/OBS/REFRESH/QUIT/exit0; missing NNP refused before READY with privileges/exit1;
+writable proc refused before READY with readOnlyFilesystem/exit1; uid65534 refused
+before READY with identity/exit1. Every process was waited and deleted, stdio and
+listeners closed, and native VM/vCPUs/NIO joined. Whole8GiB source SHA and metadata
+were unchanged. Host UUID BFA0D688-B244-3924-812D-96B2A27DBE63 and the same guest
+ELF cover all four cases. This qualifies finite startup admission, not seccomp,
+network namespaces, OOM accounting, sustained resource limits, a production
+process owner, autonomous ballooning or physical free-list attribution.

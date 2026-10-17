@@ -8,7 +8,10 @@
 
   @main private struct Monitor {
     static func main() {
-      do { try GuestMemoryMonitor.run() } catch {
+      do {
+        try GuestMemoryService.validate()
+        try GuestMemoryMonitor.run()
+      } catch {
         // Stdout is the protocol wire; the exit status is the failure signal and stderr is
         // best-effort context only.
         var message = "container-memory-monitor: \(error)\n"

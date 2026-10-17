@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 
 @testable import NativeGuestMemory
@@ -64,4 +65,38 @@ func requestsMatchOnlyTheirExactSequence(
 ])
 func malformedRequestsAreRefused(_ line: String) {
   #expect(MemoryMonitorCommand(line: line, sequence: 1) == nil)
+}
+
+private let serviceStatus = """
+  Name: monitor
+  CapInh: 0000000000000000
+  CapPrm: 0000000000000000
+  CapEff: 0000000000000000
+  CapBnd: 0000000000000000
+  CapAmb: 0000000000000000
+  NoNewPrivs: 1
+  Threads: 1
+  """
+
+@Test func servicePrivilegeAdmissionUsesTheObservedKernelStatus() {
+  #expect(throws: Never.self) {
+    try Array(serviceStatus.utf8).withUnsafeBufferPointer {
+      try GuestMemoryService.validateStatus($0)
+    }
+  }
+}
+
+@Test(arguments: [
+  ("CapEff: 0000000000000000", "CapEff: 0000000000000001"),
+  ("CapBnd: 0000000000000000", "CapBnd: 0000000000000001"),
+  ("CapAmb: 0000000000000000", ""),
+  ("NoNewPrivs: 1", "NoNewPrivs: 0"),
+  ("NoNewPrivs: 1", "NoNewPrivs: 1\nNoNewPrivs: 1"),
+  ("Threads: 1", "Threads: 2"),
+])
+func unsafeOrIncompleteServiceStatusIsRefused(old: String, replacement: String) {
+  let text = serviceStatus.replacingOccurrences(of: old, with: replacement)
+  #expect(throws: GuestMemoryService.Failure.privileges) {
+    try Array(text.utf8).withUnsafeBufferPointer { try GuestMemoryService.validateStatus($0) }
+  }
 }

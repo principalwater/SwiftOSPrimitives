@@ -101,12 +101,19 @@ public enum GuestMemory {
   extension GuestMemory {
     /// Reads and validates `/proc/meminfo` into a stack buffer of at most `meminfoLimit` bytes.
     public static func snapshot() throws -> GuestMemoryReading {
-      let fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC)
+      try withProcBytes(at: "/proc/meminfo", parse)
+    }
+
+    /// Internal procfs inputs share the same bounded read and checked descriptor lifetime.
+    static func withProcBytes<Value>(
+      at path: String, _ consume: (UnsafeBufferPointer<UInt8>) throws -> Value
+    ) throws -> Value {
+      let fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
       guard fd >= 0 else { throw GuestMemoryFailure.system(errno) }
       var owned = true
       defer { if owned { _ = close(fd) } }
       let reading = try withUnsafeTemporaryAllocation(of: UInt8.self, capacity: meminfoLimit) {
-        (buffer: UnsafeMutableBufferPointer<UInt8>) throws -> GuestMemoryReading in
+        (buffer: UnsafeMutableBufferPointer<UInt8>) throws -> Value in
         var filled = 0
         while true {
           // The allocation is non-empty and `filled < count`, so the base address exists.
@@ -117,7 +124,7 @@ public enum GuestMemory {
           filled += count
           guard filled < buffer.count else { throw GuestMemoryFailure.framing }
         }
-        return try parse(meminfo: UnsafeBufferPointer(rebasing: buffer[..<filled]))
+        return try consume(UnsafeBufferPointer(rebasing: buffer[..<filled]))
       }
       let closed = close(fd)
       owned = false

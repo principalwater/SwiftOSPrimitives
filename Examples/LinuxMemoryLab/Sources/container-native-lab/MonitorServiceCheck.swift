@@ -13,10 +13,13 @@ enum MonitorServiceCheck {
   enum Failure: Error { case check(String) }
   enum Scenario: String {
     case normal, badSequence, stdinEOF, partialEOF, nonroot, killed, oversized, controlByte
+    case unsafePrivileges, writableProc
+    var expectsReady: Bool { self != .nonroot && self != .unsafePrivileges && self != .writableProc }
     var expectedExit: Int32 {
       switch self {
       case .normal, .stdinEOF: 0
-      case .badSequence, .partialEOF, .nonroot, .oversized, .controlByte: 1
+      case .badSequence, .partialEOF, .nonroot, .oversized, .controlByte,
+        .unsafePrivileges, .writableProc: 1
       case .killed: 128 + SIGKILL
       }
     }
@@ -214,7 +217,9 @@ enum MonitorServiceCheck {
       let spec = Spec(
         version: "1.2.0",
         process: .init(
-          args: ["/monitor"], noNewPrivileges: true, capabilities: .init(),
+          args: ["/monitor"], noNewPrivileges: scenario != .unsafePrivileges,
+          capabilities: .init(bounding: [], effective: [], inheritable: [],
+            permitted: [], ambient: []),
           user: .init(uid: scenario == .nonroot ? 65534 : 0, gid: scenario == .nonroot ? 65534 : 0),
           rlimits: [.init(type: "RLIMIT_NOFILE", hard: 64, soft: 64),
             .init(type: "RLIMIT_CORE", hard: 0, soft: 0)]),
@@ -230,7 +235,9 @@ enum MonitorServiceCheck {
           namespaces: [
             .init(type: .pid), .init(type: .mount), .init(type: .uts), .init(type: .ipc),
           ],
-          readonlyPaths: ["/proc/sys"]))
+          readonlyPaths: scenario == .writableProc ? [] : [
+            "/proc/sys", "/proc/sysrq-trigger", "/proc/irq", "/proc/bus", "/proc/fs",
+          ]))
       try await client.createProcess(
         id: id, containerID: id, stdinPort: ports[0], stdoutPort: ports[1], stderrPort: ports[2],
         ociRuntimePath: nil, configuration: spec, options: nil)
@@ -243,10 +250,17 @@ enum MonitorServiceCheck {
       }
       pid = try await client.startProcess(id: id, containerID: id)
       guard pid > 1 else { throw Failure.check("invalid monitor pid") }
-      if scenario != .nonroot {
-        let ready = try await wires[1].line(until: .now.advanced(by: .seconds(5)))
-        transcript.append(ready)
-        try validate(ready, sequence: nil, maximum: geometry.maximumBytes)
+      if scenario.expectsReady {
+        do {
+          let ready = try await wires[1].line(until: .now.advanced(by: .seconds(5)))
+          transcript.append(ready)
+          try validate(ready, sequence: nil, maximum: geometry.maximumBytes)
+        } catch {
+          // Bounded best-effort startup context must never replace the original failure.
+          diagnostics = (try? await wires[2].contentsUntilEOF(
+            until: .now.advanced(by: .milliseconds(200)), limit: 2048)) ?? ""
+          throw error
+        }
       }
       switch scenario {
       case .normal:
@@ -264,7 +278,7 @@ enum MonitorServiceCheck {
       case .partialEOF:
         try wires[0].send("OBS ")
         try wires[0].close()
-      case .nonroot: break
+      case .nonroot, .unsafePrivileges, .writableProc: break
       case .killed: try await client.signalProcess(id: id, containerID: id, signal: SIGKILL)
       }
       let status = try await client.waitProcess(id: id, containerID: id, timeoutInSeconds: 5)
@@ -284,8 +298,16 @@ enum MonitorServiceCheck {
         }
       case .nonroot:
         // World-searchable root and executable deliberately exclude an exec permission denial.
-        guard diagnostics.contains("system(13)") else {
-          throw Failure.check("missing stat_refresh permission refusal: " + diagnostics)
+        guard diagnostics.contains("identity") else {
+          throw Failure.check("missing service identity refusal: " + diagnostics)
+        }
+      case .unsafePrivileges:
+        guard diagnostics.contains("privileges") else {
+          throw Failure.check("missing privilege refusal: " + diagnostics)
+        }
+      case .writableProc:
+        guard diagnostics.contains("readOnlyFilesystem") else {
+          throw Failure.check("missing proc mount refusal: " + diagnostics)
         }
       case .normal, .stdinEOF, .killed:
         guard diagnostics.isEmpty else { throw Failure.check("unexpected stderr: " + diagnostics) }
