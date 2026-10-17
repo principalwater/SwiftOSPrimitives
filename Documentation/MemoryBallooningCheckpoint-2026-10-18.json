@@ -1,0 +1,136 @@
+{
+  "commits": {
+    "coverage": "7e8985c",
+    "machOwnership": "517c77f",
+    "named": "c2cb3a9",
+    "native": "a3838f9",
+    "product": "ba7815c"
+  },
+  "controls": [
+    {
+      "file": "Examples/MachBackingControls/MachBackingControlLab.swift",
+      "retainedFreeze": "mach-backing-control-v2",
+      "sha256": "21b0880f58b16817bd4616e03a57ddf7fc69d72e85ea03680026d19aca17e468"
+    },
+    {
+      "file": "Examples/MachBackingControls/MachHVFExecutableBackingControlLab.swift",
+      "retainedFreeze": "mach-hvf-executable-control-v1",
+      "sha256": "7c8c8ea1b51507bce9534e10daff9dfbb4cff573d44cfb82e0464bee7f8bbb56"
+    },
+    {
+      "file": "Examples/MachBackingControls/MachWiredBackingControlLab.swift",
+      "retainedFreeze": "mach-wired-backing-control-v1",
+      "sha256": "603bb4ada1a96346ff91d0600f6a6449cc22951f29efc62c8eb19c9707963c04"
+    }
+  ],
+  "date": "2026-10-18",
+  "host": "AppleM2Max32GiB/macOS27.0.1(26A434)/SDK27",
+  "hostSymbolUUID": "1D2BBA52-9B0C-3E26-B699-113C0CC3E890",
+  "knownOpen": [
+    "fatal post-EMPTY process-reuse test",
+    "four-vCPU idle gate",
+    "first product start deadline failure",
+    "global cross-process resource authority",
+    "arbitrary-app allocator transparency",
+    "durable recovery and security qualification",
+    "upstream0.52build/runtime qualification",
+    "production product integration",
+    "clean fair stock/OrbStack baseline"
+  ],
+  "linuxClickHouse": {
+    "accepted": true,
+    "bootContentMatchesFreeze": true,
+    "coverageCaptured": true,
+    "cycles": [
+      {
+        "activeDuringBalloonMemoryBytes": 24082522,
+        "cycle": 1,
+        "deflatedAtNanoseconds": 20805266167,
+        "heldGuestBytes": 3140878336,
+        "heldPressureBytes": 2281701376,
+        "inflatedAtNanoseconds": 19707116250,
+        "initialGuestBytes": 3140878336,
+        "integrity": "400000\t79999800000\t9410121038903895322\t51176128",
+        "loadResult": "4999950000",
+        "pressureTableRows": 557056,
+        "releasedAtNanoseconds": 18627179917,
+        "reportedResidentBytesRecycled": 1367343104,
+        "restoredGuestBytes": 3140878336,
+        "workloadAllocatorPurgeRequested": true
+      },
+      {
+        "activeDuringBalloonMemoryBytes": 24077802,
+        "cycle": 2,
+        "deflatedAtNanoseconds": 30642658875,
+        "heldGuestBytes": 3140878336,
+        "heldPressureBytes": 2281701376,
+        "inflatedAtNanoseconds": 29740783750,
+        "initialGuestBytes": 3140878336,
+        "integrity": "400000\t79999800000\t9410121038903895322\t51176128",
+        "loadResult": "4999950000",
+        "pressureTableRows": 557056,
+        "releasedAtNanoseconds": 28558932584,
+        "reportedResidentBytesRecycled": 1405091840,
+        "restoredGuestBytes": 3140878336,
+        "workloadAllocatorPurgeRequested": true
+      }
+    ],
+    "idle": {
+      "autonomousIdleNanoseconds": "62718968084",
+      "idleCPUUsec": "1701084",
+      "idleFootprintAfter": "1837028584",
+      "idleFootprintBefore": "1837012200",
+      "idlePulses": "0",
+      "idleRequests": "0",
+      "idleSamples": "30",
+      "syntheticBeaconsQuiesced": "true"
+    },
+    "nativeCleanup": [],
+    "nativeError": "",
+    "peakRSSBytes": 4182687744,
+    "seconds": 79.46149129210971,
+    "sourceBaseContentUnchanged": true,
+    "sourceBaseMetadataUnchanged": true,
+    "vmDestroyed": true,
+    "workerJoined": true
+  },
+  "namedContracts": {
+    "collection": "Native log retained; wrapper event-stream mapping partial",
+    "compilerWarnings": 0,
+    "seconds": 50.222042833222076,
+    "tests": 152
+  },
+  "namedHostSHA256": "5e981f4effbb887a186f0932bc8e3cd1ca3b216bf7338499838425ee63b34734",
+  "nativeEvidence": {
+    "cpuCount": 2,
+    "directCountsSource": "mach_memory_entry_get_page_counts",
+    "exactExpectedReferences": 2,
+    "fatalTrueBranchQualified": false,
+    "logicalBackingBytes": 2772434944,
+    "nicCount": 2,
+    "pageBytes": 16384,
+    "physicalGlobalFreeBytesAttributed": null,
+    "processRetirementRequired": false,
+    "residentBackingBytes": 2772434944,
+    "retainedRecords": 1024,
+    "totalRetiredObjects": 1322,
+    "wholeObjectBytes": 2097152
+  },
+  "noProductionNetworkOrSourceDataChanges": true,
+  "oldAnonymousFailure": {
+    "compressedOrPagedOutLogicalBytes": 683032576,
+    "requiredResidentBytes": 1073741824,
+    "residentBeforeBytes": 704233472,
+    "thresholdRelaxed": false
+  },
+  "productContracts": {
+    "finalExactSourceSeconds": 159.745376,
+    "tests": 116
+  },
+  "schemaVersion": 1,
+  "singleCPUWireCollectorSeconds": 1.0692563750781119,
+  "singleCPUWireModes": 4,
+  "sourceFiles": 273,
+  "status": "Research checkpoint; all five product gates OPEN",
+  "toolchain": "Swift6.4.1"
+}

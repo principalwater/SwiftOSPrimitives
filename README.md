@@ -1,5 +1,7 @@
 # SwiftOSPrimitives
 
+Current research checkpoint: [native memory ballooning, confirmed results and plan](Documentation/MemoryBallooningCheckpoint-2026-10-18.md). All five product gates remain open.
+
 Ownership and bounded-memory primitives for Swift systems software, with optional
 freestanding validation. Complements typed OS bindings; this is not an OS, kernel
 allocator, runtime or Foundation replacement.
