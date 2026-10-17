@@ -24,6 +24,11 @@ import NativeLinuxVMM
   static func run() async throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 5 else { throw Failure.arguments }
+    if args[4] == "monitor-service" {
+      guard args.count == 8, args[6] == "--boot-directory" else { throw Failure.arguments }
+      try await MonitorServiceCheck.run(args: args)
+      return
+    }
     let classic = [
       "memory-balloon", "memory-balloon-wide", "pressure-balloon", "autonomous-pressure-balloon",
       "autonomous-entropy-balloon",

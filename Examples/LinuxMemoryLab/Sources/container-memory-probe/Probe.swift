@@ -1,6 +1,7 @@
 #if os(Linux)
   import LabHTTP
   import MemoryCanary
+  import NativeGuestMemory
   import NativeLinux
   import PageMemory
   import Synchronization
@@ -15,64 +16,6 @@
     case framing, integrity, topology, loadTimedOut
     case capacityTimedOut(total: UInt64, minimum: UInt64, elapsedNanoseconds: UInt64)
     case execution(Int32)
-  }
-  private func emit(_ text: String) throws {
-    let bytes = Array(text.utf8)
-    var done = 0
-    while done < bytes.count {
-      let count = bytes.withUnsafeBytes { write(1, $0.baseAddress! + done, $0.count - done) }
-      if count < 0, errno == EINTR { continue }
-      guard count > 0 else { throw ProbeFailure.system(errno) }
-      done += count
-    }
-  }
-  private func command() throws -> String {
-    var bytes: [UInt8] = []
-    while bytes.count < 64 {
-      var byte: UInt8 = 0
-      let count = read(0, &byte, 1)
-      if count < 0, errno == EINTR { continue }
-      guard count == 1 else { throw ProbeFailure.framing }
-      if byte == 10 { return String(decoding: bytes, as: UTF8.self) }
-      guard byte >= 32, byte <= 126 else { throw ProbeFailure.framing }
-      bytes.append(byte)
-    }
-    throw ProbeFailure.framing
-  }
-  private func refreshMemoryStatistics() throws {
-    let fd = open("/proc/sys/vm/stat_refresh", O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-    guard fd >= 0 else { throw ProbeFailure.system(errno) }
-    var owned = true
-    defer { if owned { _ = close(fd) } }
-    var byte: UInt8 = 0
-    var count: Int
-    repeat { count = read(fd, &byte, 1) } while count < 0 && errno == EINTR
-    guard count == 0 else {
-      if count < 0 { throw ProbeFailure.system(errno) }
-      throw ProbeFailure.framing
-    }
-    let closed = close(fd)
-    owned = false
-    guard closed == 0 else { throw ProbeFailure.system(errno) }
-  }
-
-  private func memory() throws -> String {
-    let fd = open("/proc/meminfo", O_RDONLY | O_CLOEXEC)
-    guard fd >= 0 else { throw ProbeFailure.system(errno) }
-    defer { _ = close(fd) }
-    var bytes = [UInt8](repeating: 0, count: 8192)
-    let count = read(fd, &bytes, bytes.count)
-    guard count > 0, count < bytes.count else { throw ProbeFailure.system(errno) }
-    let lines = String(decoding: bytes.prefix(count), as: UTF8.self).split(separator: "\n")
-    func field(_ key: String) throws -> UInt64 {
-      let selected = lines.filter { $0.hasPrefix(key + ":") }
-      guard selected.count == 1 else { throw ProbeFailure.framing }
-      let values = selected[0].split(whereSeparator: { $0 == " " || $0 == "\t" })
-      guard values.count == 3, values[2] == "kB", let number = UInt64(values[1]), number < 1 << 40
-      else { throw ProbeFailure.framing }
-      return number * 1024
-    }
-    return "\(try field("MemTotal")) \(try field("MemAvailable"))"
   }
   private func localSQL(
     _ query: String, queryID: String? = nil, executionSeconds: Int = 8, receiveSeconds: Int = 10
@@ -265,7 +208,7 @@
   @main private struct Probe {
     static func main() {
       do { try run() } catch {
-        try? emit("CANARY_FAIL \(error)\n")
+        try? GuestWire.emit("CANARY_FAIL \(error)\n")
         exit(1)
       }
     }
@@ -274,24 +217,12 @@
       if args.first == "--wait-capacity-exec" { try launchAfterCapacity(args) }
       if args.first == "--http-query" {
         guard (2...3).contains(args.count) else { throw ProbeFailure.framing }
-        try emit(try localSQL(args[1], queryID: args.count == 3 ? args[2] : nil))
+        try GuestWire.emit(try localSQL(args[1], queryID: args.count == 3 ? args[2] : nil))
         return
       }
       if args == ["--memory-monitor"] {
-        try emit("MEMORY_READY \(try memory())\n")
-        var sequence: UInt64 = 0
-        while sequence < UInt64.max {
-          sequence += 1
-          let text = try command()
-          guard text == "OBS \(sequence)" || text == "OBS_REFRESH \(sequence)"
-            || text == "QUIT \(sequence)" else {
-            throw ProbeFailure.framing
-          }
-          if text.hasPrefix("OBS_REFRESH ") { try refreshMemoryStatistics() }
-          try emit("MEMORY_OK \(sequence) \(try memory())\n")
-          if text.hasPrefix("QUIT ") { return }
-        }
-        throw ProbeFailure.framing
+        try GuestMemoryMonitor.run()
+        return
       }
       let cpus = Int(sysconf(Int32(_SC_NPROCESSORS_ONLN)))
       guard args.count == 2, Int(args[0]) == cpus, (1...4).contains(cpus),
@@ -386,16 +317,17 @@
             try MemoryCanary.check(bytes, multiplier: 31, seed: 47)
           }
         }
-        try emit("CANARY_READY \(try memory()) \(try summary())\n")
+        try GuestWire.emit(
+          "CANARY_READY \(try GuestMemory.snapshot().wireFields) \(try summary())\n")
         var sequence: UInt64 = 0
         while sequence < UInt64.max {
           sequence += 1
-          let text = try command()
+          guard let text = try GuestWire.nextCommand() else { throw ProbeFailure.framing }
           let fields = text.split(separator: " ")
           if fields.count == 3, fields[0] == "STATE", fields[1] == Substring(String(sequence)),
             let cycle = Int(fields[2]), (1...2).contains(cycle)
           {
-            try emit("LOAD_STATE \(sequence) \(try loadState(cycle: cycle))\n")
+            try GuestWire.emit("LOAD_STATE \(sequence) \(try loadState(cycle: cycle))\n")
             continue
           }
           if text == "HOLD \(sequence)" {
@@ -422,16 +354,17 @@
             }
           }
           let passive = text.hasPrefix("OBS ") || text.hasPrefix("OBS_REFRESH ")
-          if text.hasPrefix("OBS_REFRESH ") { try refreshMemoryStatistics() }
+          if text.hasPrefix("OBS_REFRESH ") { try GuestMemory.refreshStatistics() }
           if !passive {
             try checkPressure()
             try region.withReadAccess { bytes in
               try MemoryCanary.check(bytes, multiplier: 17, seed: 91)
             }
           }
-          try emit(
-            "CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !passive && !stopped))\n"
-          )
+          let reading = try GuestMemory.snapshot()
+          try GuestWire.emit(
+            "CANARY_OK \(sequence) \(reading.wireFields) "
+              + "\(try summary(progress: !passive && !stopped))\n")
           if text.hasPrefix("QUIT") {
             try region.release()
             try pressure.release()
@@ -441,7 +374,7 @@
         }
         throw ProbeFailure.framing
       } catch {
-        do { try stop() } catch { try? emit("CANARY_CLEANUP_FAIL \(error)\n") }
+        do { try stop() } catch { try? GuestWire.emit("CANARY_CLEANUP_FAIL \(error)\n") }
         throw error
       }
     }
@@ -458,8 +391,7 @@
       }
       while true {
         var now = timespec()
-        let fields = try memory().split(separator: " ")
-        guard fields.count == 2, let total = UInt64(fields[0]) else { throw ProbeFailure.framing }
+        let total = try GuestMemory.snapshot().total
         // A blocked proc read cannot publish a capacity receipt after its deadline.
         guard clock_gettime(CLOCK_MONOTONIC, &now) == 0, now.tv_sec >= began.tv_sec,
           now.tv_sec - began.tv_sec < Int64.max / 1_000_000_000
@@ -471,7 +403,7 @@
             total: total, minimum: minimum, elapsedNanoseconds: UInt64(elapsed))
         }
         if total >= minimum {
-          try emit("CAPACITY_READY \(total) \(elapsed)\n")
+          try GuestWire.emit("CAPACITY_READY \(total) \(elapsed)\n")
           break
         }
         usleep(10000)

@@ -47,11 +47,14 @@ let package = Package(
       dependencies: [
         "NativeLinuxVMM", .product(name: "BoundedMemory", package: "SwiftOSPrimitives"),
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
+        .product(name: "ContainerizationOCI", package: "containerization"),
       ]),
+    .target(name: "NativeGuestMemory"),
+    .executableTarget(name: "container-memory-monitor", dependencies: ["NativeGuestMemory"]),
     .executableTarget(
       name: "container-memory-probe",
       dependencies: [
-        "NativeLinux", "MemoryCanary", "LabHTTP",
+        "NativeLinux", "NativeGuestMemory", "MemoryCanary", "LabHTTP",
         .product(name: "PageMemory", package: "SwiftOSPrimitives"),
       ]),
     .systemLibrary(name: "NativeLinux"),
@@ -63,5 +66,7 @@ let package = Package(
       ]),
     .testTarget(
       name: "LinuxMemoryLabTests",
-      dependencies: ["NativeLinuxVMM", "container-native-lab", "MemoryCanary", "LabHTTP"]),
+      dependencies: [
+        "NativeLinuxVMM", "NativeGuestMemory", "container-native-lab", "MemoryCanary", "LabHTTP",
+      ]),
   ], swiftLanguageModes: [.v6])
