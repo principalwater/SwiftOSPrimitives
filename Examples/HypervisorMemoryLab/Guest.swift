@@ -2,7 +2,7 @@
 @_cdecl("swift_guest")
 public func guest(_ address: UInt64, _ pages: UInt64, _ salt: UInt64, _ operation: UInt64) -> UInt64
 {
-  guard pages == 16 || pages == 16384, operation <= 2,
+  guard pages == 16 || pages == 512 || pages == 16384, operation <= 2,
     let base = UnsafeMutablePointer<UInt64>(bitPattern: UInt(address))
   else { return 1 }
   var index: UInt64 = 0

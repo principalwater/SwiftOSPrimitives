@@ -8,7 +8,7 @@ public struct NativeMemoryGeometry: Sendable, Equatable {
     // DTB at120MiB and the optional128..192MiB initrd must fit in immutable boot RAM.
     guard bootBytes >= 256 << 20, bootBytes <= 3 << 30,
       bootBytes % (128 << 20) == 0,
-      dynamicBytes >= 128 << 20, dynamicBytes <= 2 << 30,
+      dynamicBytes >= 128 << 20, dynamicBytes <= 3 << 30,
       dynamicBytes % (128 << 20) == 0
     else { throw NativeFailure.unsupported }
     self.bootBytes = bootBytes

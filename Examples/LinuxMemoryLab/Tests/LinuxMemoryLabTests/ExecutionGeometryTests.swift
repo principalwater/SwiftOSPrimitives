@@ -24,32 +24,39 @@ import Testing
 @Test func geometryRefusesGPAOverlapAndAdvertisesActualDynamicWireCapacity() throws {
   for pair: (UInt64, UInt64) in [
     (128 << 20, 128 << 20), (4 << 30, 128 << 20), (1024 << 20, 0),
-    (1024 << 20, 3 << 30), (1025 << 20, 128 << 20), (1024 << 20, 129 << 20),
+    (1024 << 20, (3 << 30) + (128 << 20)),
+    (1025 << 20, 128 << 20), (1024 << 20, 129 << 20),
     (UInt64.max, UInt64.max),
   ] {
     #expect(throws: NativeFailure.self) {
       _ = try NativeMemoryGeometry(bootBytes: pair.0, dynamicBytes: pair.1)
     }
   }
-  let geometry = try NativeMemoryGeometry(bootBytes: 1024 << 20, dynamicBytes: 2 << 30)
-  let device = MemoryDevice(held: false, geometry: geometry)
-  let bytes = device.config()
-  // The virtio-mem ABI has region, usable and requested sizes at24/32/48bytes.
-  for offset in [24, 32, 48] {
+  for (boot, dynamic, wireBytes, countHigh): (UInt64, UInt64, UInt64, UInt8) in [
+    (1024 << 20, 2 << 30, 0x8000_0000, 4),
+    (512 << 20, 2560 << 20, 0xa000_0000, 5),
+    (256 << 20, 3 << 30, 0xc000_0000, 6),
+  ] {
+    let geometry = try NativeMemoryGeometry(bootBytes: boot, dynamicBytes: dynamic)
+    let device = MemoryDevice(held: false, geometry: geometry)
+    let bytes = device.config()
+    // Independent wire literals cover sizes and the final in-range/out-of-range block.
+    for offset in [24, 32, 48] {
+      #expect(
+        bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
+          == wireBytes.littleEndian)
+    }
+    var request = Data(count: 24)
+    request[0] = 3
+    request[12] = 1
+    request[17] = countHigh
     #expect(
-      bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt64.self) }
-        == UInt64(0x8000_0000).littleEndian)
+      try device.request(request, quiescence: (true, 0, 2))
+        == Data([0, 0, 0, 0, 0, 0, 0, 0, 1, 0]))
+    request[16] = 1
+    #expect(
+      try device.request(request, quiescence: (true, 0, 2))
+        == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+    #expect(device.plugged == 0 && device.observations.isEmpty)
   }
-  var request = Data(count: 24)
-  request[0] = 3
-  request[12] = 1
-  request[17] = 4  //1024blocks of2MiB, independent wire literal.
-  #expect(
-    try device.request(request, quiescence: (true, 0, 2))
-      == Data([0, 0, 0, 0, 0, 0, 0, 0, 1, 0]))
-  request[16] = 1
-  #expect(
-    try device.request(request, quiescence: (true, 0, 2))
-      == Data([3, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
-  #expect(device.plugged == 0 && device.observations.isEmpty)
 }

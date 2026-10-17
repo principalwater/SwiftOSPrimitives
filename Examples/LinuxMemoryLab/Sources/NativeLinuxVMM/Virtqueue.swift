@@ -1,11 +1,12 @@
 import Foundation
 
-// Only used while the sole vCPU is stopped; no asynchronous DMA or shared rings.
+// Only used while all vCPUs are parked; no asynchronous DMA or concurrent ring access.
 enum DeviceFailure: Error {
   case geometry, negotiation, request
   case native(Int32)
   case descriptor(String)
   case observation(String)
+  case reporting(offset: UInt64, write: UInt32?, status: UInt32, features: UInt64, reason: String)
 }
 
 struct GuestBuffer {
@@ -44,6 +45,7 @@ struct SplitQueue {
   }
 
   mutating func drain(
+    maximumBufferBytes: UInt32 = 1 << 20,
     memory: (UInt64, Int) throws -> UnsafeMutableRawPointer,
     process: ([GuestBuffer]) throws -> UInt32?
   ) throws -> Bool {
@@ -74,7 +76,7 @@ struct SplitQueue {
         let length = descriptor.loadUnaligned(fromByteOffset: 8, as: UInt32.self).littleEndian
         let flags = descriptor.loadUnaligned(fromByteOffset: 12, as: UInt16.self).littleEndian
         let next = descriptor.loadUnaligned(fromByteOffset: 14, as: UInt16.self).littleEndian
-        guard flags & ~3 == 0, length > 0, length <= 1 << 20,
+        guard flags & ~3 == 0, length > 0, length <= maximumBufferBytes,
           address <= UInt64.max - UInt64(length)
         else {
           throw DeviceFailure.descriptor("flags=\(flags) length=\(length) address=\(address)")
@@ -98,7 +100,7 @@ struct SplitQueue {
       usedRing.storeBytes(of: UInt32(head).littleEndian, toByteOffset: offset, as: UInt32.self)
       usedRing.storeBytes(of: written.littleEndian, toByteOffset: offset + 4, as: UInt32.self)
       completed &+= 1
-      // No other guest CPU or device thread exists; native re-entry follows these stores.
+      // All guest CPUs remain parked until synchronous device processing and these stores finish.
       usedRing.storeBytes(of: completed.littleEndian, toByteOffset: 2, as: UInt16.self)
       consumed &+= 1
       changed = true

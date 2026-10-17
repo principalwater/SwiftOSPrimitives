@@ -40,6 +40,9 @@ final class NativeControl: Sendable {
     var memoryControlRetired = false
     var memoryQuarantineApplied = false
     var backingRetiredBytes: UInt64 = 0
+    var recycledBackingBytes: UInt64 = 0
+    var recycledResidentBytes: UInt64 = 0
+    var recycledColdResidentBytes: UInt64 = 0
     var error = ""
     var result = Data()
     var commands: [Command] = []
@@ -58,16 +61,19 @@ final class NativeControl: Sendable {
   let alias: Bool
   let cpus: Int
   let geometry: NativeMemoryGeometry
+  let freePageReporting: Bool
   let executionPolicy: NativeExecutionPolicy
   let networks: [IsolatedNetwork]
 
   init(
     kernel: URL?, initfs: URL?, rootfs: URL, console: URL?, held: Bool, alias: Bool, cpus: Int = 1,
     networks: [IsolatedNetwork] = [], geometry: NativeMemoryGeometry = .qualification,
-    executionPolicy: NativeExecutionPolicy = .qualification, resources: NativeBootResources? = nil
+    executionPolicy: NativeExecutionPolicy = .qualification, resources: NativeBootResources? = nil,
+    freePageReporting: Bool = false
   ) {
     state = Mutex(State(requested: geometry.dynamicBytes))
     self.geometry = geometry
+    self.freePageReporting = freePageReporting
     self.executionPolicy = executionPolicy
     self.kernel = kernel
     self.initfs = initfs
@@ -85,7 +91,10 @@ final class NativeControl: Sendable {
     machine.capacity = Int(geometry.bootBytes)
     machine.executionPolicy = executionPolicy
     machine.cpuCount = cpus
-    machine.dynamicMemory = MemoryDevice(held: held, aliasControl: alias, geometry: geometry)
+    machine.dynamicMemory = MemoryDevice(
+      held: held, aliasControl: alias, geometry: geometry,
+      coldProvisioning: freePageReporting && !held)
+    if freePageReporting { machine.freePageReporting = FreePageReportingDevice() }
     let lease = NativeProcessLease.claimed.withLock { claimed -> Bool in
       guard !claimed else { return false }
       claimed = true
@@ -156,6 +165,16 @@ final class NativeControl: Sendable {
       "memoryObservationsTotal": machine.dynamicMemory?.observationsTotal ?? 0,
       "memoryRefusalsTotal": machine.dynamicMemory?.refusalsTotal ?? 0,
       "cumulativeBackingRetiredBytes": machine.dynamicMemory?.cumulativeBackingRetiredBytes ?? 0,
+      "freePageReportingEnabled": freePageReporting,
+      "freePageReports": machine.freePageReporting?.reports ?? 0,
+      "freePageReportedBytes": machine.freePageReporting?.reportedBytes ?? 0,
+      "freePageReportingObservations": machine.freePageReporting?.observations ?? [],
+      "freePagePoison": machine.freePageReporting?.poison ?? 0,
+      "recycledBackingBytes": machine.dynamicMemory?.recycledBackingBytes ?? 0,
+      "recycledResidentBytes": machine.dynamicMemory?.recycledResidentBytes ?? 0,
+      "recycledResidentBytesFromColdBacking": machine.dynamicMemory?.recycledColdResidentBytes ?? 0,
+      "recyclingObservations": machine.dynamicMemory?.recyclingObservations ?? [],
+      "recyclingObservationsTotal": machine.dynamicMemory?.recyclingObservationsTotal ?? 0,
       "networks": machine.networks.map {
         ["index": $0.index, "txPackets": $0.txPackets, "rxPackets": $0.rxPackets]
       },
@@ -196,6 +215,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public let group: MultiThreadedEventLoopGroup
   public let memoryGeometry: NativeMemoryGeometry
   public let executionPolicy: NativeExecutionPolicy
+  public let freePageReporting: Bool
   private let resources: NativeBootResources?
   private let owner = Mutex<NativeVirtualMachine?>(nil)
 
@@ -203,10 +223,11 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     kernel: URL, initfs: URL, console: URL, held: Bool = false,
     aliasControl: Bool = false, group: MultiThreadedEventLoopGroup,
     memoryGeometry: NativeMemoryGeometry = .qualification,
-    executionPolicy: NativeExecutionPolicy = .qualification
+    executionPolicy: NativeExecutionPolicy = .qualification, freePageReporting: Bool = false
   ) {
     self.memoryGeometry = memoryGeometry
     self.executionPolicy = executionPolicy
+    self.freePageReporting = freePageReporting
     self.kernel = kernel
     self.initfs = initfs
     self.console = console
@@ -219,7 +240,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
   public init(
     resources: NativeBootResources, group: MultiThreadedEventLoopGroup,
     memoryGeometry: NativeMemoryGeometry = .qualification,
-    executionPolicy: NativeExecutionPolicy = .sustained
+    executionPolicy: NativeExecutionPolicy = .sustained, freePageReporting: Bool = false
   ) {
     self.resources = resources
     kernel = nil
@@ -230,6 +251,7 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     self.group = group
     self.memoryGeometry = memoryGeometry
     self.executionPolicy = executionPolicy
+    self.freePageReporting = freePageReporting
   }
   public var instance: NativeVirtualMachine? { owner.withLock { $0 } }
   public func create(config: some VMCreationConfig) async throws -> any VirtualMachineInstance {
@@ -267,7 +289,8 @@ public final class NativeVirtualMachineManager: VirtualMachineManager {
     let control = NativeControl(
       kernel: kernel, initfs: initfs, rootfs: URL(filePath: mount.source),
       console: console, held: held, alias: aliasControl, cpus: config.cpus, networks: networks,
-      geometry: memoryGeometry, executionPolicy: executionPolicy, resources: resources)
+      geometry: memoryGeometry, executionPolicy: executionPolicy, resources: resources,
+      freePageReporting: freePageReporting)
     let machine = NativeVirtualMachine(
       control: control, group: group, id: entry.key,
       attachments: attachments)
@@ -307,6 +330,14 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       ?? Data()
   }
   public var memoryGeometry: NativeMemoryGeometry { control.geometry }
+  /// Cumulative native object retirement; resident pages are observations, not global free RAM.
+  public var backingRecyclingStatus:
+    (bytes: UInt64, residentBytes: UInt64, coldResidentBytes: UInt64)
+  {
+    control.state.withLock {
+      ($0.recycledBackingBytes, $0.recycledResidentBytes, $0.recycledColdResidentBytes)
+    }
+  }
   public var processorCount: Int { control.cpus }
   public var networkCount: Int { control.networks.count }
   public var aliasDiagnosticEnabled: Bool { control.alias }

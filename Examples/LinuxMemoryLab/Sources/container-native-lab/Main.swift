@@ -24,13 +24,20 @@ import NativeLinuxVMM
   static func run() async throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 5 else { throw Failure.arguments }
-    let pressureWide = ["continuous-pressure-wide", "continuous-pressure-protected"]
+    let reporting = [
+      "memory-reporting", "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
+    ].contains(args[4])
+    let pressureWide = [
+      "continuous-pressure-wide", "continuous-pressure-protected", "continuous-pressure-reporting",
+      "continuous-pressure-reporting-small-boot",
+    ]
       .contains(args[4])
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
         || [6, 8].contains(args.count)
           && [
-            "memory", "held", "alias", "crash", "recover", "adaptive", "adaptive-busy",
+            "memory", "memory-reporting", "held", "alias", "crash", "recover", "adaptive",
+            "adaptive-busy",
             "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
             "continuous-stop",
             "continuous-churn",
@@ -38,18 +45,23 @@ import NativeLinuxVMM
             "continuous-sustained",
             "continuous-pressure-wide",
             "continuous-pressure-protected",
+            "continuous-pressure-reporting",
+            "continuous-pressure-reporting-small-boot",
             "continuous-uart", "memory-wide",
             "memory-boot-wide",
           ].contains(args[4])
     else { throw Failure.arguments }
-    guard !pressureWide || args.count == 8 else {
+    guard !(pressureWide || reporting) || args.count == 8 else {
       throw Failure.arguments
     }
     if args.count == 8 {
       guard args[6] == "--boot-directory",
         [
-          "memory", "adaptive", "continuous", "continuous-sustained", "memory-wide",
+          "memory", "memory-reporting", "adaptive", "continuous", "continuous-sustained",
+          "memory-wide",
           "memory-boot-wide", "continuous-pressure-wide", "continuous-pressure-protected",
+          "continuous-pressure-reporting",
+          "continuous-pressure-reporting-small-boot",
           "crash", "recover",
         ].contains(args[4])
       else { throw Failure.arguments }
@@ -68,8 +80,11 @@ import NativeLinuxVMM
     else { throw Failure.arguments }
     let geometry: NativeMemoryGeometry
     switch args[4] {
-    case "memory-wide", "continuous-pressure-wide", "continuous-pressure-protected":
+    case "memory-wide", "continuous-pressure-wide", "continuous-pressure-protected",
+      "continuous-pressure-reporting":
       geometry = try .init(bootBytes: 1024 << 20, dynamicBytes: 2 << 30)
+    case "continuous-pressure-reporting-small-boot":
+      geometry = try .init(bootBytes: 512 << 20, dynamicBytes: 2560 << 20)
     case "memory-boot-wide":
       geometry = try .init(bootBytes: 2 << 30, dynamicBytes: 256 << 20)
     default: geometry = .qualification
@@ -86,12 +101,14 @@ import NativeLinuxVMM
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     let manager: NativeVirtualMachineManager
     let policy: NativeExecutionPolicy =
-      ["continuous-sustained", "continuous-pressure-wide", "continuous-pressure-protected"]
+      ["continuous-sustained", "continuous-pressure-wide", "continuous-pressure-protected",
+        "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot"]
         .contains(args[4])
       ? .sustained : .qualification
     if let resources {
       manager = NativeVirtualMachineManager(
-        resources: resources, group: group, memoryGeometry: geometry, executionPolicy: policy)
+        resources: resources, group: group, memoryGeometry: geometry, executionPolicy: policy,
+        freePageReporting: reporting)
     } else {
       manager = NativeVirtualMachineManager(
         kernel: URL(filePath: args[0]), initfs: URL(filePath: args[1]),

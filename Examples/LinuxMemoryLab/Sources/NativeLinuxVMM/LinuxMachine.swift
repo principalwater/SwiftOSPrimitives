@@ -40,6 +40,7 @@ final class LinuxMachine {
     set { osLocks[activeCPU] = newValue }
   }
   var dynamicMemory: MemoryDevice?
+  var freePageReporting: FreePageReportingDevice?
   var disk: BlockDevice?
   var rootDisk: BlockDevice?
   var vsock: VsockDevice?
@@ -293,7 +294,7 @@ final class LinuxMachine {
       memoryBytes: UInt64(capacity),
       initrd: initrdAddress..<(initrdAddress + UInt64(initrd.count)), command: command,
       memoryDevice: dynamicMemory != nil, blockDevice: disk != nil, container: control != nil,
-      cpuCount: cpuCount, networkCount: networks.count)
+      cpuCount: cpuCount, networkCount: networks.count, freePageReporting: freePageReporting != nil)
     guard kernel.count < 100 << 20, initrd.count < 64 << 20 else { throw Failure.arguments }
     let textOffset = kernel[8..<16].enumerated().reduce(UInt64(0)) {
       $0 | (UInt64($1.element) << ($1.offset * 8))
@@ -332,6 +333,9 @@ final class LinuxMachine {
         let update = control.state.withLock { state in
           state.plugged = dynamicMemory?.plugged ?? 0
           state.backingRetiredBytes = dynamicMemory?.cumulativeBackingRetiredBytes ?? 0
+          state.recycledBackingBytes = dynamicMemory?.recycledBackingBytes ?? 0
+          state.recycledResidentBytes = dynamicMemory?.recycledResidentBytes ?? 0
+          state.recycledColdResidentBytes = dynamicMemory?.recycledColdResidentBytes ?? 0
           return (state.stop, state.requested, state.memoryControlRetired)
         }
         if update.0 { break }
@@ -436,6 +440,33 @@ final class LinuxMachine {
       let address = event.physicalAddress
       let rt = UInt32((syndrome >> 16) & 31)
       let width = 1 << Int((syndrome >> 22) & 3)
+      if address >= 0x0a00_6000, address < 0x0a00_7000,
+        let reporting = freePageReporting, let memory = dynamicMemory
+      {
+        try requireStopped()
+        try synchronizeMemoryQuarantine()
+        let write = syndrome & 64 != 0
+        let offset = address - 0x0a00_6000
+        let supplied: UInt32? = write
+          ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt))) : nil
+        let value: UInt64
+        do {
+          value = try reporting.access(
+            offset, width: width, write: supplied,
+            boot: base..<(base + UInt64(capacity)), memory: memory, metadata: pointer,
+            quiescence: (cpus?.isQuiescent ?? false, cpus?.epoch ?? 0, cpuCount))
+        } catch {
+          throw DeviceFailure.reporting(
+            offset: offset, write: supplied, status: reporting.transport.status,
+            features: reporting.transport.driverFeatures, reason: String(describing: error))
+        }
+        try check(
+          hv_gic_set_spi(reporting.transport.interrupt, reporting.transport.interruptStatus != 0),
+          "reporting-irq")
+        if !write, rt != 31 { try set(hv_reg_t(rawValue: rt), value) }
+        try set(HV_REG_PC, register(HV_REG_PC) + 4)
+        return
+      }
       if address >= 0x0a00_4000, address < 0x0a00_6000 {
         let index = Int((address - 0x0a00_4000) / 0x1000)
         guard networks.indices.contains(index) else { throw Failure.boundary }
@@ -623,6 +654,13 @@ public enum StandaloneLab {
   }
   private static func run() throws {
     let args = CommandLine.arguments
+    if args.count == 4,
+      ["--memory-device-check", "--memory-device-check-cold"].contains(args[1])
+    {
+      try NativeMemoryDeviceCheck.run(
+        image: args[2], destination: args[3], coldProvisioning: args[1].hasSuffix("-cold"))
+      return
+    }
     guard (4...6).contains(args.count) else { throw Failure.arguments }
     let output = URL(filePath: args[3])
     guard !FileManager.default.fileExists(atPath: output.path) else { throw Failure.arguments }

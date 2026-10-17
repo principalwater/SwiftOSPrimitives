@@ -86,7 +86,10 @@ extension Lab {
     probe: URL, mode: String
   ) async throws -> Bool {
     let geometry = vm.memoryGeometry
-    let protectedCapacity = mode == "continuous-pressure-protected"
+    let reporting = [
+      "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
+    ].contains(mode)
+    let protectedCapacity = mode == "continuous-pressure-protected" || reporting
     let pressureWide = mode == "continuous-pressure-wide" || protectedCapacity
     let memoryLimit: UInt64 = (pressureWide ? 2816 : 896) << 20
     var commands: [[String: String]] = []
@@ -102,6 +105,8 @@ extension Lab {
       "continuous-expire", "continuous-expired-stop", "continuous-unsettled",
       "continuous-sustained", "continuous-uart", "continuous-pressure-wide",
       "continuous-pressure-protected",
+      "continuous-pressure-reporting",
+      "continuous-pressure-reporting-small-boot",
     ].contains(mode)
     var churn: [[String: UInt64]] = []
     var expectedGracefulStop = false
@@ -646,8 +651,18 @@ extension Lab {
       for cycle
         in (expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry ? [] : [1, 2])
       {
+        if mode == "memory-reporting" {
+          let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+          while vm.backingRecyclingStatus.bytes == 0 {
+            guard ContinuousClock.now < deadline else {
+              throw Failure.check("reporting did not precede unplug control")
+            }
+            try await Task.sleep(for: .milliseconds(20))
+          }
+        }
         var pressurePeakGuest: UInt64 = 0
         var pressurePeakBacking: UInt64 = 0
+        var peakRecycledResidentBytes: UInt64 = 0
         if pressureWide {
           // Sixteen 128 MiB policy steps need their own aggregate phase fence;
           // the governor's wire/completion/drain fences remain unchanged.
@@ -711,6 +726,13 @@ extension Lab {
           pressurePeakGuest = try await verify("OBS")
           guard pressurePeakGuest == initialMemory else { throw Failure.check("pressure growth") }
           pressurePeakBacking = vm.memoryControlStatus.backingRetiredBytes
+          peakRecycledResidentBytes = vm.backingRecyclingStatus.coldResidentBytes
+          if reporting {
+            commands.append([
+              "reportingPeakRecycledResidentBytes": String(peakRecycledResidentBytes),
+              "capturedAt": String(now()),
+            ])
+          }
           try await resourceSnapshot("pressure-peak-\(cycle)")
         }
         let queryID = "swiftos-load-\(cycle)"
@@ -737,6 +759,27 @@ extension Lab {
           // This releases the workload's allocator pages; VM capacity changes remain autonomous.
           _ = try await sql(container, query: "SYSTEM JEMALLOC PURGE")
           if protectedCapacity {
+            if reporting {
+              let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+              while vm.backingRecyclingStatus.coldResidentBytes - peakRecycledResidentBytes < 1 << 30
+              {
+                guard observer?.status.failure.isEmpty == true else {
+                  throw Failure.check("reporting observer failed")
+                }
+                guard ContinuousClock.now < deadline else {
+                  commands.append([
+                    "reportingDeadlineRecycledResidentBytes": String(
+                      vm.backingRecyclingStatus.coldResidentBytes), "capturedAt": String(now()),
+                  ])
+                  throw Failure.check("reported resident backing did not return")
+                }
+                try await Task.sleep(for: .milliseconds(5))
+              }
+              let active = try await loadState(cycle: cycle)
+              guard active.0 == 1, active.1 >= 16 << 20 else {
+                throw Failure.check("SQL not live during reporting")
+              }
+            }
             let aggregate = try await activeLoad!.value
             activeLoad = nil
             try await waitObserver(geometry.dynamicBytes)
@@ -751,6 +794,8 @@ extension Lab {
             observations.append([
               "cycle": cycle, "pressureTableRows": 557056, "heldPressureBytes": 2176 << 20,
               "protectedCapacity": true, "retiredBackingBytes": 0,
+              "reportedResidentBytesRecycled": vm.backingRecyclingStatus.coldResidentBytes
+                - peakRecycledResidentBytes,
               "regrownGuestBytes": pressurePeakGuest, "shrunkGuestBytes": retained,
               "activeQueryMemoryBytes": observed, "workloadAllocatorPurgeRequested": true,
               "integrity": expected, "loadResult": aggregate,
@@ -1018,6 +1063,24 @@ extension Lab {
       memoryMonitor = nil
     } catch {
       primary = String(describing: error)
+      if reporting, case Failure.check(let reason) = error,
+        reason == "reported resident backing did not return"
+      {
+        // Preserve the failed eight-second gate; later observations cannot turn it into a pass.
+        let diagnosticBegan = ContinuousClock.now
+        do {
+          for delay in [0, 10, 20, 30] {
+            try await Task.sleep(until: diagnosticBegan.advanced(by: .seconds(delay)))
+            commands.append([
+              "reportingDiagnosticSecondsAfterFailure": String(delay),
+              "recycledResidentBytes": String(vm.backingRecyclingStatus.coldResidentBytes),
+              "capturedAt": String(now()),
+            ])
+            print("REPORTING_FOLLOWUP \(delay) \(vm.backingRecyclingStatus.residentBytes)")
+            fflush(nil)
+          }
+        } catch { memoryDiagnostics.append(["reportingFollowupError": String(describing: error)]) }
+      }
       if pressureWide {
         for (name, query) in [
           (

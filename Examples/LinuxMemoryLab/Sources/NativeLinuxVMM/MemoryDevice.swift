@@ -14,10 +14,12 @@ final class MemoryDevice {
     var mapped = false
     var plugged = false
     var freshAllocation = false
+    var initializedByHost = false
   }
   let thread = pthread_self()
   let held: Bool
   let aliasControl: Bool
+  let coldProvisioning: Bool
   var aliasAddress: UInt64?
   var aliasReleased = false
   private var refusalHistory = RecentHistory<[String: Any]>(capacity: 128)
@@ -32,18 +34,26 @@ final class MemoryDevice {
   var observations: [[String: Any]] { observationHistory.elements }
   var observationsTotal: UInt64 { observationHistory.totalCount }
   private(set) var cumulativeBackingRetiredBytes: UInt64 = 0
+  private var recyclingHistory = RecentHistory<[String: Any]>(capacity: 1024)
+  var recyclingObservations: [[String: Any]] { recyclingHistory.elements }
+  var recyclingObservationsTotal: UInt64 { recyclingHistory.totalCount }
+  private(set) var recycledBackingBytes: UInt64 = 0
+  private(set) var recycledResidentBytes: UInt64 = 0
+  private(set) var recycledColdResidentBytes: UInt64 = 0
   private(set) var quarantined = false
   private(set) var quarantineRecord: [String: UInt64] = [:]
-  var plugged: UInt64 { UInt64(extents.filter(\.plugged).count * Self.block) }
+  var plugged: UInt64 { extents.reduce(0) { $0 + ($1.plugged ? UInt64(Self.block) : 0) } }
 
   init(
-    held: Bool, aliasControl: Bool = false, geometry: NativeMemoryGeometry = .qualification
+    held: Bool, aliasControl: Bool = false, geometry: NativeMemoryGeometry = .qualification,
+    coldProvisioning: Bool = false
   ) {
     capacity = Int(geometry.dynamicBytes)
     requested = geometry.dynamicBytes
     extents = (0..<(Int(geometry.dynamicBytes) / Self.block)).map { _ in Extent() }
     self.held = held
     self.aliasControl = aliasControl
+    self.coldProvisioning = coldProvisioning
   }
 
   private func native(_ result: Int32) throws {
@@ -151,8 +161,13 @@ final class MemoryDevice {
     try native(
       mach_vm_inherit(
         mach_task_self_, UInt64(UInt(bitPattern: pointer)), UInt64(Self.block), VM_INHERIT_NONE))
-    // Held pages also regain zero semantics, never expose an old guest's data.
-    memset(pointer, 0, Self.block)
+    // Fresh anonymous backing supplies zeroes lazily; reused held pages must be cleared.
+    if !coldProvisioning || !extent.freshAllocation {
+      memset(pointer, 0, Self.block)
+      extent.initializedByHost = true
+    } else {
+      extent.initializedByHost = false
+    }
     // Ordinary Linux RAM: guest stage1 enforces code permissions; host alias stays RW/NX.
     try native(
       hv_vm_map(
@@ -230,10 +245,13 @@ final class MemoryDevice {
     }
   }
   private func retire(
-    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int)
+    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int), replacing: Bool = false
   ) throws -> Bool {
-    guard observationHistory.remainingCounterValues >= UInt64(indices.count),
-      UInt64.max - cumulativeBackingRetiredBytes >= UInt64(indices.count) * UInt64(Self.block),
+    let remaining = replacing ? recyclingHistory.remainingCounterValues
+      : observationHistory.remainingCounterValues
+    let cumulative = replacing ? recycledBackingBytes : cumulativeBackingRetiredBytes
+    guard !replacing || !held, remaining >= UInt64(indices.count),
+      UInt64.max - cumulative >= UInt64(indices.count) * UInt64(Self.block),
       indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
       )
     else { throw DeviceFailure.request }
@@ -253,7 +271,7 @@ final class MemoryDevice {
       try restore(unmapped)
       try refusalHistory.append([
         "reason": refusal.detail, "unmappedThenRestored": unmapped.count,
-        "ownedBytesDeallocated": 0, "reply": "BUSY",
+        "ownedBytesDeallocated": 0, "reply": replacing ? "REPORT_SKIPPED" : "BUSY",
       ])
       return false
     }
@@ -262,34 +280,93 @@ final class MemoryDevice {
       let index = plan.index
       let extent = extents[index]
       let before = try ProcessMemorySnapshot.capture()
+      let previouslyInitializedByHost = extent.initializedByHost
+      let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
+      guard pageSize > 0, Self.block % pageSize == 0 else { throw DeviceFailure.geometry }
+      let residentBefore = UInt64(plan.info.pages_resident) * UInt64(pageSize)
+      guard residentBefore <= UInt64(Self.block) else { throw DeviceFailure.geometry }
       if !held {
         try native(hv_vm_deallocate(plan.pointer, Self.block))
         extent.pointer = nil
         try requireAbsent(UInt64(UInt(bitPattern: plan.pointer)))
       }
-      extent.plugged = false
+      var replacementResidentBytes: UInt64?
+      if replacing {
+        try native(hv_vm_allocate(&extent.pointer, Self.block, 0))
+        guard let pointer = extent.pointer else { throw DeviceFailure.request }
+        try native(
+          mach_vm_inherit(
+            mach_task_self_, UInt64(UInt(bitPattern: pointer)), UInt64(Self.block),
+            VM_INHERIT_NONE))
+        try native(
+          hv_vm_map(
+            pointer, Self.base + UInt64(index * Self.block), Self.block,
+            UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
+        extent.mapped = true
+        extent.freshAllocation = true
+        extent.initializedByHost = false
+        replacementResidentBytes = try withUnsafeTemporaryAllocation(
+          of: Int8.self, capacity: Self.block / pageSize
+        ) { pages in
+          pages.initialize(repeating: 0)
+          guard mincore(pointer, Self.block, pages.baseAddress!) == 0 else {
+            throw DeviceFailure.native(errno)
+          }
+          return pages.reduce(UInt64(0)) { $0 + ($1 & 1 != 0 ? UInt64(pageSize) : 0) }
+        }
+        // No host writes: fresh anonymous zeroes must remain cold before guest ACK/resume.
+        guard replacementResidentBytes == 0 else {
+          throw DeviceFailure.observation("replacement-not-cold")
+        }
+      } else {
+        extent.plugged = false
+      }
       let after = try ProcessMemorySnapshot.capture()
-      if !held { cumulativeBackingRetiredBytes += UInt64(Self.block) }
-      try observationHistory.append([
+      if replacing {
+        recycledBackingBytes += UInt64(Self.block)
+        recycledResidentBytes += residentBefore
+        if !previouslyInitializedByHost { recycledColdResidentBytes += residentBefore }
+      } else if !held {
+        cumulativeBackingRetiredBytes += UInt64(Self.block)
+      }
+      let observation: [String: Any] = [
         "allVCPUsParked": quiescence.parked, "quiescentEpoch": quiescence.epoch,
         "vcpuCount": quiescence.cpus,
         "index": index, "held": held,
         "nativeEntryBytes": plan.size, "nativeObjectOffset": plan.info.offset,
-        "freshAllocation": extent.freshAllocation, "hostInitializedBytes": Self.block,
-        "residentObservationIncludesHostZeroing": true, "oldVirtualRangeAbsent": !held,
+        "freshAllocation": extent.freshAllocation,
+        "hostInitializedBytes": previouslyInitializedByHost ? Self.block : 0,
+        "residentObservationIncludesHostZeroing": previouslyInitializedByHost,
+        "replacementHostInitializedBytes": replacing ? 0 : NSNull(),
+        "oldVirtualRangeAbsent": !held,
+        "sameGPAMappedBeforeAcknowledgement": replacing && extent.mapped,
+        "replacementResidentBytes": replacementResidentBytes.map { $0 as Any } ?? NSNull(),
         "objectID": plan.info.object_id_full,
         "residentPagesBefore": plan.info.pages_resident,
         "pagedOutPagesBefore": plan.info.pages_swapped_out,
-        "residentBytesObservedBefore": UInt64(plan.info.pages_resident)
-          * UInt64(sysconf(Int32(_SC_PAGESIZE))),
+        "residentBytesObservedBefore": residentBefore,
         "ownerVirtualBytesDeallocated": held ? 0 : Self.block,
         "referenceCount": plan.info.ref_count,
         "footprintBefore": before.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
         "footprintAfter": after.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
         "physicalReleasedBytes": NSNull(),
-      ])
+      ]
+      if replacing { try recyclingHistory.append(observation) }
+      else { try observationHistory.append(observation) }
     }
     return true
+  }
+  /// Guest ownership is supplied by a synchronous REPORTING queue, never by free-byte telemetry.
+  func recycleReported(
+    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int)
+  ) throws {
+    try confined()
+    guard quiescence.parked, quiescence.epoch >= 0, (1...4).contains(quiescence.cpus),
+      indices.count <= extents.count, Set(indices).count == indices.count,
+      indices.allSatisfy({ extents.indices.contains($0) })
+    else { throw DeviceFailure.request }
+    if quarantined || indices.isEmpty { return }
+    _ = try retire(indices, quiescence: quiescence, replacing: true)
   }
   private func requireAbsent(_ original: UInt64) throws {
     var start = original
@@ -328,6 +405,7 @@ final class MemoryDevice {
         extent.pointer = nil
       }
       extent.plugged = false
+      extent.initializedByHost = false
     }
   }
 }
