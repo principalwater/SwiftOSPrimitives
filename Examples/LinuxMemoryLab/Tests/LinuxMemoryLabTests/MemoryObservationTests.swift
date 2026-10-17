@@ -13,7 +13,8 @@ func memoryTelemetryProgressesDuringForegroundAllocation(refresh: Bool)
   let diagnostic = MemoryProbeSession(input: input, output: output, cpus: 2)
   let monitorInput = NativeMemoryInput()
   let monitorOutput = NativeMemoryOutput()
-  let monitor = NativeMemorySession(input: monitorInput, output: monitorOutput)
+  let monitor = try NativeMemorySession(
+    input: monitorInput, output: monitorOutput, maximumGuestBytes: 1000)
   defer {
     input.finish()
     monitorInput.finish()
@@ -62,12 +63,14 @@ func memoryTelemetryProgressesDuringForegroundAllocation(refresh: Bool)
     "MEMORY_OK 1 1000 1001\n", "MEMORY_OK 1 0 0\n",
     "MEMORY_OK  1 1000 900\n", "MEMORY_OK 1 01000 900\n",
     "MEMORY_OK 1 1000 900 \n",
+    "MEMORY_OK 1 1001 900\n",
   ]) func invalidMemoryTelemetryClosesWire(_ invalid: String) async throws
 {
   let input = NativeMemoryInput()
   defer { input.finish() }
   let output = NativeMemoryOutput()
-  let monitor = NativeMemorySession(input: input, output: output)
+  let monitor = try NativeMemorySession(
+    input: input, output: output, maximumGuestBytes: 1000)
   try output.write(Data("MEMORY_READY 1000 900\n".utf8))
   try await monitor.start()
   var wire = input.stream().makeAsyncIterator()
@@ -88,7 +91,8 @@ func noncanonicalMemoryReadinessCannotOpenTheSession(_ invalid: String) async th
   let input = NativeMemoryInput()
   defer { input.finish() }
   let output = NativeMemoryOutput()
-  let monitor = NativeMemorySession(input: input, output: output)
+  let monitor = try NativeMemorySession(
+    input: input, output: output, maximumGuestBytes: 1000)
   try output.write(Data(invalid.utf8))
   await #expect(throws: NativeControlFailure.framing) { try await monitor.start() }
   await monitor.close()
@@ -99,7 +103,8 @@ func aClosedMemoryWireCannotPublishLiveTelemetry(afterReadiness: Bool) async thr
   let input = NativeMemoryInput()
   defer { input.finish() }
   let output = NativeMemoryOutput()
-  let monitor = NativeMemorySession(input: input, output: output)
+  let monitor = try NativeMemorySession(
+    input: input, output: output, maximumGuestBytes: 1000)
   try output.write(Data("MEMORY_READY 1000 900\n".utf8))
   if afterReadiness {
     try await monitor.start()
@@ -122,7 +127,8 @@ func aFinalQuitAcknowledgementSurvivesItsFollowingEOF() async throws {
   let input = NativeMemoryInput()
   defer { input.finish() }
   let output = NativeMemoryOutput()
-  let monitor = NativeMemorySession(input: input, output: output)
+  let monitor = try NativeMemorySession(
+    input: input, output: output, maximumGuestBytes: 1000)
   try output.write(Data("MEMORY_READY 1000 900\n".utf8))
   try await monitor.start()
   var wire = input.stream().makeAsyncIterator()
@@ -134,12 +140,39 @@ func aFinalQuitAcknowledgementSurvivesItsFollowingEOF() async throws {
   #expect(await wire.next() == nil)
 }
 
+@Test func zeroGuestCapacityCannotAdmitAMemorySession() {
+  let input = NativeMemoryInput()
+  defer { input.finish() }
+  #expect(throws: NativeControlFailure.arguments) {
+    try NativeMemorySession(input: input, output: NativeMemoryOutput(), maximumGuestBytes: 0)
+  }
+}
+
+@Test(.timeLimit(.minutes(1)))
+func guestReadinessCannotExceedTheOwnersConfiguredCapacity() async throws {
+  let input = NativeMemoryInput()
+  defer { input.finish() }
+  let output = NativeMemoryOutput()
+  let monitor = try NativeMemorySession(
+    input: input, output: output, maximumGuestBytes: 1000)
+  try output.write(Data("MEMORY_READY 1001 900\n".utf8))
+  await #expect(throws: NativeControlFailure.framing) { try await monitor.start() }
+  await #expect(throws: NativeControlFailure.disconnected) {
+    try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1)))
+  }
+  var wire = input.stream().makeAsyncIterator()
+  // Retiring even a rejected READY prevents callers from queuing any later command.
+  await monitor.close()
+  #expect(await wire.next() == nil)
+}
+
 @Test(.timeLimit(.minutes(1)), arguments: [false, true])
 func abandonedMemoryTelemetryCannotConsumeLateReply(cancel: Bool) async throws {
   let input = NativeMemoryInput()
   defer { input.finish() }
   let output = NativeMemoryOutput()
-  let monitor = NativeMemorySession(input: input, output: output)
+  let monitor = try NativeMemorySession(
+    input: input, output: output, maximumGuestBytes: 1000)
   try output.write(Data("MEMORY_READY 1000 900\n".utf8))
   try await monitor.start()
   var wire = input.stream().makeAsyncIterator()

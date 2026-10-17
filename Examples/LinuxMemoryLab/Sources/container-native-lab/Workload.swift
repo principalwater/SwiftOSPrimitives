@@ -428,7 +428,8 @@ extension Lab {
       if autonomousBalloon {
         let monitorInput = NativeMemoryInput()
         let monitorOutput = NativeMemoryOutput()
-        let telemetry = NativeMemorySession(input: monitorInput, output: monitorOutput)
+        let telemetry = try NativeMemorySession(
+          input: monitorInput, output: monitorOutput, maximumGuestBytes: geometry.maximumBytes)
         memorySession = telemetry
         memoryMonitor = try await container.exec("memory-monitor") { config in
           config.arguments = [guestProbe, "--memory-monitor"]
@@ -459,8 +460,8 @@ extension Lab {
       if continuous {
         let monitorInput = NativeMemoryInput()
         let monitorOutput = NativeMemoryOutput()
-        let telemetry = NativeMemorySession(
-          input: monitorInput, output: monitorOutput)
+        let telemetry = try NativeMemorySession(
+          input: monitorInput, output: monitorOutput, maximumGuestBytes: geometry.maximumBytes)
         memorySession = telemetry
         memoryMonitor = try await container.exec("memory-monitor") { config in
           config.arguments = [guestProbe, "--memory-monitor"]

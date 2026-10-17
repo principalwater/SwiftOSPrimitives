@@ -181,3 +181,25 @@ were unchanged. Host UUID BFA0D688-B244-3924-812D-96B2A27DBE63 and the same gues
 ELF cover all four cases. This qualifies finite startup admission, not seccomp,
 network namespaces, OOM accounting, sustained resource limits, a production
 process owner, autonomous ballooning or physical free-list attribution.
+
+
+## Configured guest-capacity boundary
+
+NativeMemorySession now requires an explicit nonzero maximumGuestBytes at
+construction; both real workload callers supply their VM geometry's configured
+maximum. READY and every MEMORY_OK must stay at or below it. Available <= total
+alone cannot prove that a report describes the intended VM. This permits a
+changing online MemTotal while preserving its immutable configured upper bound.
+
+The behavior-preserving constructor-parameter addition first stored the limit
+without enforcing it, allowing real owner-boundary BEFORE evidence: zero capacity,
+oversized READY and oversized ACK were accepted (three failed declarations,
+seven issues,153.311s including recompilation). The retained source patch records
+that intermediate state. Constructor validation and shared READY/ACK bounds then
+passed the focused regressions in50.932s and the complete118-declaration release
+suite in18.593s (13.732s actual tests), zero warnings/errors. All six existing
+session fixtures retain their positive1000-byte limit control. EOF, canonical
+framing, exact sequence, cancellation, original deadlines and final QUIT+EOF
+remain covered. The Product consumer's full96 declarations also passed after
+recompilation in63.912s. No guest ELF, PageMemory/BoundedMemory ownership or CPUGroup
+behavior changed in this capacity slice.

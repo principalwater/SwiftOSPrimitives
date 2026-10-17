@@ -21,14 +21,20 @@ public struct NativeMemoryObservation: Sendable {
 public actor NativeMemorySession {
   private let input: NativeMemoryInput
   private let output: NativeMemoryOutput
+  private let maximumGuestBytes: UInt64
   private var sequence: UInt64 = 0
   private var ready = false
   private var busy = false
   private var closed = false
 
-  public init(input: NativeMemoryInput, output: NativeMemoryOutput) {
+  /// The owner supplies the VM's configured maximum, including all potentially online memory.
+  public init(
+    input: NativeMemoryInput, output: NativeMemoryOutput, maximumGuestBytes: UInt64
+  ) throws {
+    guard maximumGuestBytes > 0 else { throw NativeControlFailure.arguments }
     self.input = input
     self.output = output
+    self.maximumGuestBytes = maximumGuestBytes
   }
 
   private func line(
@@ -53,7 +59,8 @@ public actor NativeMemorySession {
       let text = try await line(until: deadline)
       let words = text.split(separator: " ")
       guard words.count == 3, words[0] == "MEMORY_READY", let total = UInt64(words[1]),
-        total > 0, let available = UInt64(words[2]), available <= total,
+        total > 0, total <= maximumGuestBytes,
+        let available = UInt64(words[2]), available <= total,
         text == "MEMORY_READY \(total) \(available)"
       else { throw NativeControlFailure.framing }
       try Task.checkCancellation()
@@ -98,7 +105,8 @@ public actor NativeMemorySession {
       let words = text.split(separator: " ")
       try Task.checkCancellation()
       guard !closed, words.count == 4, words[0] == "MEMORY_OK",
-        words[1] == Substring(String(sequence)), let total = UInt64(words[2]), total > 0,
+        words[1] == Substring(String(sequence)), let total = UInt64(words[2]),
+        total > 0, total <= maximumGuestBytes,
         let available = UInt64(words[3]), available <= total,
         text == "MEMORY_OK \(sequence) \(total) \(available)"
       else { throw NativeControlFailure.framing }
