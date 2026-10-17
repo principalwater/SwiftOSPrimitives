@@ -115,3 +115,25 @@ Canonical-spec semantic tests must exercise the real policy, not copy a fixture
 that supplies the answer. PhysicalReleasedBytes remains null.
 
 Kernel source reference: [stat_refresh documentation](https://docs.kernel.org/admin-guide/sysctl/vm.html#stat-refresh).
+
+## Host memory-session EOF and canonical framing repair
+
+The host session now refuses already-closed transports for READY and live
+observations, even if a syntactically valid line was buffered before EOF. Generic
+stream consumers keep their normal final-frame draining; QUIT alone may accept
+its exact final acknowledgement followed by EOF. This closes known-dead telemetry
+without confusing orderly process exit with a fresh liveness observation.
+
+READY and MEMORY_OK must match their canonical decimal rendering exactly: extra
+spaces, trailing spaces and leading zeros are refused. Completion must still be
+inside the original host deadline after parsing; cancellation and failure retire
+the command stream rather than consuming a later reply.
+
+The BEFORE release run failed on buffered EOF and three malformed forms in each
+frame family (14 issues, retained raw log); its valid QUIT+EOF control passed.
+After the shared repair the six selected declarations and parameter cases passed
+in 99.711 seconds including compilation. The complete release suite then passed
+114 declarations in 23.178 seconds (18.126 seconds actual tests), zero warnings
+or errors. The collector has no validated Swift Testing event mapping for this
+toolchain, so the retained raw log is the test evidence. No memory ownership or
+RAM reclamation API changed. Actual service-owner integration remains open.

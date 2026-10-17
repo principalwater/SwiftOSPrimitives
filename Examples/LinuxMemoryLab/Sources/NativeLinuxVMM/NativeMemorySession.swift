@@ -31,11 +31,13 @@ public actor NativeMemorySession {
     self.output = output
   }
 
-  private func line(until deadline: ContinuousClock.Instant) async throws -> String {
+  private func line(
+    until deadline: ContinuousClock.Instant, allowAfterClose: Bool = false
+  ) async throws -> String {
     while ContinuousClock.now < deadline {
       try Task.checkCancellation()
       guard !closed else { throw NativeControlFailure.disconnected }
-      if let text = try output.takeLine() { return text }
+      if let text = try output.takeLine(allowAfterClose: allowAfterClose) { return text }
       try await Task.sleep(for: .milliseconds(5))
     }
     throw NativeControlFailure.wireTimedOut
@@ -47,10 +49,15 @@ public actor NativeMemorySession {
     busy = true
     defer { busy = false }
     do {
-      let words = try await line(until: .now.advanced(by: .seconds(5))).split(separator: " ")
+      let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+      let text = try await line(until: deadline)
+      let words = text.split(separator: " ")
       guard words.count == 3, words[0] == "MEMORY_READY", let total = UInt64(words[1]),
-        total > 0, let available = UInt64(words[2]), available <= total
+        total > 0, let available = UInt64(words[2]), available <= total,
+        text == "MEMORY_READY \(total) \(available)"
       else { throw NativeControlFailure.framing }
+      try Task.checkCancellation()
+      guard ContinuousClock.now < deadline else { throw NativeControlFailure.wireTimedOut }
       ready = true
     } catch {
       close()
@@ -87,12 +94,15 @@ public actor NativeMemorySession {
       sequence += 1
       let capturedAt = ContinuousClock.now
       try input.send(Data("\(command) \(sequence)\n".utf8))
-      let words = try await line(until: deadline).split(separator: " ")
+      let text = try await line(until: deadline, allowAfterClose: command == "QUIT")
+      let words = text.split(separator: " ")
       try Task.checkCancellation()
       guard !closed, words.count == 4, words[0] == "MEMORY_OK",
         words[1] == Substring(String(sequence)), let total = UInt64(words[2]), total > 0,
-        let available = UInt64(words[3]), available <= total
+        let available = UInt64(words[3]), available <= total,
+        text == "MEMORY_OK \(sequence) \(total) \(available)"
       else { throw NativeControlFailure.framing }
+      guard ContinuousClock.now < deadline else { throw NativeControlFailure.wireTimedOut }
       if command == "QUIT" { close() }
       return .init(sequence: sequence, capturedAt: capturedAt, total: total, available: available)
     } catch {

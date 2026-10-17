@@ -40,8 +40,10 @@ public final class NativeMemoryOutput: Writer {
     }
   }
   public func close() { state.withLock { $0.closed = true } }
-  public func takeLine() throws -> String? {
+  /// Stream consumers may drain final frames after EOF; live control observations require open IO.
+  public func takeLine(allowAfterClose: Bool = true) throws -> String? {
     try state.withLock { state in
+      guard allowAfterClose || !state.closed else { throw NativeControlFailure.disconnected }
       if let newline = state.bytes.firstIndex(of: 10) {
         let line = state.bytes[..<newline]
         guard line.count <= 8192, line.allSatisfy({ $0 >= 32 && $0 <= 126 }) else {

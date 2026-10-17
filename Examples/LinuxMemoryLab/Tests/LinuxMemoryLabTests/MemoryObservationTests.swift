@@ -60,6 +60,8 @@ func memoryTelemetryProgressesDuringForegroundAllocation(refresh: Bool)
   arguments: [
     "MEMORY_OK 2 1000 900\n", "MEMORY_OK 01 1000 900\n",
     "MEMORY_OK 1 1000 1001\n", "MEMORY_OK 1 0 0\n",
+    "MEMORY_OK  1 1000 900\n", "MEMORY_OK 1 01000 900\n",
+    "MEMORY_OK 1 1000 900 \n",
   ]) func invalidMemoryTelemetryClosesWire(_ invalid: String) async throws
 {
   let input = NativeMemoryInput()
@@ -76,6 +78,59 @@ func memoryTelemetryProgressesDuringForegroundAllocation(refresh: Bool)
   await #expect(throws: NativeControlFailure.disconnected) {
     try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1)))
   }
+  #expect(await wire.next() == nil)
+}
+
+@Test(arguments: [
+  "MEMORY_READY  1000 900\n", "MEMORY_READY 1000 0900\n", "MEMORY_READY 1000 900 \n",
+])
+func noncanonicalMemoryReadinessCannotOpenTheSession(_ invalid: String) async throws {
+  let input = NativeMemoryInput()
+  defer { input.finish() }
+  let output = NativeMemoryOutput()
+  let monitor = NativeMemorySession(input: input, output: output)
+  try output.write(Data(invalid.utf8))
+  await #expect(throws: NativeControlFailure.framing) { try await monitor.start() }
+  await monitor.close()
+}
+
+@Test(arguments: [false, true])
+func aClosedMemoryWireCannotPublishLiveTelemetry(afterReadiness: Bool) async throws {
+  let input = NativeMemoryInput()
+  defer { input.finish() }
+  let output = NativeMemoryOutput()
+  let monitor = NativeMemorySession(input: input, output: output)
+  try output.write(Data("MEMORY_READY 1000 900\n".utf8))
+  if afterReadiness {
+    try await monitor.start()
+    // A peer may leave a syntactically valid reply queued before its EOF is observed.
+    try output.write(Data("MEMORY_OK 1 1000 900\n".utf8))
+  }
+  output.close()
+  if afterReadiness {
+    await #expect(throws: NativeControlFailure.disconnected) {
+      try await monitor.observeIfIdle(deadline: .now.advanced(by: .seconds(1)))
+    }
+  } else {
+    await #expect(throws: NativeControlFailure.disconnected) { try await monitor.start() }
+  }
+  await monitor.close()
+}
+
+@Test(.timeLimit(.minutes(1)))
+func aFinalQuitAcknowledgementSurvivesItsFollowingEOF() async throws {
+  let input = NativeMemoryInput()
+  defer { input.finish() }
+  let output = NativeMemoryOutput()
+  let monitor = NativeMemorySession(input: input, output: output)
+  try output.write(Data("MEMORY_READY 1000 900\n".utf8))
+  try await monitor.start()
+  var wire = input.stream().makeAsyncIterator()
+  let quitting = Task { try await monitor.quit() }
+  #expect(await wire.next() == Data("QUIT 1\n".utf8))
+  try output.write(Data("MEMORY_OK 1 1000 900\n".utf8))
+  output.close()
+  try await quitting.value
   #expect(await wire.next() == nil)
 }
 
