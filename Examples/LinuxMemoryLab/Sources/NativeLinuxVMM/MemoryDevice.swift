@@ -4,13 +4,16 @@ import Foundation
 import Hypervisor
 import PageMemory
 
-// Exclusively owned dynamic RAM region, never a borrowed VZ allocation.
+// Exclusively owned dynamic RAM region, never a borrowed VZ allocation. In this private candidate
+// each 2 MiB extent is one named purgable Mach object owned by MachNamedBacking.
 final class MemoryDevice {
   static let base: UInt64 = 0x1_0000_0000
   static let block = 2 << 20
   let capacity: Int
   final class Extent {
-    var pointer: UnsafeMutableRawPointer?
+    var backing: MachNamedBacking?
+    /// Confined host address of the owned mapping; nil after an unplug detached it.
+    var pointer: UnsafeMutableRawPointer? { backing?.pointer }
     var mapped = false
     var plugged = false
     var freshAllocation = false
@@ -45,6 +48,9 @@ final class MemoryDevice {
   private(set) var quarantineRecord: [String: UInt64] = [:]
   // Only committed provide/retire/close mutate this logical count; avoid an ARC walk per VM exit.
   private(set) var plugged: UInt64 = 0
+  // Uncertain ownership, failed restoration or destruction cannot authorize further reuse;
+  // the VM owner must retain its admission lease and retire the process.
+  private(set) var nativeFailure: String?
 
   init(
     held: Bool, aliasControl: Bool = false, geometry: NativeMemoryGeometry = .qualification,
@@ -165,26 +171,20 @@ final class MemoryDevice {
   }
   private func provide(_ index: Int) throws {
     let extent = extents[index]
-    guard !extent.plugged, !extent.mapped,
+    guard nativeFailure == nil, !extent.plugged, !extent.mapped,
       plugged <= UInt64(capacity - Self.block) else { throw DeviceFailure.request }
     extent.freshAllocation = extent.pointer == nil
-    if extent.freshAllocation { try native(hv_vm_allocate(&extent.pointer, Self.block, 0)) }
+    if extent.freshAllocation { try attach(extent) }
     guard let pointer = extent.pointer else { throw DeviceFailure.request }
-    try native(
-      mach_vm_inherit(
-        mach_task_self_, UInt64(UInt(bitPattern: pointer)), UInt64(Self.block), VM_INHERIT_NONE))
-    // Fresh anonymous backing supplies zeroes lazily; reused held pages must be cleared.
+    // A cold object supplies zeroes lazily; reused held pages must be cleared.
     if !coldProvisioning || !extent.freshAllocation {
       memset(pointer, 0, Self.block)
       extent.initializedByHost = true
     } else {
       extent.initializedByHost = false
     }
-    // Ordinary Linux RAM: guest stage1 enforces code permissions; host alias stays RW/NX.
-    try native(
-      hv_vm_map(
-        pointer, Self.base + UInt64(index * Self.block), Self.block,
-        UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
+    // Ordinary Linux RAM: guest stage1 enforces code permissions; host mapping stays RW/NX.
+    try mapStage2(index, pointer)
     extent.mapped = true
     extent.plugged = true
     plugged += UInt64(Self.block)
@@ -200,15 +200,16 @@ final class MemoryDevice {
       aliasAddress = target
     }
   }
-  private struct OwnershipRefusal: Error {
-    let detail: String
-    init(_ detail: String) { self.detail = detail }
+  /// A first plug creates the named object; a replug after unplug maps the retained entry again.
+  private func attach(_ extent: Extent) throws {
+    if let backing = extent.backing { try backing.attachMapping() }
+    else { extent.backing = try MachNamedBacking.create() }
   }
-  private struct Retirement {
-    let index: Int
-    let pointer: UnsafeMutableRawPointer
-    let info: vm_region_submap_info_data_64_t
-    let size: UInt64
+  private func mapStage2(_ index: Int, _ pointer: UnsafeMutableRawPointer) throws {
+    try native(
+      hv_vm_map(
+        pointer, Self.base + UInt64(index * Self.block), Self.block,
+        UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
   }
   func releaseAlias() throws {
     try confined()
@@ -218,65 +219,33 @@ final class MemoryDevice {
     }
     aliasReleased = true
   }
-  private func inspect(_ index: Int) throws -> Retirement {
-    guard let pointer = extents[index].pointer else { throw DeviceFailure.request }
-    var address = UInt64(UInt(bitPattern: pointer))
-    let original = address
-    var size: UInt64 = 0
-    var depth: UInt32 = 0
-    var info = vm_region_submap_info_data_64_t()
-    let words = MemoryLayout<vm_region_submap_info_data_64_t>.size / 4
-    var count = mach_msg_type_number_t(words)
-    try withUnsafeMutablePointer(to: &info) { value in
-      try value.withMemoryRebound(to: integer_t.self, capacity: words) {
-        try native(mach_vm_region_recurse(mach_task_self_, &address, &size, &depth, $0, &count))
-      }
-    }
-    guard count == words, address == original, size == Self.block, info.offset == 0,
-      info.is_submap == 0,
-      info.external_pager == 0, info.shadow_depth == 0, info.object_id_full != 0,
-      info.ref_count == 1, info.pages_wired == 0,
-      info.user_wired_count == 0
-    else {
-      throw OwnershipRefusal(
-        "index=\(index) start=\(address) original=\(original) size=\(size) offset=\(info.offset) count=\(count) submap=\(info.is_submap) external=\(info.external_pager) shadow=\(info.shadow_depth) object=\(info.object_id_full) refs=\(info.ref_count) swapped=\(info.pages_swapped_out) wired=\(info.pages_wired) userWired=\(info.user_wired_count)"
-      )
-    }
-    return Retirement(index: index, pointer: pointer, info: info, size: size)
-  }
   private func restore(_ indices: [Int]) throws {
     for index in indices {
       let extent = extents[index]
       guard let pointer = extent.pointer, extent.plugged, !extent.mapped else {
         throw DeviceFailure.request
       }
-      try native(
-        hv_vm_map(
-          pointer, Self.base + UInt64(index * Self.block), Self.block,
-          UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
+      try mapStage2(index, pointer)
       extent.mapped = true
     }
   }
-  private func retire(
-    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int), replacing: Bool = false,
-    balloonEpoch: UInt64? = nil, acknowledgmentPending: Bool = true
-  ) throws -> Bool {
-    let remaining = replacing ? recyclingHistory.remainingCounterValues
-      : observationHistory.remainingCounterValues
-    let cumulative = replacing ? recycledBackingBytes : cumulativeBackingRetiredBytes
-    guard !replacing || !held, remaining >= UInt64(indices.count),
-      replacing || plugged >= UInt64(indices.count) * UInt64(Self.block),
-      UInt64.max - cumulative >= UInt64(indices.count) * UInt64(Self.block),
-      indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
-      )
-    else { throw DeviceFailure.request }
-    if indices.contains(where: { extents[$0].metadataPinned }) {
-      try refusalHistory.append([
-        "reason": "metadata-pinned", "unmappedThenRestored": 0,
-        "ownedBytesDeallocated": 0, "reply": replacing ? "REPORT_SKIPPED" : "BUSY",
-      ])
-      return false
-    }
+  private struct Transaction {
+    let quiescence: (parked: Bool, epoch: Int, cpus: Int)
+    let replacing: Bool
+    let balloonEpoch: UInt64?
+    let acknowledgmentPending: Bool
+  }
+  private struct Evidence {
+    let inspection: MachNamedBacking.Inspection
+    let discard: MachNamedBacking.Discard?
+    let replacement: MachNamedBacking.Counts?
+    let replacementBytes: UInt64?
+    let residentBefore: UInt64
+    let previouslyInitializedByHost: Bool
+    let ownerRangeDeallocated: Bool
+    let footprint: (before: ProcessMemorySnapshot, after: ProcessMemorySnapshot)
+  }
+  private func unmapStage2(_ indices: [Int]) throws -> [Int] {
     var unmapped: [Int] = []
     for index in indices {
       let extent = extents[index]
@@ -287,99 +256,187 @@ final class MemoryDevice {
         unmapped.append(index)
       }
     }
-    let plans: [Retirement]
-    do { plans = try indices.map(inspect) } catch let refusal as OwnershipRefusal {
-      // BUSY is legal only before any object has been freed and after full remapping.
-      try restore(unmapped)
-      try refusalHistory.append([
-        "reason": refusal.detail, "unmappedThenRestored": unmapped.count,
-        "ownedBytesDeallocated": 0, "reply": replacing ? "REPORT_SKIPPED" : "BUSY",
-      ])
+    return unmapped
+  }
+  private func preflight(_ index: Int) throws -> MachNamedBacking.Inspection {
+    guard let backing = extents[index].backing else { throw DeviceFailure.request }
+    return try backing.inspect()
+  }
+  private func recordRefusal(_ reason: String, unmapped: Int, replacing: Bool) throws {
+    try refusalHistory.append([
+      "reason": reason, "unmappedThenRestored": unmapped,
+      "ownedBytesDeallocated": 0, "objectBytesDiscarded": 0,
+      "reply": replacing ? "REPORT_SKIPPED" : "BUSY",
+    ])
+  }
+  private func retire(
+    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int), replacing: Bool = false,
+    balloonEpoch: UInt64? = nil, acknowledgmentPending: Bool = true
+  ) throws -> Bool {
+    let remaining = replacing ? recyclingHistory.remainingCounterValues
+      : observationHistory.remainingCounterValues
+    let cumulative = replacing ? recycledBackingBytes : cumulativeBackingRetiredBytes
+    guard nativeFailure == nil, !replacing || !held, remaining >= UInt64(indices.count),
+      replacing || plugged >= UInt64(indices.count) * UInt64(Self.block),
+      UInt64.max - cumulative >= UInt64(indices.count) * UInt64(Self.block),
+      indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
+      )
+    else { throw DeviceFailure.request }
+    if indices.contains(where: { extents[$0].metadataPinned }) {
+      try recordRefusal("metadata-pinned", unmapped: 0, replacing: replacing)
       return false
     }
-    // Native errors after this point are fatal; released guest data cannot be rolled back.
-    for plan in plans {
-      let index = plan.index
-      let extent = extents[index]
-      let before = try ProcessMemorySnapshot.capture()
-      let previouslyInitializedByHost = extent.initializedByHost
-      let pageSize = Int(sysconf(Int32(_SC_PAGESIZE)))
-      guard pageSize > 0, Self.block % pageSize == 0 else { throw DeviceFailure.geometry }
-      let residentBefore = UInt64(plan.info.pages_resident) * UInt64(pageSize)
-      guard residentBefore <= UInt64(Self.block) else { throw DeviceFailure.geometry }
-      if !held {
-        try native(hv_vm_deallocate(plan.pointer, Self.block))
-        extent.pointer = nil
-        try requireAbsent(UInt64(UInt(bitPattern: plan.pointer)))
+    let transaction = Transaction(
+      quiescence: quiescence, replacing: replacing, balloonEpoch: balloonEpoch,
+      acknowledgmentPending: acknowledgmentPending)
+    var unmapped: [Int] = []
+    var discarded = 0
+    do {
+      unmapped = try unmapStage2(indices)
+      let planned = try indices.map(preflight)
+      for (index, plan) in zip(indices, planned) {
+        if try retireOne(index, plan, transaction) { discarded += 1 }
       }
-      var replacementResidentBytes: UInt64?
-      if replacing {
-        try native(hv_vm_allocate(&extent.pointer, Self.block, 0))
-        guard let pointer = extent.pointer else { throw DeviceFailure.request }
-        try native(
-          mach_vm_inherit(
-            mach_task_self_, UInt64(UInt(bitPattern: pointer)), UInt64(Self.block),
-            VM_INHERIT_NONE))
-        try native(
-          hv_vm_map(
-            pointer, Self.base + UInt64(index * Self.block), Self.block,
-            UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
-        extent.mapped = true
-        extent.freshAllocation = true
-        extent.initializedByHost = false
-        replacementResidentBytes = try withUnsafeTemporaryAllocation(
-          of: Int8.self, capacity: Self.block / pageSize
-        ) { pages in
-          pages.initialize(repeating: 0)
-          guard mincore(pointer, Self.block, pages.baseAddress!) == 0 else {
-            throw DeviceFailure.native(errno)
-          }
-          return pages.reduce(UInt64(0)) { $0 + ($1 & 1 != 0 ? UInt64(pageSize) : 0) }
-        }
-        // No host writes: fresh anonymous zeroes must remain cold before guest ACK/resume.
-        guard replacementResidentBytes == 0 else {
-          throw DeviceFailure.observation("replacement-not-cold")
-        }
-      } else {
-        extent.plugged = false
-        plugged -= UInt64(Self.block)
+    } catch let refusal as MachNamedBacking.Refusal where discarded == 0 {
+      // The first point of destruction rechecked ownership and refused: nothing was destroyed.
+      do {
+        try restore(unmapped)
+        try recordRefusal(refusal.detail, unmapped: unmapped.count, replacing: replacing)
+      } catch {
+        nativeFailure = String(describing: error)
+        throw error
       }
-      let after = try ProcessMemorySnapshot.capture()
-      if replacing {
-        recycledBackingBytes += UInt64(Self.block)
-        recycledResidentBytes += residentBefore
-        if !previouslyInitializedByHost { recycledColdResidentBytes += residentBefore }
-      } else if !held {
-        cumulativeBackingRetiredBytes += UInt64(Self.block)
-      }
-      let observation: [String: Any] = [
-        "allVCPUsParked": quiescence.parked, "quiescentEpoch": quiescence.epoch,
-        "vcpuCount": quiescence.cpus,
-        "index": index, "held": held,
-        "nativeEntryBytes": plan.size, "nativeObjectOffset": plan.info.offset,
-        "freshAllocation": extent.freshAllocation,
-        "hostInitializedBytes": previouslyInitializedByHost ? Self.block : 0,
-        "residentObservationIncludesHostZeroing": previouslyInitializedByHost,
-        "replacementHostInitializedBytes": replacing ? 0 : NSNull(),
-        "oldVirtualRangeAbsent": !held,
-        "sameGPAMappedBeforeAcknowledgement": replacing && extent.mapped && acknowledgmentPending,
-        "sameGPAMappedBeforeResume": replacing && extent.mapped,
-        "balloonOwnershipEpoch": balloonEpoch.map { $0 as Any } ?? NSNull(),
-        "replacementResidentBytes": replacementResidentBytes.map { $0 as Any } ?? NSNull(),
-        "objectID": plan.info.object_id_full,
-        "residentPagesBefore": plan.info.pages_resident,
-        "pagedOutPagesBefore": plan.info.pages_swapped_out,
-        "residentBytesObservedBefore": residentBefore,
-        "ownerVirtualBytesDeallocated": held ? 0 : Self.block,
-        "referenceCount": plan.info.ref_count,
-        "footprintBefore": before.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
-        "footprintAfter": after.physicalFootprintBytes.map { $0 as Any } ?? NSNull(),
-        "physicalReleasedBytes": NSNull(),
-      ]
-      if replacing { try recyclingHistory.append(observation) }
-      else { try observationHistory.append(observation) }
+      return false
+    } catch {
+      // Uncertain ownership or native failures cannot authorize restoration or process reuse.
+      nativeFailure = String(describing: error)
+      throw error
     }
     return true
+  }
+  /// Returns true when the object's contents were discarded. Each extent's own discard rechecks
+  /// ownership immediately before destroying, so an alias that appeared after the bulk plan wins.
+  private func retireOne(
+    _ index: Int, _ planned: MachNamedBacking.Inspection, _ transaction: Transaction
+  ) throws -> Bool {
+    let extent = extents[index]
+    // Destruction needs the stage-2 mapping to be gone already, not merely requested to go.
+    guard extent.plugged, !extent.mapped, let backing = extent.backing else {
+      throw DeviceFailure.request
+    }
+    let before = try ProcessMemorySnapshot.capture()
+    let previouslyInitializedByHost = extent.initializedByHost
+    var discard: MachNamedBacking.Discard?
+    if !held { discard = try backing.discard() }
+    let inspection = discard?.before ?? planned
+    let residentBefore = try inspection.counts.residentBytes()
+    var replacement: MachNamedBacking.Counts?
+    var replacementBytes: UInt64?
+    var ownerRangeDeallocated = false
+    if transaction.replacing {
+      let counts = try remapCold(index)
+      replacement = counts
+      replacementBytes = try counts.residentBytes()
+    } else {
+      if !held {
+        try backing.detachMapping()
+        ownerRangeDeallocated = true
+      }
+      extent.plugged = false
+      plugged -= UInt64(Self.block)
+    }
+    let after = try ProcessMemorySnapshot.capture()
+    if transaction.replacing {
+      recycledBackingBytes += UInt64(Self.block)
+      recycledResidentBytes += residentBefore
+      if !previouslyInitializedByHost { recycledColdResidentBytes += residentBefore }
+    } else if !held {
+      cumulativeBackingRetiredBytes += UInt64(Self.block)
+    }
+    let record = observation(
+      index,
+      Evidence(
+        inspection: inspection, discard: discard, replacement: replacement,
+        replacementBytes: replacementBytes, residentBefore: residentBefore,
+        previouslyInitializedByHost: previouslyInitializedByHost,
+        ownerRangeDeallocated: ownerRangeDeallocated, footprint: (before, after)),
+      transaction)
+    if transaction.replacing { try recyclingHistory.append(record) }
+    else { try observationHistory.append(record) }
+    return discard != nil
+  }
+  /// Same owned address and same GPA, with no virtual-range hole. Host writes are forbidden so
+  /// the discarded object must still be cold when the guest is acknowledged or resumed.
+  private func remapCold(_ index: Int) throws -> MachNamedBacking.Counts {
+    let extent = extents[index]
+    guard let pointer = extent.pointer, let backing = extent.backing else {
+      throw DeviceFailure.request
+    }
+    try mapStage2(index, pointer)
+    extent.mapped = true
+    extent.freshAllocation = true
+    extent.initializedByHost = false
+    let counts = try backing.counts()
+    guard counts.resident == 0, counts.swapped == 0 else {
+      throw DeviceFailure.observation("replacement-not-cold")
+    }
+    return counts
+  }
+  private static let discardMechanism =
+    "mach_memory_entry_purgable_control EMPTY then NONVOLATILE on the whole named object"
+  private static func value<T>(_ optional: T?) -> Any {
+    optional.map { $0 as Any } ?? NSNull()
+  }
+  private func observation(
+    _ index: Int, _ evidence: Evidence, _ transaction: Transaction
+  ) -> [String: Any] {
+    let extent = extents[index]
+    let inspection = evidence.inspection
+    let quiescence = transaction.quiescence
+    let replacing = transaction.replacing
+    var record: [String: Any] = [
+      "allVCPUsParked": quiescence.parked, "quiescentEpoch": quiescence.epoch,
+      "vcpuCount": quiescence.cpus,
+      "index": index, "held": held,
+      "nativeEntryBytes": inspection.size, "nativeObjectOffset": inspection.offset,
+      "freshAllocation": extent.freshAllocation,
+      "hostInitializedBytes": evidence.previouslyInitializedByHost ? Self.block : 0,
+      "residentObservationIncludesHostZeroing": evidence.previouslyInitializedByHost,
+      "replacementHostInitializedBytes": replacing ? 0 : NSNull(),
+      // Removing the owner's virtual range and discarding object contents are distinct facts.
+      "oldVirtualRangeAbsent": evidence.ownerRangeDeallocated,
+      "ownerVirtualBytesDeallocated": evidence.ownerRangeDeallocated ? Self.block : 0,
+      "sameGPAMappedBeforeAcknowledgement":
+        replacing && extent.mapped && transaction.acknowledgmentPending,
+      "sameGPAMappedBeforeResume": replacing && extent.mapped,
+      "balloonOwnershipEpoch": Self.value(transaction.balloonEpoch),
+      "replacementResidentBytes": Self.value(evidence.replacementBytes),
+      "objectID": inspection.objectID,
+      "residentPagesBefore": inspection.counts.resident,
+      "pagedOutPagesBefore": inspection.counts.swapped,
+      "residentBytesObservedBefore": evidence.residentBefore,
+      "referenceCount": inspection.references,
+      "footprintBefore": Self.value(evidence.footprint.before.physicalFootprintBytes),
+      "footprintAfter": Self.value(evidence.footprint.after.physicalFootprintBytes),
+      "physicalReleasedBytes": NSNull(),
+    ]
+    let discarded = evidence.discard != nil
+    record["backingKind"] = "mach-named-purgable-whole-object"
+    record["objectContentsDiscarded"] = discarded
+    record["discardMechanism"] = discarded ? Self.discardMechanism : "none-held-control"
+    record["directCountSource"] = "mach_memory_entry_get_page_counts"
+    record["directCountPageBytes"] = MachNamedBacking.pageBytes
+    record["directResidentPagesBefore"] = inspection.counts.resident
+    record["directDirtyPagesBefore"] = inspection.counts.dirty
+    record["directSwappedPagesBefore"] = inspection.counts.swapped
+    record["regionResidentPagesBefore"] = inspection.regionResidentPages
+    record["directResidentPagesAfterDiscard"] = Self.value(evidence.discard?.after.resident)
+    record["directDirtyPagesAfterDiscard"] = Self.value(evidence.discard?.after.dirty)
+    record["directSwappedPagesAfterDiscard"] = Self.value(evidence.discard?.after.swapped)
+    record["directResidentPagesAfterRemap"] = Self.value(evidence.replacement?.resident)
+    record["directSwappedPagesAfterRemap"] = Self.value(evidence.replacement?.swapped)
+    record["purgableStateAfterDiscard"] = Self.value(discarded ? "nonvolatile" : nil)
+    return record
   }
   /// Callers prove ownership by a pending REPORTING ACK or the persistent balloon PFN ledger.
   @discardableResult func recycleOwned(
@@ -397,26 +454,8 @@ final class MemoryDevice {
       indices, quiescence: quiescence, replacing: true, balloonEpoch: balloonEpoch,
       acknowledgmentPending: acknowledgmentPending)
   }
-  private func requireAbsent(_ original: UInt64) throws {
-    var start = original
-    var size: UInt64 = 0
-    var info = vm_region_basic_info_data_64_t()
-    var count = mach_msg_type_number_t(MemoryLayout<vm_region_basic_info_data_64_t>.size / 4)
-    var port: mach_port_t = 0
-    let result = withUnsafeMutablePointer(to: &info) { value in
-      value.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-        mach_vm_region(mach_task_self_, &start, &size, VM_REGION_BASIC_INFO_64, $0, &count, &port)
-      }
-    }
-    if port != 0 { try native(mach_port_deallocate(mach_task_self_, port)) }
-    guard
-      result == KERN_INVALID_ADDRESS
-        || result == KERN_SUCCESS && start >= original + UInt64(Self.block)
-    else {
-      throw DeviceFailure.observation(
-        "absence result=\(result) start=\(start) original=\(original) size=\(size)")
-    }
-  }
+  /// Explicit release of every owned kernel resource, only after the native VM stopped running
+  /// vCPUs. A failure keeps the remaining resources (and the alias) owned until process exit.
   func close() throws {
     try confined()
     if let aliasAddress {
@@ -429,9 +468,9 @@ final class MemoryDevice {
         try native(hv_vm_unmap(Self.base + UInt64(index * Self.block), Self.block))
         extent.mapped = false
       }
-      if let pointer = extent.pointer {
-        try native(hv_vm_deallocate(pointer, Self.block))
-        extent.pointer = nil
+      if let backing = extent.backing {
+        try backing.close()
+        extent.backing = nil
       }
       if extent.plugged {
         extent.plugged = false

@@ -215,10 +215,12 @@ final class NativeControl: Sendable {
     for listener in listeners {
       do { try listener.finish() } catch { cleanup.append("listener-finish \(error)") }
     }
-    if !machine.created, cleanup.isEmpty {
+    let memoryNativeFailure = machine.dynamicMemory?.nativeFailure
+    // A partial destructive failure cannot authorize another VM in this process.
+    if !machine.created, cleanup.isEmpty, memoryNativeFailure == nil {
       do { try resources?.retire() } catch { cleanup.append("boot-resources-retire \(error)") }
     }
-    if lease, !machine.created, cleanup.isEmpty {
+    if lease, !machine.created, cleanup.isEmpty, memoryNativeFailure == nil {
       NativeProcessLease.claimed.withLock { $0 = false }
     }
     let applications: [[String: UInt64]]
@@ -291,6 +293,8 @@ final class NativeControl: Sendable {
       "memoryControlRetired": state.withLock { $0.memoryControlRetired },
       "memoryQuarantineApplied": state.withLock { $0.memoryQuarantineApplied },
       "memoryQuarantine": machine.dynamicMemory?.quarantineRecord ?? [:],
+      "memoryNativeFailure": memoryNativeFailure.map { $0 as Any } ?? NSNull(),
+      "processRetirementRequired": memoryNativeFailure != nil,
       "diskAdmittedWriteBytes": machine.rootDisk?.written ?? 0,
       "consoleRetainedBytes": machine.console.count,
       "exits": machine.exits, "lastPC": String(machine.lastPC, radix: 16),
