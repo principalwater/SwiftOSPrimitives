@@ -20,14 +20,14 @@ public final class NativeBalloonGovernor: Sendable {
     public fileprivate(set) var requests = RecentHistory<[String: UInt64]>(capacity: 64)
   }
   private let state = Mutex(State())
-  private let probe: NativeMemorySession
+  private let probe: NativeMemoryObserver
   private let vm: NativeVirtualMachine
   private let residentTarget: UInt64
   private let lifetime: ContinuousClock.Instant?
   public var snapshot: State { state.withLock { $0 } }
 
   public init(
-    probe: NativeMemorySession, vm: NativeVirtualMachine, residentTarget: UInt64,
+    probe: NativeMemoryObserver, vm: NativeVirtualMachine, residentTarget: UInt64,
     lifetimeDeadline: ContinuousClock.Instant? = nil
   ) throws {
     guard residentTarget >= vm.memoryGeometry.bootBytes,
@@ -48,7 +48,8 @@ public final class NativeBalloonGovernor: Sendable {
         let device = vm.balloonState
         if device.settled, device.targetBytes == 0 { return }
         if let generation = Self.admittedZeroGeneration(
-          device: device, lastRequest: $0.requests.elements.last) {
+          device: device, lastRequest: $0.requests.elements.last)
+        {
           $0.stopRequestGeneration = generation
           return
         }
@@ -64,7 +65,8 @@ public final class NativeBalloonGovernor: Sendable {
     device: NativeBalloonState, lastRequest: [String: UInt64]?
   ) -> UInt64? {
     guard let lastRequest, lastRequest["targetBytes"] == 0,
-      let generation = lastRequest["generation"], generation == device.requestGeneration else {
+      let generation = lastRequest["generation"], generation == device.requestGeneration
+    else {
       return nil
     }
     return generation

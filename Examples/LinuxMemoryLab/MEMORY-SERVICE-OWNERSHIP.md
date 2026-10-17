@@ -81,3 +81,49 @@ reservations, compromised guest controls, wedged service fault injection, long
 resource/security soaks, durable DB shutdown, autonomous RAM return, idle4-vCPU
 budgets, upstream updates and Docker/Compose migration remain unqualified.
 No production service or installed container was changed.
+
+## Observation authority and review regressions — 2026-10-17
+
+The managed service now returns a concrete `NativeMemoryObserver` from `session`.
+It admits observations only; it exposes no handshake, quit or close authority. The
+legacy `NativeMemorySession` initializer and lifecycle remain public for their real
+standalone owners. Both native governors consume the observation capability, and
+all lab callers use it. An owned terminal observation revokes live admission; its
+actual operation remains counted until completion and is joined after native stop.
+Graceful shutdown waits for any admitted observation inside the original drain
+budget. No idle IO pump or respawn was added.
+
+An external compiler consumer proved the old getter accepted all three unwanted
+lifecycle calls. The repaired getter rejects each with a no-member diagnostic;
+positive observation and actual legacy-owner consumers still compile. These were
+actual Swift6.4.1 typechecks, not source-string assertions.
+
+The already-cancelled shutdown regression failed on the old owner in37.851135s:
+its live admission remained available. The repair consumes the stopping phase
+before checking cancellation and starts no shutdown RPC for an already-cancelled
+caller. A later call cannot renew the cancelled stop. Reply sleeps are clipped to
+the original deadline; phase errors remain distinct from expiration. Join failures
+and truncated cleanup histories remain visible. Extra buffered stdio connections
+are closed and cause bootstrap refusal rather than silently becoming live.
+
+The final candidate passed123 release tests with warnings as errors (91.646783s
+including compilation). Eight fresh2-vCPU/zero-NIC/3GiB VM cases passed107.489250s:
+normal, cancel during upload, cancel after listener registration at create-requested,
+original deadline, wrong digest, expired shutdown, already-cancelled shutdown, and
+a stopped monitor. The last case uses `Signal.Linux.stop`, not Darwin's differently
+numbered SIGSTOP, and proves wire timeout, revoked admission and forced VM retirement.
+Signal acceptance and missed reply were observed; Linux process state was not read.
+
+Every case retained actual VM/vCPU/NIO joins, zero pending operations, weak ARC
+release and four final open descriptors. A count is supporting lifetime evidence,
+not an exhaustive descriptor-identity proof. Original8GiB content and metadata were
+unchanged. Frozen224-source host UUID `92114CAD-7CBE-3B1A-84AC-72E1AAC3EB7B`, SHA-256
+`3f2a16894cb7bfdc84e13085d63a08c878390e85bf4bea79464dab51abff89cc`.
+The monitor digest above is unchanged. Private receipts:
+`monitor-owner-observer-v6-{freeze,independent}.json`.
+
+Retained failed harness attempts are not acceptance: an invalid descriptor-census
+bound after retirement, a freeze-receipt filename collision before VM admission,
+and use of Darwin's signal number in the Linux fault case. They were corrected
+without relaxing limits. These results do not qualify autonomous RAM return,
+application integration, hostile guests or any complete production gate.

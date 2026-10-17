@@ -36,6 +36,7 @@ public final class NativeMemoryService: Sendable {
     var shutdown: Task<Void, Never>?
     var startupDone = false
     var shutdownDone = false
+    var observing = false
     var signal: AsyncStream<Result<Void, any Error>>.Continuation?
     var pid: Int32?
     var waited = false
@@ -83,22 +84,58 @@ public final class NativeMemoryService: Sendable {
         phase: $0.phase, stage: $0.stage, pid: $0.pid, waited: $0.waited, deleted: $0.deleted,
         rootUnmounted: $0.rootUnmounted,
         pendingOperations: ($0.startup != nil && !$0.startupDone ? 1 : 0)
-          + ($0.shutdown != nil && !$0.shutdownDone ? 1 : 0),
+          + ($0.shutdown != nil && !$0.shutdownDone ? 1 : 0) + ($0.observing ? 1 : 0),
         memoryBytes: $0.memoryBytes, diagnostics: $0.wire?.diagnosticText ?? "",
         primaryError: $0.primaryError,
         cleanupErrors: $0.cleanupErrors + ($0.wire?.cleanupErrors.map(Self.describe) ?? []))
     }
   }
 
-  /// No session escapes before the bounded bootstrap and actual resource checks succeed.
-  public var session: NativeMemorySession {
+  /// Observation authority escapes only after the bounded bootstrap and actual resource checks.
+  public var session: NativeMemoryObserver {
     get throws {
       try state.withLock {
-        guard $0.phase == .live, let session = $0.session else {
+        guard $0.phase == .live, $0.session != nil else {
           throw NativeControlFailure.ownership
         }
-        return session
+        return NativeMemoryObserver(owner: self)
       }
+    }
+  }
+
+  func observeIfIdle(
+    deadline: ContinuousClock.Instant, refreshStatistics: Bool
+  ) async throws -> NativeMemoryObservation? {
+    try Task.checkCancellation()
+    let session = try state.withLock { value -> NativeMemorySession? in
+      guard value.phase == .live, let session = value.session else {
+        throw NativeControlFailure.ownership
+      }
+      guard !value.observing else { return nil }
+      value.observing = true
+      return session
+    }
+    guard let session else { return nil }
+    defer { state.withLock { $0.observing = false } }
+    do {
+      let sample = try await session.observeIfIdle(
+        deadline: deadline, refreshStatistics: refreshStatistics)
+      try Task.checkCancellation()
+      guard state.withLock({ $0.phase == .live }) else { throw NativeControlFailure.ownership }
+      guard ContinuousClock.now < deadline else { throw NativeControlFailure.wireTimedOut }
+      return sample
+    } catch {
+      // An unadmitted request leaves the wire intact; a terminal exchange revokes live admission.
+      if await session.isClosed {
+        let failed = state.withLock { value in
+          guard value.phase == .live else { return false }
+          value.phase = .failed
+          if value.primaryError.isEmpty { value.primaryError = Self.describe(error) }
+          return true
+        }
+        if failed { abort(cause: error) }
+      }
+      throw error
     }
   }
 
@@ -118,17 +155,15 @@ public final class NativeMemoryService: Sendable {
     do {
       try await wait(events, signal: signal, until: deadline, timeout: .lifetimeExpired)
       let task = try state.withLock { value -> Task<Void, Never>? in
-        guard value.phase == .starting, ContinuousClock.now < deadline else {
-          throw NativeControlFailure.ownership
-        }
+        guard value.phase == .starting else { throw NativeControlFailure.ownership }
+        guard ContinuousClock.now < deadline else { throw NativeControlFailure.lifetimeExpired }
         return value.startup
       }
       await task?.value
       try Task.checkCancellation()
       try state.withLock {
-        guard $0.phase == .starting, ContinuousClock.now < deadline else {
-          throw NativeControlFailure.lifetimeExpired
-        }
+        guard $0.phase == .starting else { throw NativeControlFailure.ownership }
+        guard ContinuousClock.now < deadline else { throw NativeControlFailure.lifetimeExpired }
         $0.phase = .live
         $0.signal = nil
       }
@@ -140,7 +175,6 @@ public final class NativeMemoryService: Sendable {
 
   /// Requires the governor's actual join first. Uses only the caller's remaining drain budget.
   public func shutdown(until deadline: ContinuousClock.Instant) async throws {
-    try Task.checkCancellation()
     let (events, signal) = AsyncStream<Result<Void, any Error>>.makeStream(
       bufferingPolicy: .bufferingOldest(1))
     let admitted = try state.withLock { value -> Bool in
@@ -148,19 +182,21 @@ public final class NativeMemoryService: Sendable {
       guard value.phase == .live else { throw NativeControlFailure.ownership }
       value.phase = .stopping
       value.signal = signal
-      value.shutdown = Task { await self.performShutdown(until: deadline, signal: signal) }
+      if !Task.isCancelled {
+        value.shutdown = Task { await self.performShutdown(until: deadline, signal: signal) }
+      }
       return true
     }
     guard admitted else { return }
     do {
+      try Task.checkCancellation()
       try await wait(events, signal: signal, until: deadline, timeout: .drainTimedOut)
       let task = state.withLock { $0.shutdown }
       await task?.value
       try Task.checkCancellation()
       try state.withLock {
-        guard $0.phase == .stopping, ContinuousClock.now < deadline else {
-          throw NativeControlFailure.drainTimedOut
-        }
+        guard $0.phase == .stopping else { throw NativeControlFailure.ownership }
+        guard ContinuousClock.now < deadline else { throw NativeControlFailure.drainTimedOut }
         $0.phase = .stopped
         $0.signal = nil
       }
@@ -201,7 +237,7 @@ public final class NativeMemoryService: Sendable {
     abort()
     while true {
       let tasks = state.withLock { value -> (Task<Void, Never>?, Task<Void, Never>?)? in
-        guard value.startup == nil || value.startupDone,
+        guard !value.observing, value.startup == nil || value.startupDone,
           value.shutdown == nil || value.shutdownDone
         else { return nil }
         return (value.startup, value.shutdown)
@@ -209,7 +245,10 @@ public final class NativeMemoryService: Sendable {
       if let tasks {
         await tasks.0?.value
         await tasks.1?.value
-        guard ContinuousClock.now < deadline else { throw NativeControlFailure.drainTimedOut }
+        guard ContinuousClock.now < deadline else {
+          cleanup("owner-join: drainTimedOut")
+          throw NativeControlFailure.drainTimedOut
+        }
         state.withLock {
           $0.startup = nil
           $0.shutdown = nil
@@ -218,7 +257,10 @@ public final class NativeMemoryService: Sendable {
         }
         return
       }
-      guard ContinuousClock.now < deadline else { throw NativeControlFailure.drainTimedOut }
+      guard ContinuousClock.now < deadline else {
+        cleanup("owner-join: drainTimedOut")
+        throw NativeControlFailure.drainTimedOut
+      }
       try await Task.sleep(
         until: min(deadline, .now.advanced(by: .milliseconds(5))), clock: .continuous)
     }
@@ -261,11 +303,15 @@ public final class NativeMemoryService: Sendable {
   }
   private func cleanup(_ text: String) {
     state.withLock {
-      if $0.cleanupErrors.count < 8 { $0.cleanupErrors.append(Self.describe(text)) }
+      if $0.cleanupErrors.count < 8 {
+        $0.cleanupErrors.append(Self.describe(text))
+      } else {
+        $0.cleanupErrors[7] = "Additional cleanup errors omitted"
+      }
     }
   }
   private static func describe(_ value: Any) -> String {
-    String(String(describing: value).prefix(512))
+    String(decoding: String(describing: value).utf8.prefix(512), as: UTF8.self)
   }
   private func finish(_ listener: VsockListener) {
     do { try listener.finish() } catch { cleanup("listener: \(error)") }
@@ -278,7 +324,7 @@ public final class NativeMemoryService: Sendable {
     until deadline: ContinuousClock.Instant,
     signal: AsyncStream<Result<Void, any Error>>.Continuation
   ) async {
-    let result: Result<Void, any Error>
+    var result: Result<Void, any Error>
     do {
       try await bootstrap(until: deadline)
       result = .success(())
@@ -290,7 +336,14 @@ public final class NativeMemoryService: Sendable {
     let listeners = state.withLock { $0.listeners }
     for listener in listeners {
       finish(listener)
-      for await handle in listener { close(handle) }
+      for await handle in listener {
+        cleanup("Unexpected additional stdio connection")
+        close(handle)
+      }
+    }
+    if case .success = result, !snapshot.cleanupErrors.isEmpty {
+      abort(cause: NativeControlFailure.unsettled)
+      result = .failure(NativeControlFailure.unsettled)
     }
     state.withLock { $0.startupDone = true }
     signal.yield(result)
@@ -420,6 +473,11 @@ public final class NativeMemoryService: Sendable {
   ) async {
     let result: Result<Void, any Error>
     do {
+      while state.withLock({ $0.observing }) {
+        try check(.stopping, "observation-drain", deadline)
+        try await Task.sleep(
+          until: min(deadline, .now.advanced(by: .milliseconds(5))), clock: .continuous)
+      }
       try check(.stopping, "quit-requested", deadline)
       guard let session = state.withLock({ $0.session }) else {
         throw NativeControlFailure.ownership

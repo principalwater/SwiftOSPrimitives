@@ -21,7 +21,7 @@ public final class NativeMemoryGovernor: Sendable {
     public var requests: [[String: UInt64]] { requestHistory.elements }
   }
   private let state = Mutex(State())
-  private let probe: NativeMemorySession
+  private let probe: NativeMemoryObserver
   private let vm: NativeVirtualMachine
   private let bootGuestBytes: UInt64
   /// An owner-validated floor including workload budgets and guest overhead.
@@ -44,7 +44,7 @@ public final class NativeMemoryGovernor: Sendable {
     }
   }
   public init(
-    probe: NativeMemorySession, vm: NativeVirtualMachine, began: ContinuousClock.Instant,
+    probe: NativeMemoryObserver, vm: NativeVirtualMachine, began: ContinuousClock.Instant,
     bootGuestBytes: UInt64, minimumResidentBytes: UInt64? = nil,
     lifetimeDeadline: ContinuousClock.Instant? = nil,
     samplingInterval: Duration = .milliseconds(200)

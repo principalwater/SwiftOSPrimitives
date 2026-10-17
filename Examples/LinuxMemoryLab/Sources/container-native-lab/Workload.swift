@@ -441,7 +441,7 @@ extension Lab {
         try await memoryMonitor!.start()
         try await telemetry.start()
         let driver = try NativeBalloonGovernor(
-          probe: telemetry, vm: vm, residentTarget: 1024 << 20)
+          probe: telemetry.observations, vm: vm, residentTarget: 1024 << 20)
         balloonObserver = driver
         balloonTask = Task { try await driver.run() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(3))
@@ -475,7 +475,7 @@ extension Lab {
         if mode == "continuous-unsettled" {
           try vm.requestMemory(bytes: 0)
           let premature = NativeMemoryGovernor(
-            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+            probe: telemetry.observations, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
           do {
             try await premature.run()
             throw Failure.check("unsettled device admitted a controller")
@@ -488,7 +488,7 @@ extension Lab {
           try await waitMemory(vm, bytes: 0)
           _ = try await waitGuestMemory(bootGuestBytes, deadline: .now.advanced(by: .seconds(8)))
           let belowFloor = NativeMemoryGovernor(
-            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+            probe: telemetry.observations, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
           var floorError: NativeControlFailure?
           do { try await belowFloor.run() } catch let error as NativeControlFailure {
             floorError = error
@@ -509,7 +509,7 @@ extension Lab {
         }
         if mode == "continuous" {
           let cancelled = NativeMemoryGovernor(
-            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+            probe: telemetry.observations, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
           let gate = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingOldest(1))
           let task = Task {
             var events = gate.stream.makeAsyncIterator()
@@ -530,7 +530,7 @@ extension Lab {
           commands.append(["preCancelledControlAdmission": "refused"])
         }
         let driver = NativeMemoryGovernor(
-          probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
+          probe: telemetry.observations, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
           minimumResidentBytes: protectedCapacity ? nil : geometry.bootBytes,
           lifetimeDeadline: mode == "continuous-expired-stop"
             ? .now.advanced(by: .seconds(-1))
@@ -556,7 +556,7 @@ extension Lab {
             throw Failure.check("manual setter bypassed active governor")
           } catch NativeControlFailure.ownership {}
           let competitor = NativeMemoryGovernor(
-            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+            probe: telemetry.observations, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
           do {
             try await competitor.run()
             throw Failure.check("second governor bypassed memory authority")
@@ -1039,7 +1039,7 @@ extension Lab {
                     }
                     // Re-entry uses a new owner and remains observational at full soft capacity.
                     let replacement = try NativeBalloonGovernor(
-                      probe: memorySession!, vm: vm, residentTarget: geometry.maximumBytes)
+                      probe: memorySession!.observations, vm: vm, residentTarget: geometry.maximumBytes)
                     let resumed = Task { try await replacement.run() }
                     do {
                       let limit = ContinuousClock.now.advanced(by: .seconds(3))
@@ -1082,7 +1082,7 @@ extension Lab {
                       throw Failure.check("retired balloon admitted new ownership")
                     } catch NativeControlFailure.ownership {}
                     let refused = try NativeBalloonGovernor(
-                      probe: memorySession!, vm: vm, residentTarget: geometry.maximumBytes)
+                      probe: memorySession!.observations, vm: vm, residentTarget: geometry.maximumBytes)
                     do {
                       try await refused.run()
                       throw Failure.check("retired balloon admitted a fresh governor")

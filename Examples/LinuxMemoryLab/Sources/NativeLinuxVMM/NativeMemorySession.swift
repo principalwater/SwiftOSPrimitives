@@ -26,6 +26,10 @@ public actor NativeMemorySession {
   private var busy = false
   private var closed = false
 
+  /// A controller receives no authority to start, close or quit its owner's session.
+  public nonisolated var observations: NativeMemoryObserver { .init(session: self) }
+  var isClosed: Bool { closed }
+
   init(wire: any MemorySessionWire, maximumGuestBytes: UInt64) throws {
     guard maximumGuestBytes > 0 else { throw NativeControlFailure.arguments }
     self.wire = wire
@@ -39,7 +43,8 @@ public actor NativeMemorySession {
       try Task.checkCancellation()
       guard !closed else { throw NativeControlFailure.disconnected }
       if let text = try wire.takeLine(allowAfterClose: allowAfterClose) { return text }
-      try await Task.sleep(for: .milliseconds(5))
+      try await Task.sleep(
+        until: min(deadline, .now.advanced(by: .milliseconds(5))), clock: .continuous)
     }
     throw NativeControlFailure.wireTimedOut
   }
