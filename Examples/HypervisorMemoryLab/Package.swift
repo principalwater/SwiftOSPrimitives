@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
   name: "HypervisorMemoryLab",
   platforms: [.macOS("27.0")],
-  dependencies: [.package(path: "../..")],
+  dependencies: [.package(name: "SwiftOSPrimitives", path: "../..")],
   targets: [
     .executableTarget(
       name: "hvf-memory-lab",
