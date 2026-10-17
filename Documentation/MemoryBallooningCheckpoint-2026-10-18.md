@@ -100,8 +100,10 @@ collection, hashing and preservation checks took 102.905853 seconds.
 The original >=1 GiB resident return, 8-second deadline, live active workload,
 512 MiB guest reserve and <=5 GiB host peak limits were NOT relaxed. Host peak
 RSS was 4,182,687,744 bytes. The 30-second idle window used 1.701084 CPU seconds,
-30 samples, no idle requests and no pulses. This is not yet the desired low-idle
-performance result.
+30 samples, no idle requests and no pulses. Host physical footprint in that window
+was 1,837,012,200 -> 1,837,028,584 bytes (about 1.71 GiB), with the populated
+ClickHouse server still running. This is neither empty-VM idle nor a fair OrbStack
+comparison, and is not yet the desired low-idle performance result.
 
 The native path checked 1322 retired whole objects. Its bounded history retained
 1024 records: exact references=2; size 2 MiB/offset zero; known identity; no owner
