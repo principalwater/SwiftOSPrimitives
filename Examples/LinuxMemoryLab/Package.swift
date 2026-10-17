@@ -33,7 +33,9 @@ let package = Package(
         .product(name: "NIOPosix", package: "swift-nio"),
       ]),
     .executableTarget(name: "linux-memory-lab", dependencies: ["NativeLinuxVMM"]),
-    .executableTarget(name: "container-recovery-lab"),
+    .executableTarget(
+      name: "container-recovery-lab",
+      dependencies: [.product(name: "PageMemory", package: "SwiftOSPrimitives")]),
     .executableTarget(
       name: "container-journal-lab",
       dependencies: [

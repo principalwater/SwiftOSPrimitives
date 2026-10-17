@@ -195,6 +195,17 @@ starting a fresh VM on the same disposable ext4 disk. The replacement validates
 fixed persisted SQL oracles and repeats SMP/NIC/shrink/regrow checks. Table
 fsync settings are verified against the actual engine; virtio-blk FLUSH uses
 F_FULLFSYNC. This is process-crash recovery, not a power-loss/snapshot guarantee.
+The optional `--boot-directory` pair selects the descriptor-admitted path for
+both generations. The supervisor validates private directory/file authority and
+the journal before starting either child; each VM then performs its own pinned
+boot admission. Real SIGKILL/reopen on the same private image has passed this
+path as well as the original legacy-path research control. Symlinked directory
+admission is refused before creating the recovery output.
+Descriptor mode also requires the exact `rootfs.ext4` child name, directory mode
+0700, disk mode0600, enabled filesystem ownership and no extended ACL. Actual
+wrong-file/mode/ACL/FIFO refusals precede output creation; the repaired supervisor
+also passed a fresh SIGKILL/reopen workload. These research path checks do not
+replace a product helper's pinned workspace/storage authority.
 No in-flight query or volatile RAM is promised to survive. A private inherited pipe ties VM authority to the supervisor: parent death,
 including SIGKILL, closes the only writer and causes the native owner to exit.
 Paths are canonical, marker reads use O_NOFOLLOW/fstat, and inherited environment
@@ -273,3 +284,20 @@ vCPU/coordinator join and VM destruction. It is not a successful workload run.
 
 See [G24 native API qualification](NATIVE-API-QUALIFICATION.md) for the public
 memory-control API, native quarantine repair, 17 profiles and crash recovery.
+
+## Capacity contracts and large workload qualification
+
+`NativeMemoryGovernor` retains full installed capacity unless the owner explicitly
+provides `minimumResidentBytes`. That floor must include validated workload budgets
+and guest overhead; geometry validation does not discover or certify cgroup budgets.
+The earlier lab modes deliberately opt into their boot-only research floor.
+Unsettled or below-floor admission preserves the VM's authority for a fresh
+governor; a failure after admission still quarantines memory changes.
+The stable-capacity `continuous-pressure-protected` control retains the original
+application limits and observer interval. It has passed two large ClickHouse cycles
+with no capacity changes or backing retirement; it is not a reclamation result.
+
+See [pressure compatibility](PRESSURE-COMPATIBILITY.md) for the rejected large
+autonomous-pressure attempts, protected control and separate physical backing
+experiments. Neither a successful advice call nor a lower RSS establishes safe,
+transparent physical RAM return for arbitrary workloads.

@@ -24,6 +24,8 @@ import NativeLinuxVMM
   static func run() async throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 5 else { throw Failure.arguments }
+    let pressureWide = ["continuous-pressure-wide", "continuous-pressure-protected"]
+      .contains(args[4])
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
         || [6, 8].contains(args.count)
@@ -34,15 +36,21 @@ import NativeLinuxVMM
             "continuous-churn",
             "continuous-expire", "continuous-expired-stop", "continuous-unsettled",
             "continuous-sustained",
+            "continuous-pressure-wide",
+            "continuous-pressure-protected",
             "continuous-uart", "memory-wide",
             "memory-boot-wide",
           ].contains(args[4])
     else { throw Failure.arguments }
+    guard !pressureWide || args.count == 8 else {
+      throw Failure.arguments
+    }
     if args.count == 8 {
       guard args[6] == "--boot-directory",
         [
           "memory", "adaptive", "continuous", "continuous-sustained", "memory-wide",
-          "memory-boot-wide",
+          "memory-boot-wide", "continuous-pressure-wide", "continuous-pressure-protected",
+          "crash", "recover",
         ].contains(args[4])
       else { throw Failure.arguments }
     }
@@ -60,7 +68,7 @@ import NativeLinuxVMM
     else { throw Failure.arguments }
     let geometry: NativeMemoryGeometry
     switch args[4] {
-    case "memory-wide":
+    case "memory-wide", "continuous-pressure-wide", "continuous-pressure-protected":
       geometry = try .init(bootBytes: 1024 << 20, dynamicBytes: 2 << 30)
     case "memory-boot-wide":
       geometry = try .init(bootBytes: 2 << 30, dynamicBytes: 256 << 20)
@@ -78,7 +86,9 @@ import NativeLinuxVMM
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     let manager: NativeVirtualMachineManager
     let policy: NativeExecutionPolicy =
-      args[4] == "continuous-sustained" ? .sustained : .qualification
+      ["continuous-sustained", "continuous-pressure-wide", "continuous-pressure-protected"]
+        .contains(args[4])
+      ? .sustained : .qualification
     if let resources {
       manager = NativeVirtualMachineManager(
         resources: resources, group: group, memoryGeometry: geometry, executionPolicy: policy)
@@ -96,6 +106,9 @@ import NativeLinuxVMM
     let peers = links.map { EthernetPeer(link: $0) }
     let peerTasks = peers.map { peer in Task { try await peer.run() } }
     let serverOutput = BoundedOutput()
+    let capacityLauncher = "/lab/startup-" + UUID().uuidString.lowercased()
+    let launchMinimum = geometry.maximumBytes - (128 << 20)
+    var launchReceipt: CapacityLaunchReceipt?
     let smoke = args[4] == "smoke"
     let container = try LinuxContainer(
       "swiftos-native",
@@ -103,12 +116,17 @@ import NativeLinuxVMM
       vmm: manager, vm: .init(cpus: cpus, memoryInBytes: geometry.maximumBytes)
     ) { config in
       config.cpus = cpus
-      config.memoryInBytes = 896 << 20
+      config.memoryInBytes = (pressureWide ? 2816 : 896) << 20
       config.interfaces = links
       config.process.arguments =
         smoke
         ? ["/usr/bin/clickhouse", "--version"]
         : ["/usr/bin/clickhouse", "server", "--config-file=/lab/server.xml"]
+      if pressureWide {
+        config.process.arguments =
+          [capacityLauncher, "--wait-capacity-exec", String(launchMinimum)]
+          + config.process.arguments
+      }
       config.process.environmentVariables += ["CLICKHOUSE_WATCHDOG_ENABLE=0"]
       config.process.stdout = serverOutput
       config.process.stderr = serverOutput
@@ -136,11 +154,20 @@ import NativeLinuxVMM
           try await agent.mkdir(path: base + "/lab", all: true, perms: 0o700)
           try await agent.mkdir(path: base + "/data", all: true, perms: 0o700)
           try await agent.writeFile(
-            path: base + "/lab/server.xml", data: Data(ClickHouseConfiguration.configuration.utf8),
+            path: base + "/lab/server.xml",
+            data: Data(
+              ClickHouseConfiguration.configuration(
+                maximumMemoryBytes: (pressureWide ? 2560 : 640) << 20,
+                memoryObserverIntervalSeconds: args[4] == "continuous-pressure-wide" ? 1 : 15
+              ).utf8),
             flags: .init(create: true), mode: 0o600)
           try await agent.writeFile(
             path: base + "/lab/users.xml", data: Data(ClickHouseConfiguration.users.utf8),
             flags: .init(create: true), mode: 0o600)
+          if pressureWide {
+            _ = try await uploadProbe(
+              URL(filePath: args[5]), path: base + capacityLauncher, agent: agent)
+          }
           try await agent.close()
         } catch {
           try? await agent.close()
@@ -150,6 +177,34 @@ import NativeLinuxVMM
       try await container.start()
       print("CONTAINER_STARTED")
       fflush(nil)
+      if pressureWide {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+        while launchReceipt == nil {
+          let transcript = serverOutput.text
+          let lines = transcript.split(separator: "\n", omittingEmptySubsequences: false)
+            .dropLast()
+          if let line = lines.first(where: {
+            $0.hasPrefix("CAPACITY_READY ")
+          }) {
+            guard
+              let receipt = CapacityLaunchReceipt(
+                line: Substring(line + "\n"), minimum: launchMinimum,
+                maximum: geometry.maximumBytes)
+            else { throw Failure.check("invalid capacity startup receipt") }
+            launchReceipt = receipt
+          }
+          // Preserve a completed receipt for diagnostics, but never admit past the host fence.
+          guard !serverOutput.overflowed, ContinuousClock.now < deadline else {
+            throw Failure.check("capacity startup deadline/overflow")
+          }
+          if transcript.contains("CANARY_FAIL") {
+            throw Failure.check("capacity startup guest failure " + String(transcript.prefix(512)))
+          }
+          if launchReceipt == nil {
+            try await Task.sleep(for: .milliseconds(20))
+          }
+        }
+      }
       if smoke {
         let status = try await container.wait(timeoutInSeconds: 10)
         guard status.exitCode == 0, serverOutput.text.contains("ClickHouse") else {
@@ -192,6 +247,9 @@ import NativeLinuxVMM
       "checked": checked, "serverOutput": serverOutput.text,
       "bootBytes": geometry.bootBytes, "dynamicCapacityBytes": geometry.dynamicBytes,
       "controlPlaneHighBytes": 112 << 20, "controlPlaneMaximumBytes": 128 << 20,
+      "capacityLaunchTotalBytes": launchReceipt.map { $0.totalBytes as Any } ?? NSNull(),
+      "capacityLaunchElapsedNanoseconds": launchReceipt.map { $0.elapsedNanoseconds as Any }
+        ?? NSNull(),
       "serverOutputOverflow": serverOutput.overflowed, "physicalReleasedBytes": NSNull(),
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])

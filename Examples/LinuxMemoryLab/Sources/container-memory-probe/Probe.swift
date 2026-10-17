@@ -12,6 +12,8 @@
   private enum ProbeFailure: Error {
     case system(Int32)
     case framing, integrity, topology
+    case capacityTimedOut(total: UInt64, minimum: UInt64, elapsedNanoseconds: UInt64)
+    case execution(Int32)
   }
   private func emit(_ text: String) throws {
     let bytes = Array(text.utf8)
@@ -237,6 +239,7 @@
     }
     static func run() throws {
       let args = Array(CommandLine.arguments.dropFirst())
+      if args.first == "--wait-capacity-exec" { try launchAfterCapacity(args) }
       if args == ["--memory-monitor"] {
         try emit("MEMORY_READY \(try memory())\n")
         var sequence: UInt64 = 0
@@ -397,6 +400,45 @@
         do { try stop() } catch { try? emit("CANARY_CLEANUP_FAIL \(error)\n") }
         throw error
       }
+    }
+
+    private static func launchAfterCapacity(_ args: [String]) throws -> Never {
+      guard (3...32).contains(args.count), let minimum = UInt64(args[1]),
+        ((128 << 20)...(3 << 30)).contains(minimum), args[2].hasPrefix("/"),
+        args.allSatisfy({ !$0.utf8.contains(0) }),
+        args.reduce(0, { $0 + $1.utf8.count }) <= 4096
+      else { throw ProbeFailure.framing }
+      var began = timespec()
+      guard clock_gettime(CLOCK_MONOTONIC, &began) == 0 else {
+        throw ProbeFailure.system(errno)
+      }
+      while true {
+        var now = timespec()
+        let fields = try memory().split(separator: " ")
+        guard fields.count == 2, let total = UInt64(fields[0]) else { throw ProbeFailure.framing }
+        // A blocked proc read cannot publish a capacity receipt after its deadline.
+        guard clock_gettime(CLOCK_MONOTONIC, &now) == 0, now.tv_sec >= began.tv_sec,
+          now.tv_sec - began.tv_sec < Int64.max / 1_000_000_000
+        else { throw ProbeFailure.framing }
+        let elapsed = (now.tv_sec - began.tv_sec) * 1_000_000_000 + now.tv_nsec - began.tv_nsec
+        guard elapsed >= 0 else { throw ProbeFailure.framing }
+        guard elapsed < 8_000_000_000 else {
+          throw ProbeFailure.capacityTimedOut(
+            total: total, minimum: minimum, elapsedNanoseconds: UInt64(elapsed))
+        }
+        if total >= minimum {
+          try emit("CAPACITY_READY \(total) \(elapsed)\n")
+          break
+        }
+        usleep(10000)
+      }
+      // execv replaces this Swift process and its pages; no waiting shell or extra daemon remains.
+      let strings = args.dropFirst(2).map { strdup($0) }
+      defer { for string in strings { free(string) } }
+      guard strings.allSatisfy({ $0 != nil }) else { throw ProbeFailure.system(ENOMEM) }
+      var arguments = strings + [nil]
+      _ = arguments.withUnsafeMutableBufferPointer { execv(strings[0]!, $0.baseAddress!) }
+      throw ProbeFailure.execution(errno)
     }
   }
 #else

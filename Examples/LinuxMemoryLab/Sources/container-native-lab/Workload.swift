@@ -86,9 +86,13 @@ extension Lab {
     probe: URL, mode: String
   ) async throws -> Bool {
     let geometry = vm.memoryGeometry
+    let protectedCapacity = mode == "continuous-pressure-protected"
+    let pressureWide = mode == "continuous-pressure-wide" || protectedCapacity
+    let memoryLimit: UInt64 = (pressureWide ? 2816 : 896) << 20
     var commands: [[String: String]] = []
     var observations: [[String: Any]] = []
     var resources: [[String: Any]] = []
+    var memoryDiagnostics: [[String: String]] = []
     var policySamples: [[String: Any]] = []
     var policyRequests: [[String: UInt64]] = []
     let adaptive = ["adaptive", "adaptive-busy"].contains(mode)
@@ -96,7 +100,8 @@ extension Lab {
       "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
       "continuous-stop", "continuous-churn",
       "continuous-expire", "continuous-expired-stop", "continuous-unsettled",
-      "continuous-sustained", "continuous-uart",
+      "continuous-sustained", "continuous-uart", "continuous-pressure-wide",
+      "continuous-pressure-protected",
     ].contains(mode)
     var churn: [[String: UInt64]] = []
     var expectedGracefulStop = false
@@ -134,16 +139,8 @@ extension Lab {
     do {
       let agent = try await vm.dialAgent()
       do {
-        let handle = try FileHandle(forReadingFrom: probe)
-        defer { try? handle.close() }
-        var written = 0
-        while let bytes = try handle.read(upToCount: 65536), !bytes.isEmpty {
-          guard bytes.count <= (8 << 20) - written else { throw Failure.check("probe size") }
-          try await agent.writeFile(
-            path: "/run/container/swiftos-native/rootfs" + guestProbe, data: bytes,
-            flags: .init(create: written == 0, append: written != 0), mode: 0o700)
-          written += bytes.count
-        }
+        let written = try await uploadProbe(
+          probe, path: "/run/container/swiftos-native/rootfs" + guestProbe, agent: agent)
         guard written > 0 else { throw Failure.check("probe empty") }
         let metadata = try await agent.stat(
           root: "/run/container/swiftos-native/rootfs", path: guestProbe)
@@ -168,6 +165,21 @@ extension Lab {
         try await Task.sleep(for: .milliseconds(100))
       }
       guard ready else { throw Failure.check("server readiness") }
+      if pressureWide {
+        let interval = try await sql(
+          container,
+          query:
+            "SELECT value FROM system.server_settings WHERE name='cgroups_memory_usage_observer_wait_time' LIMIT 1"
+        )
+        guard interval == (protectedCapacity ? "15" : "1") else {
+          throw Failure.check("memory observer interval " + interval)
+        }
+        commands.append([
+          "applicationCapacityObserverSeconds": interval,
+          "applicationCapacityCompatibility": protectedCapacity
+            ? "protected-capacity-control" : "explicit-observer-cadence",
+        ])
+      }
       if mode != "recover" {
         _ = try await sql(
           container,
@@ -313,8 +325,9 @@ extension Lab {
         sequence = Int(reply.sequence)
         return (reply.count, reply.bytes)
       }
-      func waitObserver(_ bytes: UInt64?) async throws {
-        let deadline = ContinuousClock.now.advanced(by: .seconds(8))
+      func waitObserver(
+        _ bytes: UInt64?, deadline: ContinuousClock.Instant = .now.advanced(by: .seconds(8))
+      ) async throws {
         guard let observer else { throw Failure.check("observer missing") }
         repeat {
           try Task.checkCancellation()
@@ -356,7 +369,7 @@ extension Lab {
           ])
           // memory.max events include successful file-cache reclaim, not only OOM failures.
           guard events.oom == 0, events.oomKill == 0,
-            memory.limitBytes == 896 << 20, memory.usageBytes <= memory.limitBytes
+            memory.limitBytes == memoryLimit, memory.usageBytes <= memory.limitBytes
           else { throw Failure.check("cgroup limits/OOM \(resources.last!)") }
         } catch {
           try? await agent.close()
@@ -392,6 +405,24 @@ extension Lab {
           guard refused.generation == 0, !refused.retired, !refused.quarantined else {
             throw Failure.check("retryable refusal consumed memory authority")
           }
+          try vm.releaseDiagnosticAlias()
+          try await waitMemory(vm, bytes: 0)
+          _ = try await waitGuestMemory(bootGuestBytes, deadline: .now.advanced(by: .seconds(8)))
+          let belowFloor = NativeMemoryGovernor(
+            probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes)
+          var floorError: NativeControlFailure?
+          do { try await belowFloor.run() } catch let error as NativeControlFailure {
+            floorError = error
+          }
+          let floorRefusal = vm.memoryControlStatus
+          commands.append([
+            "defaultFloorEntryFailure": floorError.map { String(describing: $0) } ?? "",
+            "defaultFloorEntryGeneration": String(floorRefusal.generation),
+            "defaultFloorEntryRetired": String(floorRefusal.retired),
+          ])
+          guard floorError == .belowResidentFloor, floorRefusal.generation == 0,
+            !floorRefusal.retired, !floorRefusal.quarantined
+          else { throw Failure.check("resident floor refusal consumed memory authority") }
           try vm.requestMemory(bytes: geometry.dynamicBytes)
           try await waitMemory(vm, bytes: geometry.dynamicBytes)
           _ = try await waitGuestMemory(initialMemory, deadline: .now.advanced(by: .seconds(8)))
@@ -421,6 +452,7 @@ extension Lab {
         }
         let driver = NativeMemoryGovernor(
           probe: telemetry, vm: vm, began: began, bootGuestBytes: bootGuestBytes,
+          minimumResidentBytes: protectedCapacity ? nil : geometry.bootBytes,
           lifetimeDeadline: mode == "continuous-expired-stop"
             ? .now.advanced(by: .seconds(-1))
             : mode == "continuous-expire"
@@ -559,7 +591,9 @@ extension Lab {
             try await resourceSnapshot("cancelled-pending")
           }
         } else {
-          try await waitObserver(0)
+          try await waitObserver(
+            protectedCapacity ? geometry.dynamicBytes : 0,
+            deadline: .now.advanced(by: .seconds(pressureWide ? 30 : 8)))
         }
       }
       if expectedCancellation || expectedLifetimeExpiry {
@@ -612,6 +646,73 @@ extension Lab {
       for cycle
         in (expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry ? [] : [1, 2])
       {
+        var pressurePeakGuest: UInt64 = 0
+        var pressurePeakBacking: UInt64 = 0
+        if pressureWide {
+          // Sixteen 128 MiB policy steps need their own aggregate phase fence;
+          // the governor's wire/completion/drain fences remain unchanged.
+          try await waitObserver(
+            protectedCapacity ? geometry.dynamicBytes : 0,
+            deadline: .now.advanced(by: .seconds(30)))
+          _ = try await sql(
+            container,
+            query:
+              "CREATE TABLE IF NOT EXISTS default.pressure_lab (id UInt64, payload String) ENGINE=Memory SETTINGS compress=0"
+          )
+          for index in 0..<17 {
+            let offset = index * 32768
+            _ = try await sql(
+              container,
+              query:
+                "INSERT INTO default.pressure_lab SELECT number + \(offset), repeat(hex(cityHash64(number + \(offset))), 256) FROM numbers(32768) SETTINGS max_block_size=2048"
+            )
+            if index % 4 == 0 {
+              guard try await sql(container, query: integrity) == expected else {
+                throw Failure.check("integrity during pressure ramp")
+              }
+            }
+            commands.append([
+              "pressureCycle": String(cycle), "pressureBatches": String(index + 1),
+              "heldPressureBytes": String((index + 1) * (128 << 20)),
+              "pluggedBytes": String(vm.pluggedBytes), "capturedAt": String(now()),
+            ])
+            // Backpressure the workload on fresh guest headroom, not on a fixed success delay.
+            let firstSequence = observer!.snapshot.sampleHistory.totalCount
+            let headroomDeadline = ContinuousClock.now.advanced(by: .seconds(8))
+            while true {
+              let sample = observer!.snapshot
+              guard sample.failure.isEmpty, ContinuousClock.now < headroomDeadline else {
+                throw Failure.check("pressure ramp headroom")
+              }
+              if sample.sampleHistory.totalCount >= firstSequence + 2, !sample.pending,
+                sample.capacityReady,
+                sample.samples.last?["guestAvailableBytes"].map({ $0 >= 480 << 20 }) == true
+                  || vm.pluggedBytes == geometry.dynamicBytes
+              {
+                break
+              }
+              try await Task.sleep(for: .milliseconds(200))
+            }
+          }
+          let pressureTable = try await sql(
+            container,
+            query:
+              "SELECT total_rows, total_bytes FROM system.tables WHERE database='default' AND name='pressure_lab' LIMIT 1"
+          )
+          let pressureFields = pressureTable.split(separator: "\t")
+          guard pressureFields.count == 2, UInt64(pressureFields[0]) == 557056,
+            let allocated = UInt64(pressureFields[1]), allocated >= 2176 << 20
+          else { throw Failure.check("pressure table accounting \(pressureTable)") }
+          commands.append([
+            "pressureTableRows": "557056", "pressureTableAllocatedBytes": String(allocated),
+          ])
+          try await waitObserver(
+            geometry.dynamicBytes, deadline: .now.advanced(by: .seconds(30)))
+          pressurePeakGuest = try await verify("OBS")
+          guard pressurePeakGuest == initialMemory else { throw Failure.check("pressure growth") }
+          pressurePeakBacking = vm.memoryControlStatus.backingRetiredBytes
+          try await resourceSnapshot("pressure-peak-\(cycle)")
+        }
         let queryID = "swiftos-load-\(cycle)"
         let query =
           "SELECT sum(n.number + sleepEachRow(0.00004)) FROM numbers(100000) AS n INNER JOIN (SELECT id, payload FROM default.ram_lab WHERE id < 100000) AS r ON n.number = r.id AND repeat(hex(cityHash64(n.number)), 8) = r.payload LIMIT 1 SETTINGS join_algorithm='hash'"
@@ -631,6 +732,61 @@ extension Lab {
           try await Task.sleep(for: .milliseconds(25))
         }
         guard observed >= 16 << 20 else { throw Failure.check("active query not observed") }
+        if pressureWide {
+          _ = try await sql(container, query: "TRUNCATE TABLE default.pressure_lab")
+          // This releases the workload's allocator pages; VM capacity changes remain autonomous.
+          _ = try await sql(container, query: "SYSTEM JEMALLOC PURGE")
+          if protectedCapacity {
+            let aggregate = try await activeLoad!.value
+            activeLoad = nil
+            try await waitObserver(geometry.dynamicBytes)
+            let retained = try await verify()
+            guard retained == initialMemory, aggregate == "4999950000",
+              observer!.minimumResidentBytes == geometry.maximumBytes,
+              observer!.snapshot.requestHistory.totalCount == 0,
+              vm.memoryControlStatus.backingRetiredBytes == 0,
+              try await sql(container, query: integrity) == expected
+            else { throw Failure.check("protected capacity/integrity") }
+            try await resourceSnapshot("protected-retained-\(cycle)")
+            observations.append([
+              "cycle": cycle, "pressureTableRows": 557056, "heldPressureBytes": 2176 << 20,
+              "protectedCapacity": true, "retiredBackingBytes": 0,
+              "regrownGuestBytes": pressurePeakGuest, "shrunkGuestBytes": retained,
+              "activeQueryMemoryBytes": observed, "workloadAllocatorPurgeRequested": true,
+              "integrity": expected, "loadResult": aggregate,
+            ])
+            continue
+          }
+          let retirementDeadline = ContinuousClock.now.advanced(by: .seconds(8))
+          while vm.memoryControlStatus.backingRetiredBytes == pressurePeakBacking {
+            guard ContinuousClock.now < retirementDeadline,
+              observer?.status.failure.isEmpty == true
+            else { throw Failure.check("pressure retirement did not begin") }
+            try await Task.sleep(for: .milliseconds(5))
+          }
+          let activeDuringRetirement = try await loadState(cycle: cycle)
+          guard activeDuringRetirement.0 == 1, activeDuringRetirement.1 >= 16 << 20 else {
+            throw Failure.check("SQL not live during native backing retirement")
+          }
+          let aggregate = try await activeLoad!.value
+          activeLoad = nil
+          try await waitObserver(0, deadline: .now.advanced(by: .seconds(30)))
+          let shrunk = try await verify()
+          let retired = vm.memoryControlStatus.backingRetiredBytes - pressurePeakBacking
+          guard shrunk == bootGuestBytes, retired == geometry.dynamicBytes,
+            aggregate == "4999950000", try await sql(container, query: integrity) == expected
+          else { throw Failure.check("pressure return/integrity") }
+          try await resourceSnapshot("pressure-returned-\(cycle)")
+          observations.append([
+            "cycle": cycle, "pressureTableRows": 557056, "heldPressureBytes": 2176 << 20,
+            "workloadAllocatorPurgeRequested": true,
+            "regrownGuestBytes": pressurePeakGuest, "shrunkGuestBytes": shrunk,
+            "retiredBackingBytes": retired,
+            "activeDuringFirstRetirementMemoryBytes": activeDuringRetirement.1,
+            "integrity": expected, "loadResult": aggregate,
+          ])
+          continue
+        }
         if continuous {
           _ = try await verify("HOLD")
           try await waitObserver(nil)
@@ -860,7 +1016,33 @@ extension Lab {
         try await memoryMonitor.delete()
       }
       memoryMonitor = nil
-    } catch { primary = String(describing: error) }
+    } catch {
+      primary = String(describing: error)
+      if pressureWide {
+        for (name, query) in [
+          (
+            "server-settings",
+            "SELECT name, value FROM system.server_settings WHERE name IN ('max_server_memory_usage','max_server_memory_usage_to_ram_ratio','memory_worker_use_cgroup','memory_worker_dynamic_hard_limit','memory_worker_rss_speculative_reserve_ratio','cgroups_memory_usage_observer_wait_time') LIMIT 8"
+          ),
+          (
+            "async-memory",
+            "SELECT metric, value FROM system.asynchronous_metrics WHERE metric LIKE '%Memory%' LIMIT 100"
+          ),
+          (
+            "current-memory",
+            "SELECT metric, value FROM system.metrics WHERE metric LIKE '%Memory%' LIMIT 100"
+          ),
+        ] {
+          do {
+            memoryDiagnostics.append([
+              "kind": name, "reply": try await sql(container, query: query),
+            ])
+          } catch {
+            memoryDiagnostics.append(["kind": name, "error": String(describing: error)])
+          }
+        }
+      }
+    }
     if let task = observerTask {
       task.cancel()
       switch await task.result {
@@ -910,6 +1092,10 @@ extension Lab {
       "primaryError": primary, "cleanupErrors": cleanup,
       "cycles": observations, "canaryTranscript": transcript, "commands": commands,
       "churn": churn,
+      "pressureWide": pressureWide, "containerMemoryLimitBytes": memoryLimit,
+      "protectedCapacityControl": protectedCapacity,
+      "minimumResidentBytes": observer.map { $0.minimumResidentBytes as Any } ?? NSNull(),
+      "memoryDiagnostics": memoryDiagnostics,
       "canaryTranscriptTotal": await session.transcriptTotal,
       "canaryTranscriptDropped": await session.transcriptDropped,
       "canaryBytes": 64 << 20, "rows": 400000, "resources": resources,

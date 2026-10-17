@@ -1,10 +1,12 @@
 import Darwin
 import Foundation
+import PageMemory
 
 @main private struct Recovery {
   enum Failure: Error {
     case arguments
     case native(String, Int32)
+    case authority(String, String)
     case deadline, evidence
   }
   static func main() {
@@ -15,7 +17,9 @@ import Foundation
   }
   static func run() throws {
     let args = Array(CommandLine.arguments.dropFirst())
-    guard args.count == 6 else { throw Failure.arguments }
+    guard [6, 8].contains(args.count) else { throw Failure.arguments }
+    let bootDirectory = args.count == 8 ? URL(filePath: args[7]) : nil
+    if args.count == 8 { guard args[6] == "--boot-directory" else { throw Failure.arguments } }
     let output = URL(filePath: args[4])
     let root = output.deletingLastPathComponent().deletingLastPathComponent()
     var directoryInfo = stat()
@@ -24,8 +28,27 @@ import Foundation
       output.standardizedFileURL == output, output.resolvingSymlinksInPath() == output,
       output.deletingLastPathComponent().lastPathComponent == "results"
     else { throw Failure.arguments }
+    if let bootDirectory {
+      guard bootDirectory.path == args[7], bootDirectory.standardizedFileURL == bootDirectory,
+        bootDirectory.resolvingSymlinksInPath() == bootDirectory,
+        bootDirectory.path.hasPrefix(root.appending(path: "artifacts").path + "/")
+      else { throw Failure.arguments }
+      let fd = open(bootDirectory.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+      guard fd >= 0 else { throw Failure.arguments }
+      defer { _ = Darwin.close(fd) }
+      var metadata = stat()
+      guard fstat(fd, &metadata) == 0, metadata.st_uid == getuid(),
+        metadata.st_mode & 0o777 == 0o700
+      else { throw Failure.native("boot-directory-private-mode", EPERM) }
+      do { try DarwinFileAuthority.validate(fd) } catch {
+        throw Failure.authority("boot-directory", String(describing: error))
+      }
+      guard URL(filePath: args[3]) == bootDirectory.appending(path: "rootfs.ext4") else {
+        throw Failure.native("descriptor-rootfs-name", EINVAL)
+      }
+    }
     let marker = root.appending(path: "OWNER.json")
-    let fd = open(marker.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+    let fd = open(marker.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
     guard fd >= 0 else { throw Failure.arguments }
     let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     defer { try? handle.close() }
@@ -42,17 +65,32 @@ import Foundation
       (0, "artifacts"), (1, "inputs"), (2, "artifacts"), (3, "artifacts"), (5, "artifacts"),
     ] {
       let file = URL(filePath: args[index])
+      let parent = (index == 3 ? bootDirectory : nil) ?? root.appending(path: directory)
       var metadata = stat()
       guard file.path == args[index], file.standardizedFileURL == file,
         file.resolvingSymlinksInPath() == file,
-        file.deletingLastPathComponent().path == root.appending(path: directory).path,
+        file.deletingLastPathComponent().path == parent.path,
         lstat(file.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
         metadata.st_uid == getuid(), metadata.st_nlink == 1
       else { throw Failure.native("canonical-input-\(index)", EINVAL) }
     }
 
-    let diskHandle = try FileHandle(forReadingFrom: URL(filePath: args[3]))
+    let diskFD = open(args[3], O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard diskFD >= 0 else { throw Failure.native("recovery-disk-open", errno) }
+    let diskHandle = FileHandle(fileDescriptor: diskFD, closeOnDealloc: true)
     defer { try? diskHandle.close() }
+    var diskInfo = stat()
+    guard fstat(diskFD, &diskInfo) == 0, diskInfo.st_mode & S_IFMT == S_IFREG,
+      diskInfo.st_uid == getuid(), diskInfo.st_nlink == 1
+    else { throw Failure.arguments }
+    if bootDirectory != nil {
+      guard diskInfo.st_mode & 0o777 == 0o600 else {
+        throw Failure.native("recovery-disk-private-mode", EPERM)
+      }
+      do { try DarwinFileAuthority.validate(diskFD) } catch {
+        throw Failure.authority("recovery-disk", String(describing: error))
+      }
+    }
     try diskHandle.seek(toOffset: 1024)
     guard let superblock = try diskHandle.read(upToCount: 1024), superblock.count == 1024,
       superblock.withUnsafeBytes({
@@ -126,7 +164,8 @@ import Foundation
         posix_spawnattr_setflags(
           &attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT)) == 0
       else { throw Failure.native("spawn-attributes", errno) }
-      let command = [args[0], args[1], args[2], args[3], directory.path, mode, args[5]]
+      var command = [args[0], args[1], args[2], args[3], directory.path, mode, args[5]]
+      if let bootDirectory { command += ["--boot-directory", bootDirectory.path] }
       var argv = command.map { strdup($0) } + [nil]
       var environment = ProcessInfo.processInfo.environment.filter {
         ["PATH", "TMPDIR", "LANG", "LC_ALL", "SWIFTOS_LAB_CPUS"].contains($0.key)

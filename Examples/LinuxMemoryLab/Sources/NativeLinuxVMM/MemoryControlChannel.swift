@@ -6,7 +6,7 @@ import Synchronization
 public enum NativeControlFailure: Error, Equatable, Sendable {
   case arguments, framing, disconnected, wireTimedOut, invariant, ownership
   case capacityTimedOut, drainTimedOut, lifetimeExpired, staleObservation
-  case unsettled, quarantineTimedOut
+  case unsettled, belowResidentFloor, quarantineTimedOut
 }
 
 /// A single-consumer command wire, bounded to one queued command of at most64 bytes.

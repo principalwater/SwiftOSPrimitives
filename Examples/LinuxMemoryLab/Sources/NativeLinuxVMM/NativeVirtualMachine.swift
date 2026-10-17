@@ -355,12 +355,15 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
   public func requestMemory(bytes: UInt64) throws {
     try requestMemory(bytes: bytes, owner: nil)
   }
-  func claimMemoryControl() throws -> UInt64 {
+  func claimMemoryControl(minimumResidentBytes: UInt64) throws -> UInt64 {
     try control.state.withLock {
       guard $0.memoryOwner == nil, !$0.memoryControlRetired, $0.memoryGeneration < UInt64.max
       else { throw NativeControlFailure.ownership }
       guard $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
       guard $0.plugged == $0.requested else { throw NativeControlFailure.unsettled }
+      guard control.geometry.bootBytes + $0.plugged >= minimumResidentBytes else {
+        throw NativeControlFailure.belowResidentFloor
+      }
       $0.memoryGeneration += 1
       $0.memoryOwner = $0.memoryGeneration
       return $0.memoryGeneration

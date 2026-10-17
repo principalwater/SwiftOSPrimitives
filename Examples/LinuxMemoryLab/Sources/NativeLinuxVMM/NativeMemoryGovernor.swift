@@ -24,6 +24,9 @@ public final class NativeMemoryGovernor: Sendable {
   private let probe: NativeMemorySession
   private let vm: NativeVirtualMachine
   private let bootGuestBytes: UInt64
+  /// An owner-validated floor including workload budgets and guest overhead.
+  /// Full installed capacity is retained when the owner has supplied no such contract.
+  public let minimumResidentBytes: UInt64
   private let began: ContinuousClock.Instant
   private let lifetimeDeadline: ContinuousClock.Instant?
   private let samplingInterval: Duration
@@ -42,13 +45,18 @@ public final class NativeMemoryGovernor: Sendable {
   }
   public init(
     probe: NativeMemorySession, vm: NativeVirtualMachine, began: ContinuousClock.Instant,
-    bootGuestBytes: UInt64, lifetimeDeadline: ContinuousClock.Instant? = nil,
+    bootGuestBytes: UInt64, minimumResidentBytes: UInt64? = nil,
+    lifetimeDeadline: ContinuousClock.Instant? = nil,
     samplingInterval: Duration = .milliseconds(200)
   ) {
     self.probe = probe
     self.vm = vm
     self.began = began
     self.bootGuestBytes = bootGuestBytes
+    self.minimumResidentBytes = minimumResidentBytes ?? vm.memoryGeometry.maximumBytes
+    precondition(self.minimumResidentBytes >= vm.memoryGeometry.bootBytes)
+    precondition(self.minimumResidentBytes <= vm.memoryGeometry.maximumBytes)
+    precondition(self.minimumResidentBytes % (2 << 20) == 0)
     precondition(began <= .now && bootGuestBytes <= UInt64.max - vm.memoryGeometry.dynamicBytes)
     precondition(samplingInterval >= .milliseconds(100) && samplingInterval <= .seconds(1))
     self.lifetimeDeadline = lifetimeDeadline
@@ -78,8 +86,8 @@ public final class NativeMemoryGovernor: Sendable {
         began.advanced(by: .nanoseconds(Int64($0.issuedAtNanoseconds) + 8_000_000_000))
       }, stoppedAt: stoppedAt, lifetime: lifetimeDeadline)
   }
-  /// Run once in an owner task and join it before stopping the VM. A failed run quarantines
-  /// further memory setters until the VM is retired; it does not destroy the owner's VM.
+  /// Run once in an owner task and join it before stopping the VM. Admission refusals preserve
+  /// VM authority; failures after admission quarantine setters without destroying the owner's VM.
   public func run() async throws {
     try Task.checkCancellation()
     try state.withLock {
@@ -90,7 +98,7 @@ public final class NativeMemoryGovernor: Sendable {
     let geometry = vm.memoryGeometry
     guard
       let budget = BalloonBudget(
-        installedBytes: geometry.maximumBytes, minimumResidentBytes: geometry.bootBytes,
+        installedBytes: geometry.maximumBytes, minimumResidentBytes: minimumResidentBytes,
         granuleBytes: 2 << 20, maximumStepBytes: min(128 << 20, geometry.dynamicBytes)),
       var controller = BalloonController(
         budget: budget, epoch: 1, guestReserveBytes: 512 << 20, hysteresisBytes: 32 << 20,
@@ -104,7 +112,7 @@ public final class NativeMemoryGovernor: Sendable {
       throw NativeControlFailure.invariant
     }
     let lease: UInt64
-    do { lease = try vm.claimMemoryControl() } catch {
+    do { lease = try vm.claimMemoryControl(minimumResidentBytes: minimumResidentBytes) } catch {
       state.withLock {
         $0.running = false
         $0.failureError = error
