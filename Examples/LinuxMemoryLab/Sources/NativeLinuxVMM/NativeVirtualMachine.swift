@@ -120,7 +120,7 @@ final class NativeControl: Sendable {
           throw NativeFailure.stopped("console-open \(errno)")
         }
         machine.consoleSink = FileHandle(fileDescriptor: consoleDescriptor, closeOnDealloc: true)
-        kernelImage = try Data(contentsOf: kernel, options: .mappedIfSafe)
+        kernelImage = try NativeBootResources.kernelImage(at: kernel.path)
       }
       try machine.boot(kernel: consume kernelImage, initrd: Data())
     } catch { primary = String(describing: error) }
@@ -141,6 +141,9 @@ final class NativeControl: Sendable {
     }
     for listener in listeners {
       do { try listener.finish() } catch { cleanup.append("listener-finish \(error)") }
+    }
+    if !machine.created, cleanup.isEmpty {
+      do { try resources?.retire() } catch { cleanup.append("boot-resources-retire \(error)") }
     }
     if lease, !machine.created, cleanup.isEmpty {
       NativeProcessLease.claimed.withLock { $0 = false }
@@ -411,7 +414,12 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       }
       return code
     }
-    guard status == 0 else { throw NativeFailure.stopped("pthread-create \(status)") }
+    guard status == 0 else {
+      do { try control.resources?.retire() } catch {
+        throw NativeFailure.failedStart("pthread-create \(status)", String(describing: error))
+      }
+      throw NativeFailure.stopped("pthread-create \(status)")
+    }
     do {
       let deadline = ContinuousClock.now.advanced(by: .seconds(5))
       while true {
@@ -443,7 +451,10 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       }
       return $0.started
     }
-    guard started else { return }
+    guard started else {
+      try control.resources?.retire()
+      return
+    }
     let deadline = ContinuousClock.now.advanced(by: .seconds(10))
     while !control.state.withLock({ $0.ended }) {
       guard ContinuousClock.now < deadline else { throw NativeFailure.deadline }

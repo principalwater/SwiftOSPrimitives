@@ -230,3 +230,18 @@ qualifies the optional Apple Container adapter with800k synthetic rows, native
 cgroup/CPU/Mach observations and actual shrink/grow/reclaim completion. It also
 covers finite paused-VM recovery. Physical VZ host RAM release and persistent
 in-process forced recovery remain explicitly unqualified.
+
+
+## macOS descriptor authority
+
+`DarwinFileAuthority.validate(_:)` adds enforced-volume-ownership and extended-ACL
+checks to a caller's existing type/uid/mode/link validation. It borrows an already
+open descriptor: the caller must keep that descriptor open and prevent concurrent
+close/reassignment throughout the call. It never rewrites permissions. This API
+is macOS-only and does not establish integrity of a filesystem's backing device
+or disk-image file.
+
+The native VM and ContainerWorkspace use this shared admission boundary. See
+[storage authority qualification](Examples/LinuxMemoryLab/STORAGE-AUTHORITY-QUALIFICATION.md)
+for actual negative controls, corrected lifetime behavior, hardware tests and
+remaining production/security limits.

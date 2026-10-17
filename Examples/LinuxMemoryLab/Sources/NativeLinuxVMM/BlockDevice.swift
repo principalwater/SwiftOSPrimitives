@@ -24,19 +24,43 @@ final class BlockDevice {
     let file = URL(filePath: path)
     let root = file.deletingLastPathComponent().deletingLastPathComponent()
     let marker = root.appending(path: "OWNER.json")
-    let attributes = try FileManager.default.attributesOfItem(atPath: marker.path)
-    guard (attributes[.size] as? NSNumber)?.intValue ?? Int.max <= 4096,
-      file.resolvingSymlinksInPath() == file,
+    guard file.resolvingSymlinksInPath() == file,
       file.lastPathComponent.hasPrefix("clickhouse-run-")
         || readOnly && file.lastPathComponent == "initfs.ext4", file.pathExtension == "ext4",
       file.deletingLastPathComponent().lastPathComponent == "artifacts"
     else { throw DeviceFailure.geometry }
-    let owner = try JSONSerialization.jsonObject(with: Data(contentsOf: marker)) as? [String: Any]
+    let markerFD = open(marker.path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC)
+    guard markerFD >= 0 else { throw DeviceFailure.geometry }
+    defer { Darwin.close(markerFD) }
+    var markerInfo = stat()
+    guard fstat(markerFD, &markerInfo) == 0, markerInfo.st_mode & S_IFMT == S_IFREG,
+      markerInfo.st_size > 0, markerInfo.st_size <= 4096, markerInfo.st_nlink == 1,
+      markerInfo.st_uid == getuid()
+    else { throw DeviceFailure.geometry }
+    var contents = Data(count: Int(markerInfo.st_size))
+    try contents.withUnsafeMutableBytes { bytes in
+      var offset = 0
+      while offset < bytes.count {
+        let count = pread(
+          markerFD, bytes.baseAddress! + offset, bytes.count - offset, off_t(offset))
+        if count < 0, errno == EINTR { continue }
+        guard count > 0 else { throw DeviceFailure.geometry }
+        offset += count
+      }
+    }
+    var after = stat()
+    guard fstat(markerFD, &after) == 0, after.st_size == markerInfo.st_size,
+      after.st_mtimespec.tv_sec == markerInfo.st_mtimespec.tv_sec,
+      after.st_mtimespec.tv_nsec == markerInfo.st_mtimespec.tv_nsec,
+      after.st_ctimespec.tv_sec == markerInfo.st_ctimespec.tv_sec,
+      after.st_ctimespec.tv_nsec == markerInfo.st_ctimespec.tv_nsec
+    else { throw DeviceFailure.geometry }
+    let owner = try JSONSerialization.jsonObject(with: contents) as? [String: Any]
     guard owner?["root"] as? String == root.path,
       owner?["purpose"] as? String == "isolated-container-managed-G23",
       owner?["uid"] as? Int == Int(getuid())
     else { throw DeviceFailure.geometry }
-    descriptor = open(path, (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC | O_NOFOLLOW)
+    descriptor = open(path, (readOnly ? O_RDONLY : O_RDWR) | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK)
     guard descriptor >= 0 else { throw DeviceFailure.native(errno) }
     var metadata = stat()
     guard flock(descriptor, LOCK_EX | LOCK_NB) == 0,

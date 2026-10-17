@@ -1,5 +1,6 @@
 import Containerization
 import Darwin
+import Darwin.membership
 import Foundation
 import NIOPosix
 import Testing
@@ -10,8 +11,10 @@ private final class BootFixture {
   var root: URL
   let initial: URL
   var directory: Int32
-  init() throws {
-    let temporary = try #require(ProcessInfo.processInfo.environment["TMPDIR"])
+  init(base: String? = nil) throws {
+    let temporary = try #require(
+      base ?? ProcessInfo.processInfo.environment["SWIFTOS_BOOT_TEST_ROOT"]
+        ?? ProcessInfo.processInfo.environment["TMPDIR"])
     root = URL(filePath: temporary).appending(path: "boot-" + UUID().uuidString)
     initial = root
     try FileManager.default.createDirectory(
@@ -172,9 +175,69 @@ func invalidBootResourcesRefuseBeforeCreatingConsole(_ fault: String) throws {
     }
     try await vm.stop()
     #expect(vm.state == .stopped)
+    withExtendedLifetime(manager) {
+      #expect(throws: NativeBootResources.Failure.self) { _ = try resources.takeKernel() }
+      #expect(throws: NativeBootResources.Failure.self) {
+        let descriptor = try resources.duplicateConsole()
+        Darwin.close(descriptor)
+      }
+    }
+    let reopened = try NativeBootResources(directoryDescriptor: fixture.directory)
+    #expect(reopened.id != resources.id)
     try await group.shutdownGracefully()
   } catch {
     try? await group.shutdownGracefully()
     throw error
   }
+}
+
+@Test(arguments: ["directory", "kernel", "initfs.ext4", "rootfs.ext4"])
+func extendedBootAccessRefusesBeforeCreatingConsole(_ target: String) throws {
+  let fixture = try BootFixture()
+  var filesystem = statfs()
+  try #require(fstatfs(fixture.directory, &filesystem) == 0)
+  try #require(filesystem.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) == 0)
+  let descriptor =
+    target == "directory"
+    ? dup(fixture.directory)
+    : openat(
+      fixture.directory, target, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+  try #require(descriptor >= 0)
+  defer { Darwin.close(descriptor) }
+  var acl = acl_init(1)
+  try #require(acl != nil)
+  defer { if let acl { acl_free(UnsafeMutableRawPointer(acl)) } }
+  var entry: acl_entry_t?
+  try #require(acl_create_entry(&acl, &entry) == 0)
+  let item = try #require(entry)
+  try #require(acl_set_tag_type(item, ACL_EXTENDED_ALLOW) == 0)
+  var group = UUID().uuid
+  try #require(mbr_gid_to_uuid(getgid(), &group) == 0)
+  try #require(acl_set_qualifier(item, &group) == 0)
+  var permissions: acl_permset_t?
+  try #require(acl_get_permset(item, &permissions) == 0)
+  let granted = try #require(permissions)
+  try #require(acl_add_perm(granted, ACL_READ_DATA) == 0)
+  try #require(acl_add_perm(granted, ACL_WRITE_DATA) == 0)
+  let access = try #require(acl)
+  try #require(acl_set_fd_np(descriptor, access, ACL_TYPE_EXTENDED) == 0)
+  let before = try FileManager.default.contentsOfDirectory(atPath: fixture.root.path).sorted()
+  #expect(throws: NativeBootResources.Failure.self) {
+    _ = try NativeBootResources(directoryDescriptor: fixture.directory)
+  }
+  #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.root.path).sorted() == before)
+}
+
+@Test(.enabled(if: ProcessInfo.processInfo.environment["SWIFTOS_NOOWNERS_TEST_ROOT"] != nil))
+func ignoredOwnersVolumeCannotSupplyPrivateBootAuthority() throws {
+  let base = try #require(ProcessInfo.processInfo.environment["SWIFTOS_NOOWNERS_TEST_ROOT"])
+  let fixture = try BootFixture(base: base)
+  var filesystem = statfs()
+  try #require(fstatfs(fixture.directory, &filesystem) == 0)
+  try #require(filesystem.f_flags & UInt32(MNT_IGNORE_OWNERSHIP) != 0)
+  let before = try FileManager.default.contentsOfDirectory(atPath: fixture.root.path).sorted()
+  #expect(throws: NativeBootResources.Failure.self) {
+    _ = try NativeBootResources(directoryDescriptor: fixture.directory)
+  }
+  #expect(try FileManager.default.contentsOfDirectory(atPath: fixture.root.path).sorted() == before)
 }
