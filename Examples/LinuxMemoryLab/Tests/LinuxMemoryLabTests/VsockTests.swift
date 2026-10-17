@@ -194,3 +194,51 @@ private func control() -> NativeControl {
   #expect(received == payload)
   #expect(device.connections.isEmpty)
 }
+
+@Test(.timeLimit(.minutes(1)))
+func repeatedVsockReadsOwnTheirPayloadAndCannotLeakTheScratchTail() throws {
+  let device = VsockDevice(control: control())
+  let pair = try VsockDevice.pair()
+  defer {
+    _ = Darwin.close(pair.1)
+    device.close()
+  }
+  try #require(fcntl(pair.1, F_SETFL, O_NONBLOCK) == 0)
+  try device.open(1024, descriptor: pair.0, token: 0x2000_0000)
+  try device.receive(guestPacket(operation: 2))
+  device.transport.status = 12
+  let first = Data((0..<16384).map { UInt8(truncatingIfNeeded: $0 &* 17) })
+  let second = Data([0xa5, 0x19, 0xff])
+  var total = 0
+  var original: [Data] = []
+  func poll() throws {
+    try device.poll(
+      memory: { _, _ in throw DeviceFailure.request },
+      payloadMemory: { _, _ in throw DeviceFailure.request })
+  }
+  for data in [first, second] {
+    var sent = 0
+    var attempts = 0
+    while sent < data.count {
+      attempts += 1
+      try #require(attempts <= 16)
+      let written = data.withUnsafeBytes {
+        Darwin.write(pair.1, $0.baseAddress! + sent, $0.count - sent)
+      }
+      if written > 0 { sent += written }
+      else { try #require(written < 0 && [EINTR, EAGAIN, EWOULDBLOCK].contains(errno)) }
+      try poll()
+    }
+    total += data.count
+    for _ in 0..<16 where device.connections.values.first?.sent != UInt32(total) {
+      try poll()
+    }
+    try #require(device.connections.values.first?.sent == UInt32(total))
+    if original.isEmpty { original = device.packets.filter { $0.operation == 5 }.map(\.payload) }
+  }
+  let packets = device.packets.filter { $0.operation == 5 }.map(\.payload)
+  #expect(Array(packets.prefix(original.count)) == original)
+  #expect(packets.reduce(into: Data()) { $0.append($1) } == first + second)
+  for _ in 0..<10 { try poll() }
+  #expect(device.packets.filter { $0.operation == 5 }.map(\.payload) == packets)
+}

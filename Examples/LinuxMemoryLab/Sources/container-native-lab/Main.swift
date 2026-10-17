@@ -24,22 +24,30 @@ import NativeLinuxVMM
   static func run() async throws {
     let args = Array(CommandLine.arguments.dropFirst())
     guard args.count >= 5 else { throw Failure.arguments }
-    let classic = ["memory-balloon", "memory-balloon-wide", "pressure-balloon"].contains(args[4])
+    let classic = [
+      "memory-balloon", "memory-balloon-wide", "pressure-balloon", "autonomous-pressure-balloon",
+      "autonomous-entropy-balloon",
+      "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
+    ].contains(args[4])
     let reporting = [
-      "memory-reporting", "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
+      "memory-reporting", "continuous-pressure-reporting",
+      "continuous-pressure-reporting-small-boot",
     ].contains(args[4])
     let pressureWide = [
       "continuous-pressure-wide", "continuous-pressure-protected", "continuous-pressure-reporting",
       "continuous-pressure-reporting-small-boot",
-      "pressure-balloon",
+      "pressure-balloon", "autonomous-pressure-balloon", "autonomous-entropy-balloon",
+      "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
     ]
-      .contains(args[4])
+    .contains(args[4])
     guard
       args.count == 5 && ["smoke", "start-refusal"].contains(args[4])
         || [6, 8].contains(args.count)
           && [
             "memory", "memory-reporting", "held", "alias", "crash", "recover", "adaptive",
             "memory-balloon", "memory-balloon-wide", "pressure-balloon",
+            "autonomous-pressure-balloon", "autonomous-entropy-balloon",
+            "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
             "adaptive-busy",
             "continuous", "continuous-cancel", "continuous-cancel-release", "continuous-soak",
             "continuous-stop",
@@ -63,6 +71,8 @@ import NativeLinuxVMM
         [
           "memory", "memory-reporting", "adaptive", "continuous", "continuous-sustained",
           "memory-balloon", "memory-balloon-wide", "pressure-balloon",
+          "autonomous-pressure-balloon", "autonomous-entropy-balloon",
+          "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
           "memory-wide",
           "memory-boot-wide", "continuous-pressure-wide", "continuous-pressure-protected",
           "continuous-pressure-reporting",
@@ -89,7 +99,8 @@ import NativeLinuxVMM
       "continuous-pressure-reporting":
       geometry = try .init(bootBytes: 1024 << 20, dynamicBytes: 2 << 30)
     case "continuous-pressure-reporting-small-boot", "memory-balloon", "memory-balloon-wide",
-      "pressure-balloon":
+      "pressure-balloon", "autonomous-pressure-balloon", "autonomous-entropy-balloon",
+      "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon":
       geometry = try .init(bootBytes: 512 << 20, dynamicBytes: 2560 << 20)
     case "memory-boot-wide":
       geometry = try .init(bootBytes: 2 << 30, dynamicBytes: 256 << 20)
@@ -107,10 +118,13 @@ import NativeLinuxVMM
     let group = MultiThreadedEventLoopGroup(numberOfThreads: 2)
     let manager: NativeVirtualMachineManager
     let policy: NativeExecutionPolicy =
-      ["continuous-sustained", "continuous-pressure-wide", "continuous-pressure-protected",
+      [
+        "continuous-sustained", "continuous-pressure-wide", "continuous-pressure-protected",
         "continuous-pressure-reporting", "continuous-pressure-reporting-small-boot",
-        "pressure-balloon"]
-        .contains(args[4])
+        "pressure-balloon", "autonomous-pressure-balloon", "autonomous-entropy-balloon",
+        "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
+      ]
+      .contains(args[4])
       ? .sustained : .qualification
     if let resources {
       manager = NativeVirtualMachineManager(
@@ -268,6 +282,15 @@ import NativeLinuxVMM
       "bootResourceMode": resources == nil ? "legacy-research-paths" : "descriptor-pinned",
       "capabilityConsoleName": resources?.consoleName as Any? ?? NSNull(),
       "networkEchoes": peers.map(\.echoed),
+      "networkBackpressureAttempts": peers.map(\.backpressure),
+      "networkReceiveStatus": links.map {
+        let status = $0.receiveStatus
+        return [
+          "retired": status.retired, "waiting": status.waiting,
+          "readinessEvents": status.readinessEvents,
+          "descriptorCloseStatus": status.descriptorCloseStatus as Any? ?? NSNull(),
+        ] as [String: Any]
+      },
       "checked": checked, "serverOutput": serverOutput.text,
       "bootBytes": geometry.bootBytes, "dynamicCapacityBytes": geometry.dynamicBytes,
       "controlPlaneHighBytes": 112 << 20, "controlPlaneMaximumBytes": 128 << 20,

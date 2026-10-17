@@ -6,6 +6,14 @@ import Synchronization
 
 /// An owned private Ethernet cable. It creates no host interface or IP route.
 public final class IsolatedNetwork: Interface {
+  public struct ReceiveStatus: Sendable {
+    public let retired: Bool
+    public let waiting: Bool
+    /// Read-source deliveries, including any unexpected delivery after suspension.
+    public let readinessEvents: UInt64
+    /// Nil before cancellation completes; zero proves the registration's duplicate was closed.
+    public let descriptorCloseStatus: Int32?
+  }
   public let index: Int
   public let ipv4Address: CIDRv4
   public var ipv4Gateway: IPv4Address? { nil }
@@ -13,8 +21,19 @@ public final class IsolatedNetwork: Interface {
   private struct State {
     var device: Int32
     var peer: Int32
+    var readiness: PacketReadiness?
+    var receiving = false
+    var receiverStopped = false
   }
   private let state: Mutex<State>
+  public var receiveStatus: ReceiveStatus {
+    state.withLock {
+      let status = $0.readiness?.status
+      return ReceiveStatus(
+        retired: $0.receiverStopped, waiting: status?.waiting ?? false,
+        readinessEvents: status?.events ?? 0, descriptorCloseStatus: status?.closeStatus)
+    }
+  }
   public init(index: Int = 0) throws {
     guard (0...1).contains(index) else { throw NativeFailure.unsupported }
     self.index = index
@@ -63,6 +82,49 @@ public final class IsolatedNetwork: Interface {
       return try Self.receive(descriptor: $0.peer)
     }
   }
+  /// Waits without polling. Exactly one async receiver is admitted per link.
+  /// Cancellation after admission retires async receiving; sync I/O and the device remain owned.
+  public func receivePacket() async throws -> Data {
+    try Task.checkCancellation()
+    let readiness = try state.withLock {
+      guard !$0.receiverStopped else { throw CancellationError() }
+      guard $0.peer >= 0 else { throw NativeFailure.state }
+      guard !$0.receiving else { throw NativeFailure.state }
+      let readiness: PacketReadiness
+      if let existing = $0.readiness { readiness = existing }
+      else {
+        readiness = try PacketReadiness(descriptor: $0.peer)
+        $0.readiness = readiness
+      }
+      $0.receiving = true
+      return readiness
+    }
+    defer { state.withLock { $0.receiving = false } }
+    do {
+      while true {
+        try Task.checkCancellation()
+        let frame = try state.withLock {
+          guard !$0.receiverStopped else { throw CancellationError() }
+          guard $0.peer >= 0 else { throw NativeFailure.state }
+          return try Self.receive(descriptor: $0.peer)
+        }
+        if let frame { return frame }
+        try await readiness.wait()
+      }
+    } catch is CancellationError {
+      stopReceiving()
+      throw CancellationError()
+    }
+  }
+
+  /// Ends a pending async receive without closing either Ethernet endpoint.
+  public func stopReceiving() {
+    let readiness = state.withLock {
+      $0.receiverStopped = true
+      return $0.readiness
+    }
+    readiness?.cancel()
+  }
   static func transmit(_ frame: Data, descriptor: Int32) throws -> Bool {
     let count = frame.withUnsafeBytes { Darwin.send(descriptor, $0.baseAddress, $0.count, 0) }
     if count == frame.count { return true }
@@ -83,6 +145,7 @@ public final class IsolatedNetwork: Interface {
     return Data(bytes.prefix(count))
   }
   public func close() throws {
+    stopReceiving()
     try state.withLock {
       var first: Int32 = 0
       for descriptor in [$0.peer, $0.device] where descriptor >= 0 {

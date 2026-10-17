@@ -1,6 +1,44 @@
 import BoundedMemory
 import Foundation
 
+/// One coordinator publication; byte counts are ownership/capacity observations, not RSS.
+public struct NativeBalloonState: Sendable {
+  public let epoch: UInt64
+  public let ready: Bool
+  public let targetBytes: UInt64
+  public let actualBytes: UInt64
+  public let ownedBytes: UInt64
+  public let quarantined: Bool
+  public let requestGeneration: UInt64
+  public let appliedGeneration: UInt64
+  public let zeroTargetObserved: Bool
+  public let pendingRecyclingExtents: UInt64
+  var requestApplied: Bool { requestGeneration == appliedGeneration }
+
+  init(
+    epoch: UInt64, ready: Bool, targetBytes: UInt64, actualBytes: UInt64, ownedBytes: UInt64,
+    quarantined: Bool, requestGeneration: UInt64, appliedGeneration: UInt64,
+    zeroTargetObserved: Bool, pendingRecyclingExtents: UInt64 = 0
+  ) {
+    self.epoch = epoch
+    self.ready = ready
+    self.targetBytes = targetBytes
+    self.actualBytes = actualBytes
+    self.ownedBytes = ownedBytes
+    self.quarantined = quarantined
+    self.requestGeneration = requestGeneration
+    self.appliedGeneration = appliedGeneration
+    self.zeroTargetObserved = zeroTargetObserved
+    self.pendingRecyclingExtents = pendingRecyclingExtents
+  }
+
+  public var settled: Bool {
+    requestApplied && targetBytes == actualBytes && targetBytes == ownedBytes
+      && (targetBytes == 0 || pendingRecyclingExtents == 0)
+      && (targetBytes != 0 || zeroTargetObserved)
+  }
+}
+
 /// Persistent ownership of stock virtio-balloon 4 KiB PFNs, confined to the VM coordinator.
 /// FrameLedger's contiguous generation tickets do not represent arbitrary driver PFN transfers.
 struct BalloonPFNs {
@@ -8,8 +46,12 @@ struct BalloonPFNs {
   let dynamicBytes: UInt64
   private let bootPages: Int
   private var words: [UInt64]
+  private var pendingRecycling: Set<Int> = []
+  var pendingRecyclingCount: Int { pendingRecycling.count }
   private(set) var count: UInt32 = 0
   private(set) var dynamicCount: UInt32 = 0
+  private(set) var fullyOwnedDynamicExtents: UInt32 = 0
+  private(set) var peakFullyOwnedDynamicExtents: UInt32 = 0
   private(set) var epoch: UInt64 = 1
 
   init(boot: Range<UInt64>, dynamicBytes: UInt64) throws {
@@ -60,6 +102,9 @@ struct BalloonPFNs {
     }
     var changed: Set<Int> = []
     for slot in slots {
+      if !inflate, slot >= bootPages, ownsExtent((slot - bootPages) / 512) {
+        fullyOwnedDynamicExtents -= 1
+      }
       if inflate { words[slot / 64] |= 1 << (slot % 64) }
       else { words[slot / 64] &= ~(1 << (slot % 64)) }
       if slot >= bootPages { changed.insert((slot - bootPages) / 512) }
@@ -68,11 +113,31 @@ struct BalloonPFNs {
       }
     }
     if inflate { count += UInt32(slots.count) } else { count -= UInt32(slots.count) }
-    guard inflate else { return [] }
-    return changed.sorted().filter { index in
-      let first = (bootPages + index * 512) / 64
-      return (first..<(first + 8)).allSatisfy { words[$0] == .max }
+    guard inflate else {
+      pendingRecycling.subtract(changed)
+      return []
     }
+    let eligible = changed.sorted().filter(ownsExtent)
+    fullyOwnedDynamicExtents += UInt32(eligible.count)
+    peakFullyOwnedDynamicExtents = max(peakFullyOwnedDynamicExtents, fullyOwnedDynamicExtents)
+    pendingRecycling.formUnion(eligible)
+    return eligible
+  }
+
+  /// Retain scattered completions across bounded coordinator turns, until deflate or reset.
+  mutating func takeRecyclingBatch(limit: Int = 4) -> [Int] {
+    precondition((0...4).contains(limit))
+    let batch = Array(pendingRecycling.sorted().prefix(limit))
+    pendingRecycling.subtract(batch)
+    return batch
+  }
+
+  mutating func cancelRecycling() { pendingRecycling.removeAll(keepingCapacity: true) }
+
+  func ownsExtent(_ index: Int) -> Bool {
+    guard index >= 0, index < Int(dynamicBytes / UInt64(MemoryDevice.block)) else { return false }
+    let first = (bootPages + index * 512) / 64
+    return (first..<(first + 8)).allSatisfy { words[$0] == .max }
   }
 
   /// Deflate never remaps: release every known owned PFN before ACK, even in a mixed packet.
@@ -84,7 +149,11 @@ struct BalloonPFNs {
         valid = false
         continue
       }
+      if slot >= bootPages, ownsExtent((slot - bootPages) / 512) {
+        fullyOwnedDynamicExtents -= 1
+      }
       words[slot / 64] &= ~(1 << (slot % 64))
+      if slot >= bootPages { pendingRecycling.remove((slot - bootPages) / 512) }
       count -= 1
       if slot >= bootPages { dynamicCount -= 1 }
     }
@@ -95,14 +164,21 @@ struct BalloonPFNs {
     guard epoch < .max else { throw DeviceFailure.request }
     epoch += 1
     for index in words.indices { words[index] = 0 }
+    cancelRecycling()
     count = 0
     dynamicCount = 0
+    fullyOwnedDynamicExtents = 0
   }
 }
 
-/// Default-off stock balloon experiment: every replacement finishes before inflate ACK.
+/// Default-off experiment: backing replacement needs persistent PFN ownership until deflate ACK.
 /// Deflate clears ownership before ACK and never remaps; no async DMA/pointer escape is supported.
 final class ClassicBalloonDevice {
+  private var recyclingWindow = RecyclingWindow()
+  private(set) var recyclingAttempts: UInt64 = 0
+  private(set) var recyclingReplaced: UInt64 = 0
+  private(set) var recyclingSkippedPinned: UInt64 = 0
+  private(set) var recyclingSkippedEvidence: UInt64 = 0
   let transport = VirtioMMIO(
     identity: 5, features: (1 << 0) | (1 << 2), interrupt: 41,
     requiredFeatures: (1 << 32) | (1 << 0) | (1 << 2), queueCount: 2)
@@ -111,6 +187,10 @@ final class ClassicBalloonDevice {
   private(set) var actual: UInt32 = 0
   private(set) var quarantined = false
   private var deadline: ContinuousClock.Instant?
+  private var zeroReadGeneration: UInt32?
+  var zeroTargetObserved: Bool {
+    target == 0 && zeroReadGeneration == transport.generation
+  }
   private var history = RecentHistory<[String: UInt64]>(capacity: 64)
   var observations: [[String: UInt64]] { history.elements }
   private(set) var accepted: UInt64 = 0
@@ -129,6 +209,8 @@ final class ClassicBalloonDevice {
   private func setTarget(_ value: UInt32) throws {
     guard transport.generation < .max else { throw DeviceFailure.request }
     target = value
+    if value == 0 { ledger.cancelRecycling() }
+    zeroReadGeneration = nil
     transport.generation += 1
     transport.interruptStatus |= 2
   }
@@ -138,11 +220,16 @@ final class ClassicBalloonDevice {
     guard bytes % 4096 == 0, bytes <= ledger.dynamicBytes,
       memory.capacity == ledger.dynamicBytes,
       bytes == 0 || !memory.held && !memory.quarantined && bytes <= memory.plugged,
-      bytes == 0 || !quarantined && target == 0 && actual == 0 && ledger.count == 0,
+      bytes == 0 || !quarantined && actual == target && ledger.count == target
+        && ledger.pendingRecyclingCount == 0
+        && bytes > UInt64(target) * 4096
+        && (target == 0 || deadline.map({ now < $0 }) == true),
       transport.status & 15 == 15
     else { throw DeviceFailure.request }
+    let beginning = target == 0
     try setTarget(UInt32(bytes / 4096))
-    deadline = bytes == 0 ? nil : now.advanced(by: .seconds(8))
+    if bytes == 0 { deadline = nil }
+    else if beginning { deadline = now.advanced(by: .seconds(8)) }
   }
 
   func poll(now: ContinuousClock.Instant, quarantine: Bool) throws {
@@ -154,6 +241,40 @@ final class ClassicBalloonDevice {
       }
       deadline = nil
       if target != 0 { try setTarget(0) }
+    }
+  }
+
+  /// Ownership stays in the ledger after ACK; all vCPUs must still be parked before replacement.
+  func recyclePending(
+    memory: MemoryDevice, quiescence: (parked: Bool, epoch: Int, cpus: Int),
+    acknowledgmentPending: Bool = false
+  ) throws {
+    guard quiescence.parked, quiescence.epoch >= 0, (1...4).contains(quiescence.cpus),
+      memory.capacity == ledger.dynamicBytes, !memory.held else { throw DeviceFailure.request }
+    guard target != 0, deadline.map({ ContinuousClock.now < $0 }) == true,
+      !quarantined, !memory.quarantined else {
+      ledger.cancelRecycling()
+      return
+    }
+    let count = try recyclingWindow.admit(
+      epoch: quiescence.epoch, pending: ledger.pendingRecyclingCount)
+    guard count > 0 else { return }
+    let batch = ledger.takeRecyclingBatch(limit: count)
+    guard batch.allSatisfy(ledger.ownsExtent) else { throw DeviceFailure.request }
+    for index in batch {
+      guard target != 0, deadline.map({ ContinuousClock.now < $0 }) == true,
+        !quarantined, !memory.quarantined else {
+        ledger.cancelRecycling()
+        return
+      }
+      guard recyclingAttempts < .max else { throw DeviceFailure.request }
+      recyclingAttempts += 1
+      let replaced = try memory.recycleOwned(
+        [index], quiescence: quiescence, balloonEpoch: ledger.epoch,
+        acknowledgmentPending: acknowledgmentPending)
+      if replaced { recyclingReplaced += 1 }
+      else if memory.extents[index].metadataPinned { recyclingSkippedPinned += 1 }
+      else { recyclingSkippedEvidence += 1 }
     }
   }
 
@@ -191,6 +312,10 @@ final class ClassicBalloonDevice {
         guard UInt64(write) <= UInt64(ledger.boot.count) / 4096 + ledger.dynamicBytes / 4096
         else { try refuse(queue: nil, reason: "actual-out-of-range"); return 0 }
         actual = write // Guest telemetry never grants ownership.
+      }
+      // The stock driver's serialized resize worker reads zero after pending inflate ACKs.
+      if write == nil, offset == 0x100, target == 0 {
+        zeroReadGeneration = transport.generation
       }
       return UInt64(offset == 0x100 ? target : actual)
     }
@@ -252,13 +377,20 @@ final class ClassicBalloonDevice {
             }
             let before = memory.recycledResidentBytes
             let beforeBacking = memory.recycledBackingBytes
+            if inflate, self.target != 0, self.ledger.count > self.target {
+              try self.refuse(queue: write, reason: "inflate-exceeds-target")
+            }
             let authorized = self.target != 0
               && self.deadline.map({ ContinuousClock.now < $0 }) == true
               && !self.quarantined && !memory.quarantined
             if inflate {
               if authorized {
                 // A failure after native retirement must escape and stop the VM, never be ACKed.
-                try memory.recycleReported(eligible, quiescence: quiescence)
+                // A scattered packet cannot turn one ACK into hundreds of parked native calls.
+                try self.recyclePending(
+                  memory: memory, quiescence: quiescence, acknowledgmentPending: true)
+              } else {
+                self.ledger.cancelRecycling()
               }
             } else if self.target != 0 {
               // Migration/OOM unsolicited deflate revokes the pulse; never reinflate automatically.
@@ -274,6 +406,7 @@ final class ClassicBalloonDevice {
               "ownedPFNs": UInt64(self.ledger.count), "targetPFNs": UInt64(self.target),
               "ownedDynamicPFNs": UInt64(self.ledger.dynamicCount),
               "actualPFNs": UInt64(self.actual), "eligibleDynamicExtents": UInt64(eligible.count),
+              "pendingRecyclingExtents": UInt64(self.ledger.pendingRecyclingCount),
               "recycleAuthorized": authorized ? 1 : 0,
               "replacedExtents": (memory.recycledBackingBytes - beforeBacking)
                 / UInt64(MemoryDevice.block),
@@ -287,6 +420,7 @@ final class ClassicBalloonDevice {
         try ledger.reset()
         target = 0
         actual = 0
+        zeroReadGeneration = nil
         deadline = nil
       }
       return 0

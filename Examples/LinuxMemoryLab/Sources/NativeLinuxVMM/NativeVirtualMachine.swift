@@ -1,3 +1,4 @@
+import BoundedMemory
 import Containerization
 import Darwin
 import Dispatch
@@ -36,6 +37,7 @@ final class NativeControl: Sendable {
     var requested: UInt64 = 0
     var plugged: UInt64 = 0
     var memoryOwner: UInt64?
+    var balloonOwnerEpoch: UInt64?
     var memoryGeneration: UInt64 = 0
     var memoryControlRetired = false
     var memoryQuarantineApplied = false
@@ -46,10 +48,17 @@ final class NativeControl: Sendable {
     var balloonDesired: UInt64 = 0
     var balloonGeneration: UInt64 = 0
     var balloonApplied: UInt64 = 0
+    var balloonApplications = RecentHistory<NativeBalloonApplication>(capacity: 64)
+    var balloonEpoch: UInt64 = 0
+    var balloonRequestedEpoch: UInt64 = 0
+    var balloonRequestedOwner: UInt64 = 0
+    var balloonRejectedGeneration: UInt64 = 0
     var balloonTarget: UInt32 = 0
     var balloonActual: UInt32 = 0
     var balloonOwned: UInt32 = 0
+    var balloonPendingRecycling: UInt64 = 0
     var balloonReady = false
+    var balloonZeroObserved = false
     var balloonQuarantined = false
     var error = ""
     var result = Data()
@@ -57,7 +66,19 @@ final class NativeControl: Sendable {
     var listeners: [UInt32: VsockListener] = [:]
     var connected: [UInt32: Bool] = [:]
     var nextPort: UInt32 = 0x2000_0000
+
+    mutating func publishBalloon(_ balloon: ClassicBalloonDevice) {
+      balloonEpoch = balloon.ledger.epoch
+      balloonTarget = balloon.target
+      balloonActual = balloon.actual
+      balloonOwned = balloon.ledger.count
+      balloonPendingRecycling = UInt64(balloon.ledger.pendingRecyclingCount)
+      balloonReady = balloon.transport.status & 15 == 15
+      balloonZeroObserved = balloon.zeroTargetObserved
+      balloonQuarantined = balloon.quarantined
+    }
   }
+  let createdAt = ContinuousClock.now
   let state: Mutex<State>
   let memoryQuarantineRequested = Atomic(false)
   let kernel: URL?
@@ -94,6 +115,34 @@ final class NativeControl: Sendable {
     self.alias = alias
     self.cpus = cpus
     self.networks = networks
+  }
+
+  /// Only nonblocking configuration/ledger work occurs while holding the admission lock.
+  /// Applied generation and the fields it describes must become visible atomically.
+  func applyBalloonRequest(to balloon: ClassicBalloonDevice, memory: MemoryDevice) throws {
+    try state.withLock { value in
+      let generation = value.balloonGeneration
+      guard generation != value.balloonApplied,
+        generation != value.balloonRejectedGeneration else { return }
+      guard value.balloonRequestedEpoch == balloon.ledger.epoch,
+        value.balloonDesired == 0 || !value.memoryControlRetired
+          && (value.memoryOwner ?? 0) == value.balloonRequestedOwner else {
+        value.balloonRejectedGeneration = generation
+        value.memoryControlRetired = true
+        memoryQuarantineRequested.store(true, ordering: .releasing)
+        value.publishBalloon(balloon)
+        return
+      }
+      let previous = (balloon.target, balloon.ledger.count, balloon.actual)
+      try balloon.request(bytes: value.balloonDesired, memory: memory, now: .now)
+      try value.balloonApplications.append(NativeBalloonApplication(
+        generation: generation, owner: value.balloonRequestedOwner, epoch: balloon.ledger.epoch,
+        targetBytes: value.balloonDesired, previousTargetBytes: UInt64(previous.0) * 4096,
+        previousOwnedBytes: UInt64(previous.1) * 4096,
+        previousActualBytes: UInt64(previous.2) * 4096, appliedAt: .now))
+      value.balloonApplied = generation
+      value.publishBalloon(balloon)
+    }
   }
   func run() {
     let machine = LinuxMachine()
@@ -172,6 +221,15 @@ final class NativeControl: Sendable {
     if lease, !machine.created, cleanup.isEmpty {
       NativeProcessLease.claimed.withLock { $0 = false }
     }
+    let applications: [[String: UInt64]]
+    do {
+      applications = try state.withLock {
+        try $0.balloonApplications.elements.map { try $0.record(since: createdAt) }
+      }
+    } catch {
+      applications = []
+      cleanup.append("balloon-application-journal \(error)")
+    }
     let result: [String: Any] = [
       "primaryError": primary, "cleanupErrors": cleanup,
       "vmCreated": machine.wasCreated, "vmDestroyed": machine.wasCreated && !machine.created,
@@ -187,6 +245,9 @@ final class NativeControl: Sendable {
       "freePagePoison": machine.freePageReporting?.poison ?? 0,
       "classicBallooningEnabled": classicBallooning,
       "balloonObservations": machine.classicBalloon?.observations ?? [],
+      "balloonApplications": applications,
+      "balloonApplicationsTotal": state.withLock { $0.balloonApplications.totalCount },
+      "balloonRejectedGeneration": state.withLock { $0.balloonRejectedGeneration },
       "balloonAcceptedPackets": machine.classicBalloon?.accepted ?? 0,
       "balloonRefusedPackets": machine.classicBalloon?.refused ?? 0,
       "balloonInvalidActualWrites": machine.classicBalloon?.invalidActualWrites ?? 0,
@@ -195,10 +256,17 @@ final class NativeControl: Sendable {
       "balloonOwnedPFNs": machine.classicBalloon?.ledger.count ?? 0,
       "balloonEpoch": machine.classicBalloon?.ledger.epoch ?? 0,
       "balloonActualPFNs": machine.classicBalloon?.actual ?? 0,
+      "balloonZeroTargetObserved": machine.classicBalloon?.zeroTargetObserved ?? false,
       "balloonTargetPFNs": machine.classicBalloon?.target ?? 0,
       "balloonQuarantined": machine.classicBalloon?.quarantined ?? false,
       "balloonPeakBootPFNs": machine.classicBalloon?.peakBootPFNs ?? 0,
       "balloonPeakDynamicPFNs": machine.classicBalloon?.peakDynamicPFNs ?? 0,
+      "balloonPeakFullyOwnedDynamicExtents": machine.classicBalloon?.ledger.peakFullyOwnedDynamicExtents ?? 0,
+      "balloonRecyclingAttempts": machine.classicBalloon?.recyclingAttempts ?? 0,
+      "balloonRecyclingReplaced": machine.classicBalloon?.recyclingReplaced ?? 0,
+      "balloonRecyclingSkippedPinned": machine.classicBalloon?.recyclingSkippedPinned ?? 0,
+      "balloonRecyclingSkippedEvidence": machine.classicBalloon?.recyclingSkippedEvidence ?? 0,
+      "balloonPendingRecyclingExtents": machine.classicBalloon?.ledger.pendingRecyclingCount ?? 0,
       "initialDynamicBootMemory": classicBallooning,
       "guestBounceBuffersRequestedDisabled": classicBallooning,
       "memoryTransportStatus": machine.dynamicMemory?.transport.status ?? 0,
@@ -442,10 +510,35 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
       return $0.memoryGeneration
     }
   }
+  func claimBalloonControl() throws -> (owner: UInt64, epoch: UInt64) {
+    guard control.classicBallooning else { throw NativeControlFailure.ownership }
+    return try control.state.withLock {
+      guard $0.memoryOwner == nil, !$0.memoryControlRetired, $0.memoryGeneration < .max else {
+        throw NativeControlFailure.ownership
+      }
+      guard $0.running, !$0.ended, !$0.stop else { throw NativeFailure.state }
+      guard $0.balloonReady, $0.balloonEpoch > 0, !$0.balloonQuarantined,
+        $0.balloonGeneration == $0.balloonApplied,
+        $0.balloonTarget == 0, $0.balloonActual == 0, $0.balloonOwned == 0,
+        $0.balloonZeroObserved,
+        $0.plugged == control.geometry.dynamicBytes else { throw NativeControlFailure.unsettled }
+      $0.memoryGeneration += 1
+      $0.memoryOwner = $0.memoryGeneration
+      $0.balloonOwnerEpoch = $0.balloonEpoch
+      return ($0.memoryGeneration, $0.balloonEpoch)
+    }
+  }
+
   func finishMemoryControl(owner: UInt64, reusable: Bool) {
     control.state.withLock {
       precondition($0.memoryOwner == owner, "Only the current governor can release its authority")
+      let reusable = reusable && (!control.classicBallooning
+        || $0.balloonOwnerEpoch == $0.balloonEpoch && !$0.balloonQuarantined
+          && $0.balloonGeneration == $0.balloonApplied
+          && $0.balloonTarget == 0 && $0.balloonActual == 0 && $0.balloonOwned == 0
+          && $0.balloonZeroObserved)
       $0.memoryOwner = nil
+      $0.balloonOwnerEpoch = nil
       if !reusable {
         $0.memoryControlRetired = true
         control.memoryQuarantineRequested.store(true, ordering: .releasing)
@@ -467,30 +560,49 @@ public final class NativeVirtualMachine: VirtualMachineInstance {
   }
   /// Experimental finite stock-balloon pulse; zero requests rescue and never grant PFN ownership.
   public func requestBalloon(bytes: UInt64) throws {
+    try requestBalloon(bytes: bytes, owner: nil)
+  }
+
+  func requestBalloon(bytes: UInt64, owner: UInt64?) throws {
     guard control.classicBallooning, bytes % 4096 == 0, bytes <= control.geometry.dynamicBytes
     else { throw NativeFailure.unsupported }
     try control.state.withLock {
+      guard $0.memoryOwner == owner, bytes == 0 || !$0.memoryControlRetired,
+        owner == nil || $0.balloonOwnerEpoch == $0.balloonEpoch else {
+        throw NativeControlFailure.ownership
+      }
       guard $0.running, !$0.ended, !$0.stop, $0.balloonReady,
         $0.balloonGeneration < .max,
         bytes == 0 || !$0.balloonQuarantined && $0.balloonGeneration == $0.balloonApplied
-          && $0.balloonTarget == 0 && $0.balloonActual == 0 && $0.balloonOwned == 0
+          && $0.balloonPendingRecycling == 0
+          && $0.balloonActual == $0.balloonTarget && $0.balloonOwned == $0.balloonTarget
+          && ($0.balloonTarget == 0 || owner != nil)
+          && bytes > UInt64($0.balloonTarget) * 4096
           && $0.plugged == control.geometry.dynamicBytes
       else { throw NativeControlFailure.unsettled }
       $0.balloonDesired = bytes
+      $0.balloonRequestedEpoch = $0.balloonEpoch
+      $0.balloonRequestedOwner = owner ?? 0
       $0.balloonGeneration += 1
     }
   }
+  /// In-process host clock origin for diagnostic events; never compare it with a guest clock.
+  public var controlTimeOrigin: ContinuousClock.Instant { control.createdAt }
+  /// Latest native application; a setter returning only proves admission, not device application.
+  public var lastBalloonApplication: NativeBalloonApplication? {
+    control.state.withLock { $0.balloonApplications.elements.last }
+  }
   /// Current coordinator observations; actual is guest telemetry, owned is the separate PFN ledger.
-  public var balloonState: (
-    ready: Bool, targetBytes: UInt64, actualBytes: UInt64, ownedBytes: UInt64,
-    quarantined: Bool, settled: Bool
-  ) {
+  public var balloonState: NativeBalloonState {
     control.state.withLock {
-      ($0.balloonReady && $0.running && !$0.ended,
-        UInt64($0.balloonTarget) * 4096, UInt64($0.balloonActual) * 4096,
-        UInt64($0.balloonOwned) * 4096, $0.balloonQuarantined,
-        $0.balloonGeneration == $0.balloonApplied && $0.balloonActual == $0.balloonTarget
-          && $0.balloonOwned == $0.balloonTarget)
+      NativeBalloonState(
+        epoch: $0.balloonEpoch, ready: $0.balloonReady && $0.running && !$0.ended,
+        targetBytes: UInt64($0.balloonTarget) * 4096,
+        actualBytes: UInt64($0.balloonActual) * 4096, ownedBytes: UInt64($0.balloonOwned) * 4096,
+        quarantined: $0.balloonQuarantined,
+        requestGeneration: $0.balloonGeneration, appliedGeneration: $0.balloonApplied,
+        zeroTargetObserved: $0.balloonZeroObserved,
+        pendingRecyclingExtents: $0.balloonPendingRecycling)
     }
   }
   public func start() async throws {

@@ -91,8 +91,20 @@ extension Lab {
     probe: URL, mode: String
   ) async throws -> Bool {
     let geometry = vm.memoryGeometry
-    let classicPressure = mode == "pressure-balloon"
-    let classic = ["memory-balloon", "memory-balloon-wide", "pressure-balloon"].contains(mode)
+    let entropyPressure = mode == "autonomous-entropy-balloon"
+    let pressureRelation = entropyPressure ? "pressure_entropy_lab" : "pressure_lab"
+    let pressureColumns = "id UInt64, payload String"
+    let pressureRows = 557056
+    let pressureWidth = 4096
+    let autonomousFault = [
+      "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
+    ].contains(mode)
+    let autonomousBalloon = mode == "autonomous-pressure-balloon" || entropyPressure || autonomousFault
+    let classicPressure = mode == "pressure-balloon" || autonomousBalloon
+    let classic = ["memory-balloon", "memory-balloon-wide", "pressure-balloon",
+      "autonomous-pressure-balloon", "autonomous-entropy-balloon",
+      "autonomous-stop-balloon", "autonomous-cancel-balloon", "autonomous-disconnect-balloon",
+    ].contains(mode)
     let pulseBytes: UInt64 = (classicPressure ? 2048 : mode == "memory-balloon-wide" ? 768 : 128)
       << 20
     let reporting = [
@@ -122,7 +134,10 @@ extension Lab {
     var expectedLifetimeExpiry = false
     var observer: NativeMemoryGovernor?
     var observerTask: Task<Void, Error>?
+    var balloonObserver: NativeBalloonGovernor?
+    var balloonTask: Task<Void, Error>?
     var expectedCancellation = false
+    var expectedDisconnection = false
     let began = ContinuousClock.now
     func now() -> UInt64 {
       let elapsed = began.duration(to: .now).components
@@ -410,6 +425,37 @@ extension Lab {
       }
       try await waitMemory(vm, bytes: geometry.dynamicBytes)
       try await resourceSnapshot("baseline")
+      if autonomousBalloon {
+        let monitorInput = NativeMemoryInput()
+        let monitorOutput = NativeMemoryOutput()
+        let telemetry = NativeMemorySession(input: monitorInput, output: monitorOutput)
+        memorySession = telemetry
+        memoryMonitor = try await container.exec("memory-monitor") { config in
+          config.arguments = [guestProbe, "--memory-monitor"]
+          config.stdin = monitorInput
+          config.stdout = monitorOutput
+          config.stderr = monitorOutput
+          config.noNewPrivileges = true
+        }
+        try await memoryMonitor!.start()
+        try await telemetry.start()
+        let driver = try NativeBalloonGovernor(
+          probe: telemetry, vm: vm, residentTarget: 1024 << 20)
+        balloonObserver = driver
+        balloonTask = Task { try await driver.run() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while driver.snapshot.samples.totalCount == 0 {
+          guard driver.snapshot.failureError == nil, ContinuousClock.now < deadline else {
+            throw Failure.check("autonomous balloon owner admission")
+          }
+          try await Task.sleep(for: .milliseconds(5))
+        }
+        do {
+          try vm.requestBalloon(bytes: 0)
+          throw Failure.check("manual setter bypassed balloon owner")
+        } catch NativeControlFailure.ownership {}
+        commands.append(["autonomousBalloonExclusiveOwner": "verified"])
+      }
       if continuous {
         let monitorInput = NativeMemoryInput()
         let monitorOutput = NativeMemoryOutput()
@@ -785,14 +831,21 @@ extension Lab {
           _ = try await sql(
             container,
             query:
-              "CREATE TABLE IF NOT EXISTS default.pressure_lab (id UInt64, payload String) ENGINE=Memory SETTINGS compress=0"
+              "CREATE TABLE IF NOT EXISTS default.\(pressureRelation) (\(pressureColumns)) ENGINE=Memory SETTINGS compress=0"
           )
-          for index in 0..<17 {
-            let offset = index * 32768
+          // Preserve the compressible control; random bytes separately test resident RAM return.
+          let batchRows = 32768
+          // Leave room for SIMD padding without doubling the random column's reserved capacity.
+          let blockRows = entropyPressure ? 2047 : 2048
+          for index in 0..<(pressureRows / batchRows) {
+            let offset = index * batchRows
+            let payload = entropyPressure
+              ? "number + \(offset), randomString(4096, number)"
+              : "number + \(offset), repeat(hex(cityHash64(number + \(offset))), 256)"
             _ = try await sql(
               container,
               query:
-                "INSERT INTO default.pressure_lab SELECT number + \(offset), repeat(hex(cityHash64(number + \(offset))), 256) FROM numbers(32768) SETTINGS max_block_size=2048"
+                "INSERT INTO default.\(pressureRelation) SELECT \(payload) FROM numbers(\(batchRows)) SETTINGS max_block_size=\(blockRows)"
             )
             if index % 4 == 0 {
               guard try await sql(container, query: integrity) == expected else {
@@ -801,7 +854,7 @@ extension Lab {
             }
             commands.append([
               "pressureCycle": String(cycle), "pressureBatches": String(index + 1),
-              "heldPressureBytes": String((index + 1) * (128 << 20)),
+              "heldPressureBytes": String((index + 1) * batchRows * pressureWidth),
               "pluggedBytes": String(vm.pluggedBytes), "capturedAt": String(now()),
             ])
             // Backpressure the workload on fresh guest headroom, not on a fixed success delay.
@@ -832,14 +885,14 @@ extension Lab {
           let pressureTable = try await sql(
             container,
             query:
-              "SELECT total_rows, total_bytes FROM system.tables WHERE database='default' AND name='pressure_lab' LIMIT 1"
+              "SELECT total_rows, total_bytes FROM system.tables WHERE database='default' AND name='\(pressureRelation)' LIMIT 1"
           )
           let pressureFields = pressureTable.split(separator: "\t")
-          guard pressureFields.count == 2, UInt64(pressureFields[0]) == 557056,
+          guard pressureFields.count == 2, UInt64(pressureFields[0]) == UInt64(pressureRows),
             let allocated = UInt64(pressureFields[1]), allocated >= 2176 << 20
           else { throw Failure.check("pressure table accounting \(pressureTable)") }
           commands.append([
-            "pressureTableRows": "557056", "pressureTableAllocatedBytes": String(allocated),
+            "pressureTableRows": String(pressureRows), "pressureTableAllocatedBytes": String(allocated),
           ])
           if !classicPressure {
             try await waitObserver(
@@ -893,12 +946,238 @@ extension Lab {
           continue
         }
         if pressureWide {
-          _ = try await sql(container, query: "TRUNCATE TABLE default.pressure_lab")
+          let releaseStarted = now()
+          _ = try await sql(container, query: "TRUNCATE TABLE default.\(pressureRelation)")
           // This releases the workload's allocator pages; VM capacity changes remain autonomous.
           _ = try await sql(container, query: "SYSTEM JEMALLOC PURGE")
           if protectedCapacity {
             if classicPressure {
-              let pulse = try await balloonPulse(cycle: cycle, minimumResidentReturn: 1 << 30)
+              let pulse: [String: UInt64]
+              if autonomousBalloon {
+                if autonomousFault {
+                  guard let driver = balloonObserver, let task = balloonTask else {
+                    throw Failure.check("missing autonomous fault owner")
+                  }
+                  let admission = ContinuousClock.now.advanced(by: .seconds(3))
+                  while true {
+                    let candidate = vm.balloonState
+                    guard driver.snapshot.running, driver.snapshot.failureError == nil,
+                      driver.snapshot.stopRequestedAt == nil, ContinuousClock.now < admission else {
+                      throw Failure.check("autonomous fault ownership point")
+                    }
+                    if candidate.ownedBytes >= 64 << 20, candidate.actualBytes >= 64 << 20,
+                      candidate.targetBytes != 0 { break }
+                    try await Task.sleep(for: .milliseconds(5))
+                  }
+                  guard try await verify() == initialMemory else {
+                    throw Failure.check("pre-fault canary/capacity")
+                  }
+                  let preLoad = try await loadState(cycle: cycle)
+                  let pre = vm.balloonState
+                  guard preLoad.0 == 1, preLoad.1 >= 16 << 20,
+                    pre.ownedBytes >= 64 << 20, pre.actualBytes >= 64 << 20,
+                    pre.targetBytes != 0, driver.snapshot.running,
+                    driver.snapshot.failureError == nil, driver.snapshot.stopRequestedAt == nil else {
+                    throw Failure.check("pre-fault live load/ownership")
+                  }
+                  let owned = pre.ownedBytes
+                  let faultBegan = ContinuousClock.now
+                  switch mode {
+                  case "autonomous-stop-balloon": driver.requestStop()
+                  case "autonomous-cancel-balloon": task.cancel()
+                  default:
+                    await memorySession!.close()
+                    expectedDisconnection = true
+                  }
+                  let deliveryBound: Duration = expectedDisconnection ? .seconds(3) : .milliseconds(100)
+                  let deliveryDeadline = faultBegan.advanced(by: deliveryBound)
+                  var nativeZero: NativeBalloonApplication?
+                  while true {
+                    if let generation = driver.snapshot.stopRequestGeneration,
+                      let event = vm.lastBalloonApplication, event.generation == generation,
+                      event.generation > pre.requestGeneration, event.epoch == pre.epoch,
+                      event.targetBytes == 0 {
+                      nativeZero = event
+                      break
+                    }
+                    guard ContinuousClock.now < deliveryDeadline else {
+                      throw Failure.check("autonomous stop native application")
+                    }
+                    try await Task.sleep(for: .milliseconds(1))
+                  }
+                  guard let nativeZero, nativeZero.appliedAt >= faultBegan,
+                    nativeZero.previousTargetBytes != 0, nativeZero.previousOwnedBytes >= 64 << 20,
+                    nativeZero.previousActualBytes >= 64 << 20,
+                    faultBegan.duration(to: nativeZero.appliedAt) < deliveryBound else {
+                    throw Failure.check("autonomous stop causal native application")
+                  }
+                  let zeroDelivery = faultBegan.duration(to: nativeZero.appliedAt)
+                  let zeroLoad = try await loadState(cycle: cycle)
+                  guard zeroLoad.0 == 1, zeroLoad.1 >= 16 << 20 else {
+                    throw Failure.check("SQL not live at native zero application")
+                  }
+                  let outcome = await task.result
+                  balloonTask = nil
+                  let final = driver.snapshot
+                  guard let stop = final.stopRequestedAt,
+                    stop >= faultBegan, faultBegan.duration(to: stop) <= .seconds(3),
+                    stop.duration(to: .now) < .seconds(8),
+                    !final.running, !final.pending, final.cleanupError == nil,
+                    vm.balloonState.settled, vm.balloonState.targetBytes == 0,
+                    vm.balloonState.actualBytes == 0, vm.balloonState.ownedBytes == 0,
+                    vm.balloonState.epoch == pre.epoch else {
+                    throw Failure.check("autonomous fault drain")
+                  }
+                  let drainDuration = stop.duration(to: .now).components
+                  let ownerGeneration = vm.memoryControlStatus.generation
+                  let requestGeneration = vm.balloonState.requestGeneration
+                  if mode == "autonomous-stop-balloon" {
+                    try outcome.get()
+                    guard final.failureError == nil, !vm.memoryControlStatus.retired else {
+                      throw Failure.check("graceful stop retired healthy authority")
+                    }
+                    // Re-entry uses a new owner and remains observational at full soft capacity.
+                    let replacement = try NativeBalloonGovernor(
+                      probe: memorySession!, vm: vm, residentTarget: geometry.maximumBytes)
+                    let resumed = Task { try await replacement.run() }
+                    do {
+                      let limit = ContinuousClock.now.advanced(by: .seconds(3))
+                      while replacement.snapshot.samples.totalCount == 0 {
+                        guard replacement.snapshot.failureError == nil, ContinuousClock.now < limit
+                        else { throw Failure.check("healthy balloon re-admission") }
+                        try await Task.sleep(for: .milliseconds(5))
+                      }
+                      guard replacement.snapshot.claimed, replacement.snapshot.running,
+                        replacement.snapshot.requests.totalCount == 0,
+                        vm.memoryControlStatus.generation > ownerGeneration,
+                        vm.balloonState.requestGeneration == requestGeneration,
+                        vm.balloonState.epoch == pre.epoch, !vm.balloonState.quarantined else {
+                        throw Failure.check("replacement owner was not new and observational")
+                      }
+                      replacement.requestStop()
+                      try await resumed.value
+                    } catch {
+                      resumed.cancel()
+                      _ = await resumed.result
+                      throw error
+                    }
+                    expectedGracefulStop = true
+                  } else {
+                    switch outcome {
+                    case .success: throw Failure.check("autonomous fault returned success")
+                    case .failure(let error):
+                      if expectedDisconnection {
+                        guard error as? NativeControlFailure == .disconnected else { throw error }
+                      } else {
+                        guard error is CancellationError else { throw error }
+                        expectedCancellation = true
+                      }
+                    }
+                    guard vm.memoryControlStatus.retired, final.failureError != nil else {
+                      throw Failure.check("autonomous fault did not retire authority")
+                    }
+                    do {
+                      try vm.requestBalloon(bytes: 128 << 20)
+                      throw Failure.check("retired balloon admitted new ownership")
+                    } catch NativeControlFailure.ownership {}
+                    let refused = try NativeBalloonGovernor(
+                      probe: memorySession!, vm: vm, residentTarget: geometry.maximumBytes)
+                    do {
+                      try await refused.run()
+                      throw Failure.check("retired balloon admitted a fresh governor")
+                    } catch NativeControlFailure.ownership {}
+                    guard vm.memoryControlStatus.generation == ownerGeneration,
+                      vm.balloonState.requestGeneration == requestGeneration,
+                      vm.balloonState.epoch == pre.epoch else {
+                      throw Failure.check("refused governor changed authority")
+                    }
+                    try await vm.waitForMemoryControlRetirement(
+                      deadline: stop.advanced(by: .seconds(8)))
+                  }
+                  let aggregate = try await activeLoad!.value
+                  activeLoad = nil
+                  let actualIntegrity = try await sql(container, query: integrity)
+                  guard aggregate == "4999950000", try await verify() == initialMemory,
+                    actualIntegrity == expected else {
+                    throw Failure.check("autonomous fault SQL/canary integrity")
+                  }
+                  let elapsed = faultBegan.duration(to: .now).components
+                  let zero = zeroDelivery.components
+                  let faultAt = vm.controlTimeOrigin.duration(to: faultBegan).components
+                  let appliedAt = vm.controlTimeOrigin.duration(to: nativeZero.appliedAt).components
+                  commands.append([
+                    "autonomousFaultMode": mode, "ownedBytesAtFault": String(owned),
+                    "nativeZeroGeneration": String(nativeZero.generation),
+                    "nativeZeroEpoch": String(nativeZero.epoch),
+                    "preRequestGeneration": String(pre.requestGeneration),
+                    "nativeZeroOwner": String(nativeZero.owner),
+                    "ownerGenerationAfter": String(vm.memoryControlStatus.generation),
+                    "preLoadMemoryBytes": String(preLoad.1), "zeroLoadMemoryBytes": String(zeroLoad.1),
+                    "faultSinceControlStartNanoseconds": String(
+                      UInt64(faultAt.seconds) * 1_000_000_000 + UInt64(faultAt.attoseconds / 1_000_000_000)),
+                    "nativeAppliedSinceControlStartNanoseconds": String(
+                      UInt64(appliedAt.seconds) * 1_000_000_000
+                        + UInt64(appliedAt.attoseconds / 1_000_000_000)),
+                    "drainNanoseconds": String(
+                      UInt64(drainDuration.seconds) * 1_000_000_000
+                        + UInt64(drainDuration.attoseconds / 1_000_000_000)),
+                    "zeroDeliveryNanoseconds": String(
+                      UInt64(zero.seconds) * 1_000_000_000 + UInt64(zero.attoseconds / 1_000_000_000)),
+                    "faultCheckNanoseconds": String(
+                      UInt64(elapsed.seconds) * 1_000_000_000
+                        + UInt64(elapsed.attoseconds / 1_000_000_000)),
+                    "integrity": actualIntegrity, "loadResult": aggregate,
+                    "authorityRetired": String(vm.memoryControlStatus.retired),
+                  ])
+                  try await resourceSnapshot("autonomous-fault-restored")
+                  break
+                }
+                let releasedAt = releaseStarted
+                let elapsedRelease = now() - releaseStarted
+                guard elapsedRelease < 8_000_000_000 else {
+                  throw Failure.check("workload release exceeded autonomous return fence")
+                }
+                let deadline = ContinuousClock.now.advanced(
+                  by: .nanoseconds(Int64(8_000_000_000 - elapsedRelease)))
+                while vm.backingRecyclingStatus.coldResidentBytes - peakRecycledResidentBytes
+                  < 1 << 30
+                {
+                  guard balloonObserver?.snapshot.failureError == nil,
+                    balloonObserver?.snapshot.running == true else {
+                    throw Failure.check("autonomous balloon owner failed")
+                  }
+                  guard ContinuousClock.now < deadline else {
+                    throw Failure.check("autonomous resident return timed out")
+                  }
+                  try await Task.sleep(for: .milliseconds(5))
+                }
+                let returnedAt = now()
+                let live = try await loadState(cycle: cycle)
+                guard live.0 == 1, live.1 >= 16 << 20 else {
+                  throw Failure.check("SQL not live during autonomous return")
+                }
+                while !vm.balloonState.settled || vm.balloonState.targetBytes != 0 {
+                  guard balloonObserver?.snapshot.failureError == nil,
+                    ContinuousClock.now < deadline else {
+                    throw Failure.check("autonomous capacity restoration timed out")
+                  }
+                  try await Task.sleep(for: .milliseconds(5))
+                }
+                let restored = try await verify()
+                guard restored == initialMemory else {
+                  throw Failure.check("autonomous capacity changed")
+                }
+                pulse = [
+                  "initialGuestBytes": initialMemory, "heldGuestBytes": restored,
+                  "restoredGuestBytes": restored, "releasedAtNanoseconds": releasedAt,
+                  "inflatedAtNanoseconds": returnedAt, "deflatedAtNanoseconds": now(),
+                  "reportedResidentBytesRecycled": vm.backingRecyclingStatus.coldResidentBytes
+                    - peakRecycledResidentBytes,
+                  "activeDuringBalloonMemoryBytes": live.1,
+                ]
+              } else {
+                pulse = try await balloonPulse(cycle: cycle, minimumResidentReturn: 1 << 30)
+              }
               let aggregate = try await activeLoad!.value
               activeLoad = nil
               guard aggregate == "4999950000", vm.memoryControlStatus.backingRetiredBytes == 0,
@@ -907,7 +1186,7 @@ extension Lab {
               try await resourceSnapshot("classic-pressure-restored-\(cycle)")
               var record: [String: Any] = pulse.mapValues { $0 as Any }
               record["cycle"] = cycle
-              record["pressureTableRows"] = 557056
+              record["pressureTableRows"] = pressureRows
               record["heldPressureBytes"] = 2176 << 20
               record["workloadAllocatorPurgeRequested"] = true
               record["integrity"] = expected
@@ -1192,6 +1471,55 @@ extension Lab {
         observerTask = nil
         guard !observer.status.running else { throw Failure.check("observer still running") }
       }
+      if let balloonObserver, let task = balloonTask {
+        // Join synthetic CPU/NIC beacons; the 64 MiB canary remains live and checked afterward.
+        _ = try await verify("QUIESCE")
+        let idleStart = ContinuousClock.now
+        let initial = balloonObserver.snapshot
+        let memoryBefore = try ProcessMemorySnapshot.capture()
+        var cpuBefore = rusage()
+        guard getrusage(RUSAGE_SELF, &cpuBefore) == 0 else { throw Failure.check("idle CPU") }
+        while idleStart.duration(to: .now) < .seconds(30) {
+          guard balloonObserver.snapshot.running,
+            balloonObserver.snapshot.failureError == nil else {
+            throw Failure.check("autonomous idle owner failed")
+          }
+          try await Task.sleep(for: .seconds(1))
+        }
+        let idle = balloonObserver.snapshot
+        let memoryAfter = try ProcessMemorySnapshot.capture()
+        var cpuAfter = rusage()
+        guard getrusage(RUSAGE_SELF, &cpuAfter) == 0 else { throw Failure.check("idle CPU") }
+        func microseconds(_ usage: rusage) -> Int {
+          usage.ru_utime.tv_sec * 1_000_000 + Int(usage.ru_utime.tv_usec)
+            + usage.ru_stime.tv_sec * 1_000_000 + Int(usage.ru_stime.tv_usec)
+        }
+        commands.append([
+          "autonomousIdleNanoseconds": String(now()),
+          "syntheticBeaconsQuiesced": "true",
+          "idlePulses": String(idle.completedPulses - initial.completedPulses),
+          "idleRequests": String(idle.requests.totalCount - initial.requests.totalCount),
+          "idleSamples": String(idle.samples.totalCount - initial.samples.totalCount),
+          "idleCPUUsec": String(microseconds(cpuAfter) - microseconds(cpuBefore)),
+          "idleFootprintBefore": String(memoryBefore.physicalFootprintBytes ?? 0),
+          "idleFootprintAfter": String(memoryAfter.physicalFootprintBytes ?? 0),
+        ])
+        _ = try await verify()
+        guard try await sql(container, query: integrity) == expected else {
+          throw Failure.check("post-idle integrity")
+        }
+        try await resourceSnapshot("autonomous-idle")
+        balloonObserver.requestStop()
+        try await task.value
+        balloonTask = nil
+        let final = balloonObserver.snapshot
+        guard !final.running, !final.pending, final.failureError == nil,
+          final.cleanupError == nil, final.completedPulses >= 2,
+          vm.balloonState.settled, vm.balloonState.targetBytes == 0,
+          !vm.memoryControlStatus.retired else {
+          throw Failure.check("autonomous balloon owner did not drain")
+        }
+      }
       _ = try await verify(quit: true)
       input.finish()
       guard try await canary!.wait(timeoutInSeconds: 5).exitCode == 0 else {
@@ -1200,7 +1528,7 @@ extension Lab {
       try await canary!.delete()
       canary = nil
       if let memorySession {
-        if expectedCancellation || expectedLifetimeExpiry {
+        if expectedCancellation || expectedLifetimeExpiry || expectedDisconnection {
           await memorySession.close()
         } else {
           try await memorySession.quit()
@@ -1209,7 +1537,7 @@ extension Lab {
       if let memoryMonitor {
         let status = try await memoryMonitor.wait(timeoutInSeconds: 5)
         // Closing the owned input intentionally retires this strict command protocol with exit1.
-        let expectedExit: Int32 = expectedCancellation || expectedLifetimeExpiry ? 1 : 0
+        let expectedExit: Int32 = expectedCancellation || expectedLifetimeExpiry || expectedDisconnection ? 1 : 0
         commands.append(["memoryMonitorExit": String(status.exitCode)])
         guard status.exitCode == expectedExit else {
           throw Failure.check("memory monitor exit")
@@ -1219,7 +1547,7 @@ extension Lab {
       memoryMonitor = nil
     } catch {
       primary = String(describing: error)
-      if classic {
+      if classic, !autonomousBalloon {
         do {
           try vm.requestBalloon(bytes: 0)
           let deadline = ContinuousClock.now.advanced(by: .seconds(8))
@@ -1270,6 +1598,18 @@ extension Lab {
             memoryDiagnostics.append(["kind": name, "error": String(describing: error)])
           }
         }
+      }
+    }
+    if let task = balloonTask {
+      balloonObserver?.requestStop()
+      task.cancel()
+      switch await task.result {
+      case .success: break
+      case .failure(let error):
+        if !(error is CancellationError) { cleanup.append("autonomous-balloon-stop \(error)") }
+      }
+      if let error = balloonObserver?.snapshot.cleanupError {
+        cleanup.append("autonomous-balloon-drain \(error)")
       }
     }
     if let task = observerTask {
@@ -1329,7 +1669,19 @@ extension Lab {
       "canaryTranscriptDropped": await session.transcriptDropped,
       "canaryBytes": 64 << 20, "rows": 400000, "resources": resources,
       "adaptive": adaptive, "policyRequests": policyRequests, "policySamples": policySamples,
-      "classicBallooning": classic,
+      "classicBallooning": classic, "autonomousBallooning": autonomousBalloon,
+      "pressurePayload": entropyPressure ? "random-string-4096-bytes" : "repeated-hash-control",
+      "balloonObserverRequests": balloonObserver?.snapshot.requests.elements ?? [],
+      "balloonObserverSamples": balloonObserver?.snapshot.samples.elements ?? [],
+      "balloonObserverRequestsTotal": balloonObserver?.snapshot.requests.totalCount ?? 0,
+      "balloonObserverCompletedPulses": balloonObserver?.snapshot.completedPulses ?? 0,
+      "balloonObserverStopped": balloonObserver?.snapshot.running == false,
+      "balloonObserverFailure": balloonObserver?.snapshot.failureError.map {
+        String(describing: $0)
+      } ?? "",
+      "balloonObserverCleanupFailure": balloonObserver?.snapshot.cleanupError.map {
+        String(describing: $0)
+      } ?? "",
       "continuous": continuous, "observerSamples": observerState?.samples ?? [],
       "observerRequests": observerState?.requests ?? [],
       "observerSamplesTotal": observerState?.sampleHistory.totalCount ?? 0,
@@ -1344,11 +1696,12 @@ extension Lab {
       "observerFailure": observerState?.failure ?? "", "expectedCancellation": expectedCancellation,
       "expectedGracefulStop": expectedGracefulStop,
       "expectedLifetimeExpiry": expectedLifetimeExpiry,
+      "expectedDisconnection": expectedDisconnection,
     ]
     try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
       .write(to: output.appending(path: "workload.json"), options: .withoutOverwriting)
     guard primary.isEmpty, cleanup.isEmpty,
-      expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry
+      expectedCancellation || expectedGracefulStop || expectedLifetimeExpiry || expectedDisconnection
         || observations.count == 2
     else {
       throw Failure.check(primary)

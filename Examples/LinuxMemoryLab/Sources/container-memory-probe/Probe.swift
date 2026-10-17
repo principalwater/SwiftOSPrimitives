@@ -283,9 +283,11 @@
         while sequence < UInt64.max {
           sequence += 1
           let text = try command()
-          guard text == "OBS \(sequence)" || text == "QUIT \(sequence)" else {
+          guard text == "OBS \(sequence)" || text == "OBS_REFRESH \(sequence)"
+            || text == "QUIT \(sequence)" else {
             throw ProbeFailure.framing
           }
+          if text.hasPrefix("OBS_REFRESH ") { try refreshMemoryStatistics() }
           try emit("MEMORY_OK \(sequence) \(try memory())\n")
           if text.hasPrefix("QUIT ") { return }
         }
@@ -408,6 +410,9 @@
             try pressure.release()
             pressure = try PageRegion.allocate(byteCount: 320 << 20, maximumMappedBytes: 320 << 20)
             holding = false
+          } else if text == "QUIESCE \(sequence)" {
+            guard !stopped else { throw ProbeFailure.framing }
+            try stop()
           } else {
             guard
               text == "VERIFY \(sequence)" || text == "OBS \(sequence)"
@@ -425,7 +430,7 @@
             }
           }
           try emit(
-            "CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !passive))\n"
+            "CANARY_OK \(sequence) \(try memory()) \(try summary(progress: !passive && !stopped))\n"
           )
           if text.hasPrefix("QUIT") {
             try region.release()

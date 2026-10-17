@@ -5,12 +5,27 @@ import Synchronization
 // A finite RFC5737 peer, not a host IP stack or a bridge to any external network.
 final class EthernetPeer: Sendable {
   let link: IsolatedNetwork
-  private let state = Mutex((stop: false, echoed: 0))
+  private let state = Mutex((stop: false, echoed: 0, backpressure: UInt64(0)))
   init(link: IsolatedNetwork) { self.link = link }
   var echoed: Int { state.withLock { $0.echoed } }
-  func stop() { state.withLock { $0.stop = true } }
+  var backpressure: UInt64 { state.withLock { $0.backpressure } }
+  func stop() {
+    state.withLock { $0.stop = true }
+    link.stopReceiving()
+  }
   func run() async throws {
-    var pending: Data?
+    try await withThrowingTaskGroup(of: Void.self) { group in
+      group.addTask { try await self.respond() }
+      group.addTask {
+        try await Task.sleep(for: .seconds(150))
+        throw NativeControlFailure.wireTimedOut
+      }
+      defer { group.cancelAll() }
+      _ = try await group.next()
+    }
+  }
+  private func respond() async throws {
+    var pending: (frame: Data, counted: Bool)?
     let deadline = ContinuousClock.now.advanced(by: .seconds(150))
     while !state.withLock({ $0.stop }) {
       try Task.checkCancellation()
@@ -18,12 +33,23 @@ final class EthernetPeer: Sendable {
         throw NativeControlFailure.wireTimedOut
       }
       if let packet = pending {
-        if try link.send(packet) { pending = nil }
-      } else if let packet = try link.receive() {
-        pending = try Self.reply(packet, index: link.index)
-        if pending != nil, packet[12] == 8, packet[13] == 0 { state.withLock { $0.echoed += 1 } }
+        if try link.send(packet.frame) {
+          pending = nil
+          if packet.counted { state.withLock { $0.echoed += 1 } }
+        } else {
+          state.withLock { if $0.backpressure < UInt64.max { $0.backpressure += 1 } }
+          try await Task.sleep(for: .milliseconds(1))
+        }
+      } else {
+        let packet: Data
+        do { packet = try await link.receivePacket() } catch is CancellationError {
+          guard state.withLock({ $0.stop }) else { throw CancellationError() }
+          return
+        }
+        if let frame = try Self.reply(packet, index: link.index) {
+          pending = (frame, packet[12] == 8 && packet[13] == 0)
+        }
       }
-      try await Task.sleep(for: .milliseconds(1))
     }
   }
   static func checksum(_ bytes: Data) -> UInt16 {

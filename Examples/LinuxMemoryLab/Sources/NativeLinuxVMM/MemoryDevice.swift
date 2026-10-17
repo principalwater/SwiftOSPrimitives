@@ -4,7 +4,7 @@ import Foundation
 import Hypervisor
 import PageMemory
 
-// Dedicated virtio-mem region, never boot RAM or a borrowed VZ allocation.
+// Exclusively owned dynamic RAM region, never a borrowed VZ allocation.
 final class MemoryDevice {
   static let base: UInt64 = 0x1_0000_0000
   static let block = 2 << 20
@@ -43,7 +43,8 @@ final class MemoryDevice {
   private(set) var recycledColdResidentBytes: UInt64 = 0
   private(set) var quarantined = false
   private(set) var quarantineRecord: [String: UInt64] = [:]
-  var plugged: UInt64 { extents.reduce(0) { $0 + ($1.plugged ? UInt64(Self.block) : 0) } }
+  // Only committed provide/retire/close mutate this logical count; avoid an ARC walk per VM exit.
+  private(set) var plugged: UInt64 = 0
 
   init(
     held: Bool, aliasControl: Bool = false, geometry: NativeMemoryGeometry = .qualification,
@@ -164,7 +165,8 @@ final class MemoryDevice {
   }
   private func provide(_ index: Int) throws {
     let extent = extents[index]
-    guard !extent.plugged, !extent.mapped else { throw DeviceFailure.request }
+    guard !extent.plugged, !extent.mapped,
+      plugged <= UInt64(capacity - Self.block) else { throw DeviceFailure.request }
     extent.freshAllocation = extent.pointer == nil
     if extent.freshAllocation { try native(hv_vm_allocate(&extent.pointer, Self.block, 0)) }
     guard let pointer = extent.pointer else { throw DeviceFailure.request }
@@ -185,6 +187,7 @@ final class MemoryDevice {
         UInt64(HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC)))
     extent.mapped = true
     extent.plugged = true
+    plugged += UInt64(Self.block)
     if aliasControl, !aliasReleased, index == 32, aliasAddress == nil {
       var target: UInt64 = 0
       var current: vm_prot_t = 0
@@ -255,12 +258,14 @@ final class MemoryDevice {
     }
   }
   private func retire(
-    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int), replacing: Bool = false
+    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int), replacing: Bool = false,
+    balloonEpoch: UInt64? = nil, acknowledgmentPending: Bool = true
   ) throws -> Bool {
     let remaining = replacing ? recyclingHistory.remainingCounterValues
       : observationHistory.remainingCounterValues
     let cumulative = replacing ? recycledBackingBytes : cumulativeBackingRetiredBytes
     guard !replacing || !held, remaining >= UInt64(indices.count),
+      replacing || plugged >= UInt64(indices.count) * UInt64(Self.block),
       UInt64.max - cumulative >= UInt64(indices.count) * UInt64(Self.block),
       indices.allSatisfy({ extents[$0].plugged && extents[$0].mapped && extents[$0].pointer != nil }
       )
@@ -337,6 +342,7 @@ final class MemoryDevice {
         }
       } else {
         extent.plugged = false
+        plugged -= UInt64(Self.block)
       }
       let after = try ProcessMemorySnapshot.capture()
       if replacing {
@@ -356,7 +362,9 @@ final class MemoryDevice {
         "residentObservationIncludesHostZeroing": previouslyInitializedByHost,
         "replacementHostInitializedBytes": replacing ? 0 : NSNull(),
         "oldVirtualRangeAbsent": !held,
-        "sameGPAMappedBeforeAcknowledgement": replacing && extent.mapped,
+        "sameGPAMappedBeforeAcknowledgement": replacing && extent.mapped && acknowledgmentPending,
+        "sameGPAMappedBeforeResume": replacing && extent.mapped,
+        "balloonOwnershipEpoch": balloonEpoch.map { $0 as Any } ?? NSNull(),
         "replacementResidentBytes": replacementResidentBytes.map { $0 as Any } ?? NSNull(),
         "objectID": plan.info.object_id_full,
         "residentPagesBefore": plan.info.pages_resident,
@@ -373,17 +381,21 @@ final class MemoryDevice {
     }
     return true
   }
-  /// Guest ownership is supplied by a synchronous REPORTING queue, never by free-byte telemetry.
-  func recycleReported(
-    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int)
-  ) throws {
+  /// Callers prove ownership by a pending REPORTING ACK or the persistent balloon PFN ledger.
+  @discardableResult func recycleOwned(
+    _ indices: [Int], quiescence: (parked: Bool, epoch: Int, cpus: Int),
+    balloonEpoch: UInt64? = nil, acknowledgmentPending: Bool = true
+  ) throws -> Bool {
     try confined()
     guard quiescence.parked, quiescence.epoch >= 0, (1...4).contains(quiescence.cpus),
       indices.count <= extents.count, Set(indices).count == indices.count,
+      acknowledgmentPending || balloonEpoch.map({ $0 > 0 }) == true,
       indices.allSatisfy({ extents.indices.contains($0) })
     else { throw DeviceFailure.request }
-    if quarantined || indices.isEmpty { return }
-    _ = try retire(indices, quiescence: quiescence, replacing: true)
+    if quarantined || indices.isEmpty { return false }
+    return try retire(
+      indices, quiescence: quiescence, replacing: true, balloonEpoch: balloonEpoch,
+      acknowledgmentPending: acknowledgmentPending)
   }
   private func requireAbsent(_ original: UInt64) throws {
     var start = original
@@ -421,8 +433,12 @@ final class MemoryDevice {
         try native(hv_vm_deallocate(pointer, Self.block))
         extent.pointer = nil
       }
-      extent.plugged = false
+      if extent.plugged {
+        extent.plugged = false
+        plugged -= UInt64(Self.block)
+      }
       extent.initializedByHost = false
     }
+    guard plugged == 0 else { throw DeviceFailure.observation("plugged-accounting") }
   }
 }

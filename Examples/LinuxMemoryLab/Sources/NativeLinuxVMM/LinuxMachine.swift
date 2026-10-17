@@ -354,23 +354,16 @@ final class LinuxMachine {
       if let control, let vsock {
         try synchronizeMemoryQuarantine()
         if let balloon = classicBalloon {
-          let request = control.state.withLock {
-            ($0.balloonGeneration, $0.balloonApplied, $0.balloonDesired)
-          }
-          if request.0 != request.1 {
-            guard let memory = dynamicMemory else { throw Failure.protocolError }
-            try balloon.request(bytes: request.2, memory: memory, now: .now)
-            control.state.withLock { $0.balloonApplied = request.0 }
-          }
+          guard let memory = dynamicMemory else { throw Failure.protocolError }
+          try control.applyBalloonRequest(to: balloon, memory: memory)
           try balloon.poll(
             now: .now, quarantine: control.memoryQuarantineRequested.load(ordering: .acquiring))
-          control.state.withLock {
-            $0.balloonTarget = balloon.target
-            $0.balloonActual = balloon.actual
-            $0.balloonOwned = balloon.ledger.count
-            $0.balloonReady = balloon.transport.status & 15 == 15
-            $0.balloonQuarantined = balloon.quarantined
+          if balloon.ledger.pendingRecyclingCount > 0 {
+            try balloon.recyclePending(
+              memory: memory,
+              quiescence: (pool.isQuiescent, pool.epoch, cpuCount))
           }
+          control.state.withLock { $0.publishBalloon(balloon) }
           try check(
             hv_gic_set_spi(balloon.transport.interrupt, balloon.transport.interruptStatus != 0),
             "balloon-irq")
@@ -510,12 +503,17 @@ final class LinuxMachine {
           now: .now, quarantine: control?.memoryQuarantineRequested.load(ordering: .acquiring)
             ?? memory.quarantined)
         let write = syndrome & 64 != 0
+        let registerValue: UInt32? =
+          write ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt))) : nil
+        if address - 0x0a00_6000 == 0x70, registerValue == 0 {
+          control?.state.withLock { $0.balloonReady = false }
+        }
         let value = try balloon.access(
           address - 0x0a00_6000, width: width,
-          write: write
-            ? UInt32(truncatingIfNeeded: rt == 31 ? 0 : try register(hv_reg_t(rawValue: rt))) : nil,
+          write: registerValue,
           memory: memory, metadata: queuePointer, payload: dataPointer,
           quiescence: (cpus?.isQuiescent ?? false, cpus?.epoch ?? 0, cpuCount))
+        control?.state.withLock { $0.publishBalloon(balloon) }
         try check(
           hv_gic_set_spi(balloon.transport.interrupt, balloon.transport.interruptStatus != 0),
           "balloon-irq")

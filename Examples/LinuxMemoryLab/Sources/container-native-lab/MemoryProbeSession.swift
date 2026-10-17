@@ -18,6 +18,7 @@ actor MemoryProbeSession {
   private var waiting = 0
   private var closed = false
   private var ready = false
+  private var quiesced = false
   private var seenWork: [UInt64]
   private var checkedWork: [UInt64]
   private var seenPackets: UInt64 = 0
@@ -125,7 +126,7 @@ actor MemoryProbeSession {
     _ command: String = "VERIFY",
     deadline: ContinuousClock.Instant = .now.advanced(by: .seconds(5))
   ) async throws -> Observation {
-    guard ["VERIFY", "OBS", "OBS_REFRESH", "HOLD", "DROP", "QUIT"].contains(command) else {
+    guard ["VERIFY", "OBS", "OBS_REFRESH", "HOLD", "DROP", "QUIESCE", "QUIT"].contains(command) else {
       throw NativeControlFailure.arguments
     }
     _ = try await acquire(until: deadline)
@@ -142,6 +143,9 @@ actor MemoryProbeSession {
     _ command: String, deadline: ContinuousClock.Instant
   ) async throws -> Observation {
     defer { busy = false }
+    guard !quiesced || ["VERIFY", "OBS", "OBS_REFRESH", "QUIT"].contains(command) else {
+      throw NativeControlFailure.arguments
+    }
     do {
       let capturedAt = ContinuousClock.now
       let sent = try send(command)
@@ -151,7 +155,9 @@ actor MemoryProbeSession {
         UInt64(words[1]) == sent, let total = UInt64(words[2]),
         let available = UInt64(words[3]), available <= total
       else { throw NativeControlFailure.framing }
-      try checkWork(words.dropFirst(4), progress: command != "OBS" && command != "OBS_REFRESH")
+      try checkWork(words.dropFirst(4),
+        progress: !quiesced && command != "QUIESCE" && command != "OBS" && command != "OBS_REFRESH")
+      if command == "QUIESCE" { quiesced = true }
       if command == "QUIT" { close() }
       return .init(sequence: sent, capturedAt: capturedAt, total: total, available: available)
     } catch {

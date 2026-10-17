@@ -59,13 +59,15 @@ public actor NativeMemorySession {
   }
 
   /// Returns nil while another exchange owns the wire; never extends the caller's deadline.
-  public func observeIfIdle(deadline: ContinuousClock.Instant) async throws
+  public func observeIfIdle(
+    deadline: ContinuousClock.Instant, refreshStatistics: Bool = false
+  ) async throws
     -> NativeMemoryObservation?
   {
     try Task.checkCancellation()
     guard ready, !closed else { throw NativeControlFailure.disconnected }
     guard !busy else { return nil }
-    return try await exchange("OBS", deadline: deadline)
+    return try await exchange(refreshStatistics ? "OBS_REFRESH" : "OBS", deadline: deadline)
   }
 
   /// Requests a validated graceful exit; the process owner must still wait and delete the process.

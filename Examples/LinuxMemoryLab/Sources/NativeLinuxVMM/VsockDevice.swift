@@ -59,6 +59,7 @@ final class VsockDevice {
   let thread = pthread_self()
   var packets: [Packet] = []
   let control: NativeControl
+  private var readBuffer = InlineArray<16384, UInt8>(repeating: 0)
 
   init(control: NativeControl) { self.control = control }
 
@@ -256,22 +257,27 @@ final class VsockDevice {
       let outstanding = connection.sent &- connection.forwarded
       let space = connection.allocation - min(outstanding, connection.allocation)
       if space > 0, packets.count < 96, !connection.shutdownSent {
-        var bytes = [UInt8](repeating: 0, count: min(Int(space), 16384))
-        let count = Darwin.read(connection.descriptor, &bytes, bytes.count)
-        if count > 0 {
-          try enqueue(
-            Packet(
-              source: port, destination: connection.remote, operation: 5,
-              forwarded: connection.delivered, payload: Data(bytes.prefix(count))))
-          connection.sent &+= UInt32(count)
-        } else if count == 0 {
-          try enqueue(
-            Packet(
-              source: port, destination: connection.remote, operation: 4,
-              flags: 3, forwarded: connection.delivered))
-          connection.shutdownSent = true
-        } else if errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK {
-          throw DeviceFailure.native(errno)
+        // One coordinator owns this scratch; only received bytes are copied into owned packets.
+        try withUnsafeMutableBytes(of: &readBuffer) { bytes in
+          let limit = min(Int(space), bytes.count)
+          let count = Darwin.read(connection.descriptor, bytes.baseAddress!, limit)
+          if count > 0 {
+            guard count <= limit else { throw DeviceFailure.request }
+            try enqueue(
+              Packet(
+                source: port, destination: connection.remote, operation: 5,
+                forwarded: connection.delivered,
+                payload: Data(bytes: bytes.baseAddress!, count: count)))
+            connection.sent &+= UInt32(count)
+          } else if count == 0 {
+            try enqueue(
+              Packet(
+                source: port, destination: connection.remote, operation: 4,
+                flags: 3, forwarded: connection.delivered))
+            connection.shutdownSent = true
+          } else if errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK {
+            throw DeviceFailure.native(errno)
+          }
         }
       }
       connections[key] = connection

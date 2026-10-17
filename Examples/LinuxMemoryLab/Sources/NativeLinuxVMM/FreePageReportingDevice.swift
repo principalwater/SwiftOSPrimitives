@@ -94,7 +94,7 @@ final class FreePageReportingDevice {
             }
             // Nonzero poisoning is retained unchanged; replacing it with lazy zeroes is unsafe.
             if self.poison == 0 {
-              try memory.recycleReported(indices, quiescence: quiescence)
+              try memory.recycleOwned(indices, quiescence: quiescence)
             }
             self.reports += 1
             self.reportedBytes += bytes

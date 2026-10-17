@@ -120,3 +120,28 @@ func classicBalloonRequiresBothRescueFeatures(_ lowFeatures: UInt32) throws {
   try device.request(bytes: 0, memory: memory, now: .now)
   #expect(device.target == 0 && device.quarantined)
 }
+
+@Test func aZeroTargetMustBeReadAfterItsLatestConfigurationGeneration() throws {
+  let fixture = RingFixture()
+  let memory = MemoryDevice(held: false)
+  let device = try ClassicBalloonDevice(boot: 0..<(2 << 20), dynamicBytes: 128 << 20)
+  for (offset, value): (UInt64, UInt32) in [
+    (0x70, 3), (0x20, 5), (0x24, 1), (0x20, 1), (0x70, 15),
+  ] { _ = try device.transport.write(offset, value, memory: fixture.memory) }
+  func read(_ offset: UInt64) throws {
+    _ = try device.access(offset, width: 4, write: nil, memory: memory,
+      metadata: fixture.memory, payload: fixture.memory, quiescence: (true, 1, 2))
+  }
+  #expect(!device.zeroTargetObserved)
+  try read(0x100)
+  #expect(device.zeroTargetObserved)
+  try device.request(bytes: 0, memory: memory, now: .now)
+  #expect(!device.zeroTargetObserved)
+  try read(0x104)
+  #expect(!device.zeroTargetObserved)
+  try read(0x100)
+  #expect(device.zeroTargetObserved)
+  _ = try device.access(0x70, width: 4, write: 0, memory: memory,
+    metadata: fixture.memory, payload: fixture.memory, quiescence: (true, 1, 2))
+  #expect(!device.zeroTargetObserved)
+}
