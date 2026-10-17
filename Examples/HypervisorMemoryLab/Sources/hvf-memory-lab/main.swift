@@ -5,7 +5,9 @@ import Hypervisor
 import PageMemory
 import Synchronization
 
-private enum Failure: Error {
+// Internal to this executable target only, so the private Mach page-object experiment can reuse
+// the reviewed VM/code-page ownership. Nothing here is exported by a library product.
+enum Failure: Error {
   case arguments, state, geometry, mismatch, observation
   case native(String, Int32)
   case guestResult(UInt64)
@@ -13,12 +15,12 @@ private enum Failure: Error {
   case experiment(String)
 }
 
-private func check(_ code: hv_return_t, _ operation: String) throws {
+func check(_ code: hv_return_t, _ operation: String) throws {
   guard code == HV_SUCCESS else { throw Failure.native(operation, code) }
 }
 
 // Private to the finite, synchronous lab. No pointer or mapping escapes to a caller.
-private final class Region {
+final class Region {
   let address: UInt64
   let size: Int
   var pointer: UnsafeMutableRawPointer?
@@ -29,7 +31,7 @@ private final class Region {
   }
 }
 
-private final class Machine {
+final class Machine {
   var created = false
   var cpu: hv_vcpu_t?
   var exitInfo: UnsafeMutablePointer<hv_vcpu_exit_t>?
@@ -289,7 +291,7 @@ private final class Machine {
 
 // Exclusive, no-follow evidence output. The kernel refuses every existing path (file, directory,
 // symlink, dangling symlink), and the descriptor is closed exactly once with checked results.
-private final class EvidenceFile {
+final class EvidenceFile {
   static let maximumBytes = 64 << 10
   private var descriptor: Int32
 
@@ -955,6 +957,13 @@ extension PreEntryWake {
     // Early mode: no guest image is read and no Linux guest starts; existing modes are unchanged.
     if arguments.count == 3, arguments[1] == "preentry-wake" {
       try PreEntryWake.run(output: arguments[2])
+      return
+    }
+    // Private Mach page-object experiment. The profile is validated before the result path is
+    // reserved, so a malformed command line creates no file and touches no VM.
+    if arguments.count == 4, arguments[1] == "mach-page-objects" {
+      guard let profile = MachPageProfile(rawValue: arguments[3]) else { throw Failure.arguments }
+      try MachPageObjects.run(output: arguments[2], profile: profile)
       return
     }
     guard arguments.count == 4,
